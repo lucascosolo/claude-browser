@@ -5,7 +5,7 @@ from the start rather than bolted on.
 
 It renders with **WebKitGTK** — the same engine that backs Safari — using the copy
 already installed on your system. There is no bundled Chromium, no Electron, and no
-node_modules. The whole thing is about 2,000 lines of Python against the standard
+node_modules. The whole thing is a few thousand lines of Python against the standard
 library, and it idles in roughly the memory one Chrome tab uses.
 
 ```
@@ -19,6 +19,9 @@ library, and it idles in roughly the memory one Chrome tab uses.
         ▲                                        ▲
    agents drive this over HTTP            Ctrl+K asks Claude
 ```
+
+Working on the code? Read **`CLAUDE.md`** instead — it is the short version,
+plus the constraints that are not visible from the source.
 
 ## Why it exists
 
@@ -50,14 +53,26 @@ webkit2gtk4.1`. Arch: `python-gobject webkit2gtk-4.1`.
 ### Add it to the desktop menu
 
 ```bash
-./install.sh            # XFCE / GNOME / KDE menu entry + icon, no sudo
+./install.sh                  # menu entry + icon + ~/.local/bin symlinks, no sudo
+./install.sh --set-default    # ...and make it the system web browser
 ./install.sh --uninstall
 ```
 
-It appears under **Applications ▸ Internet** as *Claude Browser*, registers as a
-browser choice for `http`/`https` links, and symlinks `claude-browser`, `cbctl` and
-`cb-mcp` into `~/.local/bin`. Everything installed lives under `$HOME`, and the app
-keeps running from this checkout — `git pull` updates the installed copy too.
+It appears under **Applications ▸ Internet** as *Claude Browser*, and symlinks
+`claude-browser`, `cbctl` and `cb-mcp` into `~/.local/bin`. Everything installed
+lives under `$HOME`, and the app keeps running from this checkout — `git pull`
+updates the installed copy too.
+
+`--set-default` writes all four registries that have an opinion about the
+default browser: `mimeapps.list`, `xdg-settings`, XFCE's `helpers.rc` (which
+needs a hand-written helper entry for a browser it does not ship), and `gio`.
+They do not consult each other, so setting one leaves the system disagreeing
+with itself — which is the state this box was in, reporting `claude-browser`
+for `x-scheme-handler/http` and `google-chrome` for `xdg-settings get`.
+
+**Opening a link when a window is already open** hands the URL to that window
+and exits, rather than starting a second browser. That is what makes it usable
+as the default: `xdg-open` has no idea one is running.
 
 Right-clicking the menu entry offers **New Window** and **New Window (no agent API)**.
 
@@ -91,7 +106,7 @@ Claude panel's visual language. A slim icon rail moves between them.
 | | |
 |---|---|
 | `cb:home` | Start page: one input that both searches and navigates, four quick actions, then bookmarks and recent pages as tiles. This is the default new tab (`CB_HOME` overrides it). |
-| `cb:deck` | **Every open tab as a card.** A tab strip stops being navigation somewhere around the eighth tab — the labels ellipsize to nothing and you are clicking by position. The deck is the same set laid out where the titles are readable. |
+| `cb:deck` | **Every open tab as a card.** A tab strip stops being navigation somewhere around the eighth tab, however well the tabs are named. The deck is the same set laid out with room for full titles. |
 | `cb:bookmarks` | Everything saved, filterable. |
 | `cb:history` | Grouped by day, filterable, with per-entry delete and a two-step clear. |
 
@@ -148,6 +163,18 @@ primitives an external agent gets over HTTP, handed to a tool-use loop inside
 the browser. It won't submit forms or change account state unless the goal
 plainly asks for it.
 
+### When Claude is driving
+
+Claude moving a page you are watching is unnerving if nothing says why, so it is
+always visible:
+
+- the **tab** being driven carries an accent ring
+- the **window** carries an accent frame while that tab is the one on screen
+- every synthetic click or field write draws a **halo** at the point of action
+
+The marker is set in the one place every tab-targeted agent call passes through,
+so it cannot be forgotten by a new code path.
+
 ## Driving it from an agent
 
 The browser serves a JSON API on `127.0.0.1:8765` — loopback only, since it can read
@@ -156,13 +183,16 @@ any page you are signed into. Set `CB_TOKEN` to require a bearer token as well.
 ### As MCP tools (Claude Code)
 
 ```bash
-claude mcp add browser -- /path/to/claude-browser/cb-mcp
+claude mcp add -s user browser -- /path/to/claude-browser/cb-mcp
 ```
 
 That registers `browser_open`, `browser_text`, `browser_markdown`, `browser_links`,
 `browser_find`, `browser_click`, `browser_fill`, `browser_eval`, `browser_console`,
-`browser_screenshot`, and the navigation tools. Start the browser first; the MCP
-server is a thin translation layer over the running window.
+`browser_screenshot`, and the navigation tools — 18 in all, generated from the
+same table as the HTTP routes, so the two cannot disagree.
+
+**You do not need to start the browser first.** The MCP server launches it on
+the first tool call and waits for it to come up (`CB_AUTOSTART=0` opts out).
 
 ### From the shell
 
@@ -190,6 +220,7 @@ curl -s 127.0.0.1:8765/open -d '{"url":"https://example.com"}'
 | Route | | |
 |---|---|---|
 | `/tabs` `/health` | GET | what is open |
+| `/present` | POST | raise the window |
 | `/open` `/navigate` `/back` `/forward` `/reload` `/close` `/wait` | POST | move around |
 | `/text` `/markdown` `/links` `/html` `/find` | GET | read the page |
 | `/click` `/fill` `/eval` | POST | act on the page |
@@ -226,20 +257,16 @@ Three APIs here exist, are documented, and do nothing in WebKitGTK 2.52:
 `set_process_model`, `set_enable_hyperlink_auditing`, and `innerText` on a
 detached node. `hasattr()` cannot tell you that — only running it can.
 
-**No speedup figure is quoted, deliberately.** `tools/bench.py` exists and
-measures load time with and without the blocker, but on this hardware it could
-not produce a trustworthy result — the same URL took 2.9s in one run and timed
-out at 90s in another. Swap pressure and network variance both exceed the effect.
-The blocker demonstrably loads (82 rules, verified) and the process sharing is
-measured above; everything else here is sound in principle and unquantified.
+**No speedup figure is quoted, deliberately.** `tools/bench.py` measures load
+time with and without the blocker, but on this hardware it cannot produce a
+trustworthy number — the same URL took 2.9s in one run and timed out at 90s in
+another, and swap pressure alone exceeds the effect. The blocker demonstrably
+loads and the process sharing is measured above; the rest is unquantified.
 
-Python is not the bottleneck, which was worth checking: during a page load the
-CPU is entirely `WebKitWebProcess` (15–21%) and `WebKitNetworkProcess` (8–20%) —
-the Python chrome never rises above the noise floor. The interpreter costs 8.8MB
-of RSS against WebKit's ~350MB, and the GTK/WebKit libraries that make up the
-rest would be loaded by a C or Rust build too. The one real cost is startup:
-~2.9s, nearly all of it loading GObject typelibs. A Rust rewrite via Tauri would
-use this same WebKit engine and render no faster.
+Python is not the bottleneck, which was worth checking: during a load the CPU is
+entirely `WebKitWebProcess` and `WebKitNetworkProcess`, and the interpreter costs
+8.8MB of RSS against WebKit's ~350MB. Startup (~2.9s) is nearly all GObject
+typelib loading. A Rust rewrite via Tauri would use this same engine.
 
 ## Design notes
 
@@ -254,13 +281,14 @@ console messages to the embedder, so a user script installed at document-start w
 buffer that `/console` reads back. It runs before page scripts, so it catches
 early errors.
 
-**Every browser touch is marshalled onto the GTK main loop.** GTK and WebKit are not
-thread-safe; calling in from the HTTP thread crashes in ways that look like unrelated
-rendering bugs. `control.py` hands work to `GLib.idle_add` and blocks on a queue.
+**Every browser touch is marshalled onto the GTK main loop.** GTK and WebKit are
+not thread-safe. `control.on_main_loop` is the single bridge.
 
-**Selectors and values are escaped for any context.** `_js_str` escapes `<`, `>`, and
-the U+2028/U+2029 line separators on top of `json.dumps`, because a selector can come
-from a page the agent is reading.
+**Selectors and values are escaped for any context** — they can come from a page
+the agent is reading. See `extract._js_str`.
+
+**One table describes the API.** `claudebrowser/api.py` generates the HTTP
+routes, `cbctl`'s subcommands and `cb-mcp`'s tools, so the three cannot drift.
 
 ## Configuration
 
@@ -287,23 +315,17 @@ it is readable by anyone else.
 exported in a shell, so the browser behaves identically from a terminal, the
 menu and the dock. `--env-file` points at a different one.
 
-It used to be the other way around — the usual "the real environment wins" rule
-— and that was a bug factory. A stale `export ANTHROPIC_API_KEY=` in `~/.bashrc`
-silently overrode the key you had just edited into this file, and the symptom
-was a browser that authenticated fine from the desktop menu (no shell
-environment) and 401'd from a terminal. Worse, an exported variable **cannot be
-fixed from a file**: a shell that exported a dead key keeps handing it to every
-process it spawns until you close it, so deleting the `export` line changes
-nothing in the terminals you already have open. Now the browser simply ignores
-it and prints `config: ignoring the ANTHROPIC_API_KEY in your environment; using
-the one in …`.
+It used to be the other way around, and that was a bug factory: a stale
+`export ANTHROPIC_API_KEY=` in `~/.bashrc` silently overrode the key you had
+just edited in here, and an exported variable cannot be fixed from a file — the
+shell keeps handing the dead value to everything it spawns until you close it.
+The browser now ignores it and says so.
 
-**The API key never enters the process environment.** It is read out of this
-file at the moment a request is made — so it cannot be shadowed by an inherited
-variable, and it is not handed down to the control-API server or any other child
-process. Editing the key takes effect on the next request, with no restart:
-if a card says the key was rejected, fix the line and ask again in the same
-window. The card names the file the rejected key came from.
+**The API key never enters the process environment.** It is read from the file
+at the moment a request is made, so it cannot be shadowed, and it is not handed
+to the control-API server or any other child process. Editing it takes effect on
+the next request with no restart, and a rejected-key card names the file it came
+from. (The full reasoning is in `envfile.py`.)
 
 ### Credentials
 
@@ -340,7 +362,7 @@ session eats it. It is a fallback, not a foundation.
 python3 -m unittest discover -s tests
 ```
 
-116 tests, no display or GTK bindings needed.
+149 tests, no display or GTK bindings needed.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the
@@ -361,5 +383,9 @@ visit (`notify::title` fires several times per load, and counting each would
 make one page look like five), that internal pages are never recorded, and that
 hostile page titles cannot break out of the `onclick="..."` attribute their URL
 is written into.
+
+`test_tabnames.py` covers tab labelling, which is mostly a question about
+collisions: same title on different hosts, same title on the same host, and a
+suffix that would only repeat the name.
 
 The GTK layer itself is not covered; it needs a display.
