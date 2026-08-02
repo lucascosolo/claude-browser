@@ -18,7 +18,8 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import agent, ai, auth, extract, pages, panel_html, perf, store, style  # noqa: E402
+from . import (agent, ai, auth, extract, pages, panel_html, perf, store,  # noqa: E402
+               style, tabnames)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -73,6 +74,38 @@ MODE_INDEX = {key: i for i, (key, _l, _p, _t) in enumerate(PANEL_MODES)}
 PANEL_HEIGHT = 280
 PANEL_MIN = 84
 PAGE_MIN = 120
+
+
+# How long a tab keeps its "Claude is driving" glow after the last agent call.
+# Long enough to bridge the gap between steps in an agent loop, short enough
+# that the glow is gone before the user wonders whether it is stuck on.
+AGENT_GLOW_MS = 2600
+
+
+def needs_tab(method):
+    """Resolve the leading tab id, or answer "no such tab" and stop.
+
+    Seven api_* methods opened with the same three lines. Doing it here also
+    makes the contract visible in the signature: a decorated method is handed a
+    Tab, never an id, so it cannot forget the check.
+
+    It is also the one place every agent-initiated, tab-targeted call passes
+    through, which makes it the honest place to light the "Claude is driving"
+    indicator -- a marker set anywhere further in would miss whatever forgot
+    to call it.
+    """
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, tab_id, *rest):
+        done = rest[-1]
+        tab = self.find(tab_id)
+        if tab is None:
+            return done({"ok": False, "error": "no such tab"})
+        self.note_agent_activity(tab)
+        return method(self, tab, *rest)
+
+    return wrapper
 
 
 
@@ -234,9 +267,10 @@ class Browser(Gtk.Window):
         return btn
 
     def _build_chrome(self):
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root = self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         root.get_style_context().add_class("cb-root")
         self.add(root)
+        self._agent_glow_id = None
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         bar.get_style_context().add_class("cb-bar")
@@ -536,7 +570,7 @@ class Browser(Gtk.Window):
         return True
 
     def close_panel(self):
-        if getattr(self, "panel_busy", False):
+        if self.panel_busy:
             self.stop_run()
         self.panel.hide()
         tab = self.current()
@@ -565,7 +599,7 @@ class Browser(Gtk.Window):
         return GLib.SOURCE_REMOVE
 
     def _stop_agent(self):
-        if getattr(self, "active_agent", None):
+        if self.active_agent:
             self.active_agent.cancel()
             self.active_agent = None
 
@@ -622,15 +656,9 @@ class Browser(Gtk.Window):
         if action:
             action()
             return True
-        if event.keyval == Gdk.KEY_Escape:
-            if self.panel.get_visible():
-                if getattr(self, "panel_busy", False):
-                    self.stop_run()
-                self.panel.hide()
-                tab = self.current()
-                if tab:
-                    tab.view.grab_focus()
-                return True
+        if event.keyval == Gdk.KEY_Escape and self.panel.get_visible():
+            self.close_panel()
+            return True
         if event.keyval == Gdk.KEY_F12:
             tab = self.current()
             if tab:
@@ -685,10 +713,7 @@ class Browser(Gtk.Window):
     def _on_suggestion(self, _completion, model, treeiter):
         url = model[treeiter][1]
         self.omnibox.set_text(url)
-        tab = self.current() or self.new_tab()
-        self._begin_load(tab)
-        tab.view.load_uri(normalize(url))
-        tab.view.grab_focus()
+        self._load(url)
         return True
 
     # -- the browser's own pages --------------------------------------------
@@ -708,11 +733,23 @@ class Browser(Gtk.Window):
             return tab
         return self.new_tab(url)
 
-    def _go_home(self):
-        tab = self.current() or self.new_tab(HOME)
+    def _load(self, url, focus=True, raw=False):
+        """Send `url` to the tab in front, opening one if there is none.
+
+        Four callers did this by hand and one of them -- the omnibox -- left out
+        `_begin_load`, so a typed navigation never marked the tab busy and an
+        agent's `wait` immediately after could answer about the previous page.
+        `raw` skips omnibox normalization for a URL we already trust.
+        """
+        tab = self.current() or self.new_tab()
         self._begin_load(tab)
-        tab.view.load_uri(HOME)
+        tab.view.load_uri(url if raw else normalize(url))
+        if focus:
+            tab.view.grab_focus()
         return tab
+
+    def _go_home(self):
+        return self._load(HOME, focus=False, raw=True)
 
 
     def _serve_internal(self, request):
@@ -775,10 +812,7 @@ class Browser(Gtk.Window):
         url, title = data.get("url") or "", data.get("title") or ""
 
         if action == "go":
-            tab = self.current() or self.new_tab()
-            self._begin_load(tab)
-            tab.view.load_uri(normalize(url))
-            tab.view.grab_focus()
+            self._load(url)
         elif action == "bookmark" and self.store:
             self.store.bookmark(url, title)
             self._sync_star()
@@ -906,13 +940,23 @@ class Browser(Gtk.Window):
 
     def _tab_label(self, tab):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        box.get_style_context().add_class("cb-tablabel")
+        tab.label_box = box
         if tab.private:
             badge = Gtk.Label(label="private")
             badge.get_style_context().add_class("cb-priv-badge")
             box.pack_start(badge, False, False, 0)
         tab.label = Gtk.Label(label="New tab")
         tab.label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
-        tab.label.set_max_width_chars(18)
+        # width_chars is the *minimum*, and it is the whole reason tabs were
+        # readable or not. An ellipsizing GtkLabel reports its minimum width as
+        # the width of the ellipsis alone, so GtkNotebook is free to shrink every
+        # tab to a single "...". Setting max_width_chars without width_chars --
+        # which is what this did -- caps the maximum and leaves the minimum at
+        # nothing, so the tabs collapsed as soon as there were two of them.
+        tab.label.set_width_chars(14)
+        tab.label.set_max_width_chars(24)
+        tab.label.set_xalign(0)
         box.pack_start(tab.label, True, True, 0)
         close = Gtk.Button()
         close.get_style_context().add_class("cb-tabclose")
@@ -1035,11 +1079,21 @@ class Browser(Gtk.Window):
 
         GLib.timeout_add(100, fire)
 
+    def _relabel_tabs(self):
+        """Repaint every tab's name. The rule lives in tabnames.py, which has no
+        GTK import so it can be tested -- the interesting cases are collisions
+        between tabs, not any single tab."""
+        names = tabnames.label_tabs([
+            (t.view.get_uri() or "", t.view.get_title() or "", t.loading)
+            for t in self.tabs])
+        for tab, name in zip(self.tabs, names):
+            if getattr(tab, "label", None):
+                tab.label.set_text(name)
+                tab.label.set_tooltip_text(tab.view.get_uri() or "")
+
     def _refresh(self, tab):
+        self._relabel_tabs()
         title = tab.view.get_title() or tab.view.get_uri() or "New tab"
-        if getattr(tab, "label", None):
-            tab.label.set_text(title)
-            tab.label.set_tooltip_text(tab.view.get_uri() or "")
         if tab is not self.current():
             return
         self.set_title("%s — claude-browser%s"
@@ -1060,17 +1114,62 @@ class Browser(Gtk.Window):
         else:
             self.progress.hide()
 
+    # -- "Claude is driving" indicator --------------------------------------
+
+    def note_agent_activity(self, tab):
+        """Mark `tab` as agent-driven for the next few seconds.
+
+        Every control-API and in-browser-agent call lands here, so the glow
+        tracks real activity rather than a flag someone remembered to set. The
+        deadline is refreshed rather than queued: an agent taking twelve steps
+        against one tab should light it once and hold, not stack twelve timers.
+        """
+        import time
+
+        tab.agent_until = time.monotonic() + AGENT_GLOW_MS / 1000.0
+        if getattr(tab, "label_box", None):
+            tab.label_box.get_style_context().add_class("cb-agent")
+        self._paint_agent_frame()
+        if self._agent_glow_id is None:
+            self._agent_glow_id = GLib.timeout_add(400, self._expire_agent_glow)
+
+    def _expire_agent_glow(self):
+        import time
+
+        now = time.monotonic()
+        live = False
+        for tab in self.tabs:
+            if getattr(tab, "agent_until", 0) > now:
+                live = True
+            elif getattr(tab, "label_box", None):
+                tab.label_box.get_style_context().remove_class("cb-agent")
+        self._paint_agent_frame()
+        if live:
+            return GLib.SOURCE_CONTINUE
+        self._agent_glow_id = None
+        return GLib.SOURCE_REMOVE
+
+    def _paint_agent_frame(self):
+        """The window frame glows only while the driven tab is the one on
+        screen -- a background tab being read is not something to alarm the
+        user about, and the tab's own glow already says it is happening."""
+        import time
+
+        tab = self.current()
+        active = bool(tab and getattr(tab, "agent_until", 0) > time.monotonic())
+        ctx = self.root.get_style_context()
+        (ctx.add_class if active else ctx.remove_class)("cb-agent-window")
+
     def _on_switch(self, _nb, view, _index):
         tab = next((t for t in self.tabs if t.view is view), None)
         if tab:
             GLib.idle_add(self._refresh, tab)
+            GLib.idle_add(self._paint_agent_frame)
 
     # -- chrome actions -----------------------------------------------------
 
     def _on_omnibox(self, entry):
-        tab = self.current() or self.new_tab()
-        tab.view.load_uri(normalize(entry.get_text()))
-        tab.view.grab_focus()
+        self._load(entry.get_text())
 
     def _go(self, direction):
         tab = self.current()
@@ -1110,7 +1209,7 @@ class Browser(Gtk.Window):
             # An empty panel should explain itself rather than sit blank.
             self._js("cb.hint(%s)" % json.dumps(panel_html.empty_hint(mode)))
             self._card_id = None
-        if not getattr(self, "panel_busy", False):
+        if not self.panel_busy:
             self._set_status("using %s" % auth.describe(), "")
         return self.panel
 
@@ -1348,26 +1447,14 @@ class Browser(Gtk.Window):
     def call_sync(self, method, *args, timeout=90):
         """Run an api_* method on the GTK main loop and block until it answers.
 
-        Same bridge control.py uses for HTTP requests, exposed for the in-browser
-        agent. Only ever call this from a worker thread -- calling it from the
-        GTK thread would deadlock waiting on a loop that cannot run.
+        Exactly the bridge control.py uses for HTTP requests -- it used to be
+        written out twice, once here and once there. Only ever call this from a
+        worker thread; from the GTK thread it would deadlock waiting on a loop
+        that cannot run while it waits.
         """
-        import queue
+        from .control import on_main_loop
 
-        box = queue.Queue(1)
-
-        def on_main():
-            try:
-                getattr(self, method)(*args, box.put)
-            except Exception as e:
-                box.put({"ok": False, "error": repr(e)})
-            return GLib.SOURCE_REMOVE
-
-        GLib.idle_add(on_main)
-        try:
-            return box.get(timeout=timeout)
-        except queue.Empty:
-            return {"ok": False, "error": "timed out"}
+        return on_main_loop(self, method, args, timeout=timeout)
 
     def run_agent(self, goal):
         import threading
@@ -1437,21 +1524,18 @@ class Browser(Gtk.Window):
 
     def api_open(self, url, background, wait, done):
         tab = self.new_tab(url, background=background)
+        self.note_agent_activity(tab)
         self._begin_load(tab)
         self._await_load(tab, wait, done)
 
-    def api_navigate(self, tab_id, url, wait, done):
-        tab = self.find(tab_id)
-        if not tab:
-            return done({"ok": False, "error": "no such tab"})
+    @needs_tab
+    def api_navigate(self, tab, url, wait, done):
         self._begin_load(tab)
         tab.view.load_uri(normalize(url))
         self._await_load(tab, wait, done)
 
-    def api_history(self, tab_id, direction, wait, done):
-        tab = self.find(tab_id)
-        if not tab:
-            return done({"ok": False, "error": "no such tab"})
+    @needs_tab
+    def api_history(self, tab, direction, wait, done):
         if direction < 0:
             if not tab.view.can_go_back():
                 return done({"ok": False, "error": "no history behind", **tab.info()})
@@ -1464,26 +1548,30 @@ class Browser(Gtk.Window):
             tab.view.go_forward()
         self._await_load(tab, wait, done)
 
-    def api_reload(self, tab_id, wait, done):
-        tab = self.find(tab_id)
-        if not tab:
-            return done({"ok": False, "error": "no such tab"})
+    @needs_tab
+    def api_reload(self, tab, wait, done):
         self._begin_load(tab)
         tab.view.reload()
         self._await_load(tab, wait, done)
 
-    def api_close(self, tab_id, done):
-        tab = self.find(tab_id)
-        if not tab:
-            return done({"ok": False, "error": "no such tab"})
+    @needs_tab
+    def api_close(self, tab, done):
         self.close_tab(tab)
         done({"ok": True, "closed": tab.id})
 
-    def api_wait(self, tab_id, done):
-        tab = self.find(tab_id)
-        if not tab:
-            return done({"ok": False, "error": "no such tab"})
+    @needs_tab
+    def api_wait(self, tab, done):
         self._await_load(tab, True, done)
+
+    def api_present(self, done):
+        """Raise the window. Used by a second launch after it hands over its
+        URLs -- opening a link that lands in a window behind three others has
+        only half worked."""
+        # present_with_time, not present(): a plain present() is widely ignored
+        # by window managers as focus-stealing, and the launcher handing us this
+        # URL *is* the user's click, so it has a right to the foreground.
+        self.present_with_time(Gdk.CURRENT_TIME)
+        done({"ok": True})
 
     def _begin_load(self, tab):
         """Mark the tab busy *synchronously*, at the moment navigation is asked
@@ -1509,11 +1597,8 @@ class Browser(Gtk.Window):
                          **({"error": tab.failed} if tab.failed else {})})
         tab.waiters.append((tab.generation, done))
 
-    def api_eval(self, tab_id, script, done):
-        tab = self.find(tab_id)
-        if not tab:
-            return done({"ok": False, "error": "no such tab"})
-
+    @needs_tab
+    def api_eval(self, tab, script, done):
         def on_result(view, result, _data=None):
             try:
                 value = view.evaluate_javascript_finish(result)
@@ -1544,11 +1629,8 @@ class Browser(Gtk.Window):
 
         self.api_eval(tab_id, READ_CONSOLE, filter_entries)
 
-    def api_screenshot(self, tab_id, path, done):
-        tab = self.find(tab_id)
-        if not tab:
-            return done({"ok": False, "error": "no such tab"})
-
+    @needs_tab
+    def api_screenshot(self, tab, path, done):
         def on_snapshot(view, result, _data=None):
             try:
                 surface = view.get_snapshot_finish(result)

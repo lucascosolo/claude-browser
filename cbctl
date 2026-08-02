@@ -10,124 +10,72 @@
 Everything prints JSON on stdout, so it composes with jq. Exit status is 1 when
 the browser reports ok:false, which makes `cbctl click .submit && cbctl text`
 behave the way a shell user expects.
+
+The subcommands are built from claudebrowser.api.OPS rather than written out --
+the same table control.py serves and cb-mcp exposes. When they were three lists,
+`cb-mcp` silently lacked `forward` and `wait`.
 """
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
-import urllib.error
-import urllib.request
 
-# Settings come from the same file the browser uses, so CB_PORT / CB_TOKEN stay
-# consistent no matter which of the three entry points you run. Resolve through
-# the symlink -- these are installed into ~/.local/bin as links.
+# Resolve through the symlink -- these are installed into ~/.local/bin as links.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-try:
-    from claudebrowser import envfile
 
-    envfile.load()
-except Exception:
-    pass  # a settings file is a convenience; never block the CLI on it
-
-BASE = os.environ.get("CB_URL", "http://127.0.0.1:%s" % os.environ.get("CB_PORT", "8765"))
-TOKEN = os.environ.get("CB_TOKEN")
+from claudebrowser import api, client  # noqa: E402
 
 
-def call(path, params=None, method="GET"):
-    url = BASE + path
-    data = None
-    headers = {}
-    if TOKEN:
-        headers["authorization"] = "Bearer " + TOKEN
-    if method == "POST":
-        data = json.dumps(params or {}).encode()
-        headers["content-type"] = "application/json"
-    elif params:
-        from urllib.parse import urlencode
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="cbctl", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--tab", type=int, help="tab id (default: the focused tab)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-        url += "?" + urlencode({k: v for k, v in params.items() if v is not None})
+    alias_of = {target: alias for alias, target in api.CLI_ALIASES.items()}
+    for op in api.OPS:
+        command = sub.add_parser(alias_of.get(op.name, op.name), help=op.summary)
+        command.set_defaults(op=op)
+        for param in op.params:
+            if param.cli == "arg":
+                command.add_argument(param.name, help=param.help or None)
+            elif param.cli == "optarg":
+                command.add_argument(param.name, nargs="?", help=param.help or None)
+            elif param.kind == "boolean":
+                command.add_argument("--" + param.name, action="store_true",
+                                     help=param.help)
+            else:
+                command.add_argument("--" + param.name, help=param.help)
+    return parser
 
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            body = resp.read()
-            if resp.headers.get("content-type", "").startswith("application/json"):
-                return json.loads(body)
-            return {"ok": True, "bytes": len(body), "_raw": body}
-    except urllib.error.URLError as e:
-        sys.exit("cannot reach claude-browser at %s (%s)\nIs it running? Try: cb" % (BASE, e))
 
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    op = args.op
 
-def main():
-    ap = argparse.ArgumentParser(prog="cbctl", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tab", type=int, help="tab id (default: the focused tab)")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    params = {p.name: getattr(args, p.name, None) for p in op.params}
+    if op.tab:
+        params["tab"] = args.tab
 
-    sub.add_parser("tabs", help="list open tabs")
-    sub.add_parser("health", help="check the browser is up")
-    for name, help_text in [("text", "readable page text"), ("markdown", "page as markdown"),
-                            ("links", "every link on the page"), ("html", "full page HTML"),
-                            ("back", "go back"), ("forward", "go forward"),
-                            ("reload", "reload the page"), ("wait", "block until load finishes"),
-                            ("close", "close the tab")]:
-        sub.add_parser(name, help=help_text)
+    # `screenshot` with no path streams the PNG itself rather than JSON.
+    raw = op.name == "screenshot" and not params.get("path")
+    result = client.call(op.route, op.method, params, raw=raw)
+    if raw and "_raw" in result:
+        sys.stdout.buffer.write(result["_raw"])
+        return 0
 
-    p = sub.add_parser("open", help="open a URL in a new tab")
-    p.add_argument("url")
-    p.add_argument("--background", action="store_true")
-    p = sub.add_parser("go", help="navigate the current tab")
-    p.add_argument("url")
-    p = sub.add_parser("eval", help="run JavaScript in the page")
-    p.add_argument("js")
-    p = sub.add_parser("click", help="click the first element matching a CSS selector")
-    p.add_argument("selector")
-    p = sub.add_parser("fill", help="set an input's value and fire input/change")
-    p.add_argument("selector")
-    p.add_argument("value")
-    p = sub.add_parser("find", help="search the rendered text")
-    p.add_argument("pattern")
-    p = sub.add_parser("console", help="read console output captured in the page")
-    p.add_argument("--pattern", help="regex filter")
-    p = sub.add_parser("shot", help="screenshot the visible viewport")
-    p.add_argument("path", nargs="?", help="write here; omit to stream PNG to stdout")
+    # A browser that is not running is an operator problem, not page data: it
+    # goes to stderr so a `cbctl text | jq` pipeline fails loudly instead of
+    # feeding jq an error object that looks like a result.
+    if not result.get("ok", True) and "cannot reach claude-browser" in str(
+            result.get("error", "")):
+        print(result["error"], file=sys.stderr)
+        return 1
 
-    args = ap.parse_args()
-    tab = args.tab
-    c = args.cmd
-
-    if c in ("tabs", "health"):
-        out = call("/" + c)
-    elif c in ("text", "markdown", "links", "html"):
-        out = call("/" + c, {"tab": tab})
-    elif c in ("back", "forward", "reload", "wait", "close"):
-        out = call("/" + c, {"tab": tab}, "POST")
-    elif c == "open":
-        out = call("/open", {"url": args.url, "background": args.background}, "POST")
-    elif c == "go":
-        out = call("/navigate", {"tab": tab, "url": args.url}, "POST")
-    elif c == "eval":
-        out = call("/eval", {"tab": tab, "js": args.js}, "POST")
-    elif c == "click":
-        out = call("/click", {"tab": tab, "selector": args.selector}, "POST")
-    elif c == "fill":
-        out = call("/fill", {"tab": tab, "selector": args.selector, "value": args.value}, "POST")
-    elif c == "find":
-        out = call("/find", {"tab": tab, "q": args.pattern})
-    elif c == "console":
-        out = call("/console", {"tab": tab, "pattern": args.pattern})
-    elif c == "shot":
-        out = call("/screenshot", {"tab": tab, "path": args.path})
-        if "_raw" in out:  # no path given: the PNG itself is the output
-            sys.stdout.buffer.write(out["_raw"])
-            return 0
-    else:
-        ap.error("unknown command")
-
-    print(json.dumps(out, indent=2, ensure_ascii=False))
-    return 0 if out.get("ok", True) else 1
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get("ok", True) else 1
 
 
 if __name__ == "__main__":
