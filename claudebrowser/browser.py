@@ -17,7 +17,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import ai, extract, style  # noqa: E402
+from . import agent, ai, extract, perf, style  # noqa: E402
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "about:blank")
@@ -53,6 +53,19 @@ CONSOLE_SHIM = """
 
 READ_CONSOLE = "JSON.stringify({entries: window.__cb_console || []})"
 
+PANEL_MODES = {
+    "ask": {"label": "Ask Claude about this page",
+            "placeholder": "Ask about this page…   (Esc to close)", "takes_input": True},
+    "tldr": {"label": "TL;DR",
+             "placeholder": "Ask a follow-up…", "takes_input": True},
+    "research": {"label": "Research across all open tabs",
+                 "placeholder": "Optional: what to compare…  (Enter to re-run)",
+                 "takes_input": True},
+    "agent": {"label": "Command — Claude drives the browser",
+              "placeholder": "Describe a goal…  e.g. find the pricing page and list the tiers",
+              "takes_input": True},
+}
+
 
 class Tab:
     """A web view plus the bookkeeping the API needs: a stable id, and the list
@@ -60,13 +73,28 @@ class Tab:
 
     _next_id = 1
 
-    def __init__(self, manager):
+    def __init__(self, manager, related=None):
         self.id = Tab._next_id
         Tab._next_id += 1
-        self.view = WebKit2.WebView.new_with_user_content_manager(manager)
+        # Creating a view "related" to an existing one puts both in the same web
+        # process. This is the only mechanism that still works for that in
+        # WebKitGTK 2.52 -- set_process_model was deprecated to a no-op -- and it
+        # is what keeps a fourth tab from meaning a fourth few-hundred-MB process
+        # on a machine that is already swapping. A related view inherits the
+        # content manager and context from its relative, so the console shim and
+        # the content blocker come along with it.
+        if related is not None:
+            self.view = WebKit2.WebView.new_with_related_view(related)
+        else:
+            self.view = WebKit2.WebView.new_with_user_content_manager(manager)
         self.waiters = []
         self.loading = False
         self.failed = None
+        # Bumped on every navigation we initiate. WebKit keeps delivering events
+        # for a load after a newer one has replaced it, so a waiter records the
+        # generation it belongs to and stale events are dropped instead of
+        # resolving the wrong request.
+        self.generation = 0
 
     def info(self):
         return {
@@ -99,6 +127,15 @@ class Browser(Gtk.Window):
                 None,
                 None,
             )
+        )
+
+        # Context tuning must happen before the first WebView exists, since the
+        # process model is fixed once a web process has been spawned.
+        for note in perf.tune_context(WebKit2.WebContext.get_default()):
+            print("perf: %s" % note, flush=True)
+        perf.load_content_filter(
+            self.content,
+            lambda n: print("perf: content blocker active (%s rules)" % n, flush=True),
         )
 
         self._build_chrome()
@@ -158,6 +195,15 @@ class Browser(Gtk.Window):
         right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         right.get_style_context().add_class("cb-nav")
         right.pack_start(
+            self._icon_button("format-justify-left-symbolic", "TL;DR this page (Ctrl+Shift+S)",
+                              lambda *_: self.tldr()), False, False, 0)
+        right.pack_start(
+            self._icon_button("view-list-symbolic", "Research across all tabs (Ctrl+Shift+R)",
+                              lambda *_: self.research()), False, False, 0)
+        right.pack_start(
+            self._icon_button("system-run-symbolic", "Command Claude to drive (Ctrl+G)",
+                              lambda *_: self.open_panel("agent")), False, False, 0)
+        right.pack_start(
             self._icon_button("starred-symbolic", "Ask Claude about this page (Ctrl+K)",
                               lambda *_: self.toggle_ask()), False, False, 0)
         right.pack_start(
@@ -178,32 +224,52 @@ class Browser(Gtk.Window):
         self.notebook.connect("switch-page", self._on_switch)
         root.pack_start(self.notebook, True, True, 0)
 
-        self.ask_box = self._build_ask()
-        root.pack_start(self.ask_box, False, False, 0)
+        self.panel_mode = "ask"
+        self.active_agent = None
+        self.panel = self._build_panel()
+        root.pack_start(self.panel, False, False, 0)
 
-    def _build_ask(self):
+    def _build_panel(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         box.get_style_context().add_class("cb-ask")
         box.set_no_show_all(True)
 
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.panel_label = Gtk.Label(label="Ask Claude")
+        self.panel_label.set_xalign(0)
+        self.panel_label.get_style_context().add_class("cb-hint")
+        head.pack_start(self.panel_label, True, True, 0)
+        stop = Gtk.Button(label="Stop")
+        stop.get_style_context().add_class("cb-tabclose")
+        stop.set_can_focus(False)
+        stop.connect("clicked", lambda *_: self._stop_agent())
+        head.pack_start(stop, False, False, 0)
+        close = self._icon_button("window-close-symbolic", "Close (Esc)",
+                                  lambda *_: self.panel.hide())
+        head.pack_start(close, False, False, 0)
+        box.pack_start(head, False, False, 0)
+
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_min_content_height(150)
-        self.ask_view = Gtk.TextView()
-        self.ask_view.get_style_context().add_class("cb-ask-view")
-        self.ask_view.set_editable(False)
-        self.ask_view.set_cursor_visible(False)
-        self.ask_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        scroll.add(self.ask_view)
-        self.ask_scroll = scroll
+        scroll.set_min_content_height(170)
+        self.panel_view = Gtk.TextView()
+        self.panel_view.get_style_context().add_class("cb-ask-view")
+        self.panel_view.set_editable(False)
+        self.panel_view.set_cursor_visible(False)
+        self.panel_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        scroll.add(self.panel_view)
+        self.panel_scroll = scroll
         box.pack_start(scroll, True, True, 0)
 
-        self.ask_entry = Gtk.Entry()
-        self.ask_entry.get_style_context().add_class("cb-omnibox")
-        self.ask_entry.set_placeholder_text("Ask Claude about this page…  (Esc to close)")
-        self.ask_entry.connect("activate", self._on_ask)
-        box.pack_start(self.ask_entry, False, False, 0)
+        self.panel_entry = Gtk.Entry()
+        self.panel_entry.get_style_context().add_class("cb-omnibox")
+        self.panel_entry.connect("activate", self._on_panel_entry)
+        box.pack_start(self.panel_entry, False, False, 0)
         return box
+
+    def _stop_agent(self):
+        if getattr(self, "active_agent", None):
+            self.active_agent.cancel()
 
     def _bind_keys(self):
         accel = {
@@ -213,6 +279,10 @@ class Browser(Gtk.Window):
             ("w", Gdk.ModifierType.CONTROL_MASK): lambda: self.close_tab(self.current()),
             ("r", Gdk.ModifierType.CONTROL_MASK): self._reload,
             ("k", Gdk.ModifierType.CONTROL_MASK): self.toggle_ask,
+            ("g", Gdk.ModifierType.CONTROL_MASK): lambda: self.open_panel("agent"),
+            ("s", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK): self.tldr,
+            ("r", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                lambda: self.research(),
             ("q", Gdk.ModifierType.CONTROL_MASK): Gtk.main_quit,
             ("equal", Gdk.ModifierType.CONTROL_MASK): lambda: self._zoom(0.1),
             ("minus", Gdk.ModifierType.CONTROL_MASK): lambda: self._zoom(-0.1),
@@ -230,8 +300,9 @@ class Browser(Gtk.Window):
             action()
             return True
         if event.keyval == Gdk.KEY_Escape:
-            if self.ask_box.get_visible():
-                self.ask_box.hide()
+            if self.panel.get_visible():
+                self._stop_agent()
+                self.panel.hide()
                 tab = self.current()
                 if tab:
                     tab.view.grab_focus()
@@ -246,23 +317,20 @@ class Browser(Gtk.Window):
     # -- tabs ---------------------------------------------------------------
 
     def new_tab(self, url=HOME, background=False):
-        tab = Tab(self.content)
+        related = self.tabs[0].view if self.tabs else None
+        tab = Tab(self.content, related=related)
         view = tab.view
 
-        s = view.get_settings()
-        s.set_enable_developer_extras(True)
-        s.set_enable_smooth_scrolling(True)
-        s.set_enable_page_cache(True)
-        s.set_javascript_can_open_windows_automatically(False)
-        if os.environ.get("CB_GPU", "").lower() in ("off", "0", "none"):
-            # Old integrated GPUs render worse than software here; opt-in escape hatch.
-            s.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.NEVER)
+        perf.tune_view(view)
 
         view.connect("load-changed", self._on_load, tab)
         view.connect("load-failed", self._on_fail, tab)
         view.connect("notify::title", lambda *_: self._refresh(tab))
         view.connect("notify::uri", lambda *_: self._refresh(tab))
-        view.connect("notify::estimated-load-progress", lambda *_: self._refresh(tab))
+        # Progress fires many times a second per frame. Repainting the whole bar
+        # each time is work stolen from the layout we are waiting on, so this one
+        # is coalesced onto a timer while the others stay immediate.
+        view.connect("notify::estimated-load-progress", lambda *_: self._refresh_soon(tab))
         view.connect("create", self._on_popup)
 
         label = self._tab_label(tab)
@@ -338,6 +406,14 @@ class Browser(Gtk.Window):
         self._refresh(tab)
 
     def _on_fail(self, _view, _event, uri, error, tab):
+        # A load that was cancelled or interrupted because a *newer* navigation
+        # started is not a failure of anything the caller asked for. WebKit
+        # reports both, and treating them as errors is what made the benchmark
+        # report "Frame load interrupted (theverge.com)" while waiting on CNN.
+        if (error.matches(WebKit2.network_error_quark(), WebKit2.NetworkError.CANCELLED)
+                or error.matches(WebKit2.policy_error_quark(),
+                                 WebKit2.PolicyError.FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE)):
+            return False
         tab.failed = "%s (%s)" % (error.message, uri)
         tab.loading = False
         self._settle(tab, {"ok": False, "error": tab.failed, **tab.info()})
@@ -345,10 +421,32 @@ class Browser(Gtk.Window):
         return False
 
     def _settle(self, tab, payload):
-        """Hand the same result to everyone waiting on this tab's load, once."""
+        """Resolve everyone waiting on this tab's *current* load, once.
+
+        Waiters from an older generation are resolved too -- their navigation was
+        superseded, and leaving them hanging until the control timeout is worse
+        than telling them so.
+        """
         waiters, tab.waiters = tab.waiters, []
-        for done in waiters:
-            done(payload)
+        for generation, done in waiters:
+            if generation == tab.generation:
+                done(payload)
+            else:
+                done({"ok": False, "error": "superseded by a newer navigation",
+                      **tab.info()})
+
+    def _refresh_soon(self, tab):
+        """Coalesce progress-driven repaints to ~10/s instead of every tick."""
+        if getattr(tab, "_refresh_pending", False):
+            return
+        tab._refresh_pending = True
+
+        def fire():
+            tab._refresh_pending = False
+            self._refresh(tab)
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add(100, fire)
 
     def _refresh(self, tab):
         title = tab.view.get_title() or tab.view.get_uri() or "New tab"
@@ -399,55 +497,170 @@ class Browser(Gtk.Window):
         tab.view.set_zoom_level(1.0 if delta is None
                                 else max(0.3, min(4.0, tab.view.get_zoom_level() + delta)))
 
-    # -- ask Claude ---------------------------------------------------------
+    # -- the Claude panel ---------------------------------------------------
+    # One panel, four modes. Each mode is just a different prompt over the same
+    # extract-then-stream path, so they share rendering, scrolling and cancel.
+
+    def open_panel(self, mode):
+        self.panel_mode = mode
+        self.panel_label.set_text(PANEL_MODES[mode]["label"])
+        self.panel_entry.set_placeholder_text(PANEL_MODES[mode]["placeholder"])
+        self.panel_entry.set_sensitive(PANEL_MODES[mode]["takes_input"])
+        self.panel.show()
+        self.panel.show_all()
+        if PANEL_MODES[mode]["takes_input"]:
+            self.panel_entry.grab_focus()
+        return self.panel
 
     def toggle_ask(self):
-        if self.ask_box.get_visible():
-            self.ask_box.hide()
+        if self.panel.get_visible() and self.panel_mode == "ask":
+            self.panel.hide()
         else:
-            self.ask_box.show()
-            self.ask_box.show_all()
-            self.ask_entry.grab_focus()
+            self.open_panel("ask")
 
-    def _ask_write(self, text, replace=False):
-        buf = self.ask_view.get_buffer()
+    def _panel_write(self, text, replace=False):
+        buf = self.panel_view.get_buffer()
         if replace:
             buf.set_text(text)
         else:
             buf.insert(buf.get_end_iter(), text)
-        adj = self.ask_scroll.get_vadjustment()
+        adj = self.panel_scroll.get_vadjustment()
         adj.set_value(adj.get_upper() - adj.get_page_size())
         return GLib.SOURCE_REMOVE
 
-    def _on_ask(self, entry):
-        question = entry.get_text().strip()
-        if not question:
-            return
-        entry.set_text("")
-        self._ask_write("You: %s\n\nClaude: " % question, replace=True)
+    def _run_stream(self, make_generator, header):
+        """Drive a text-producing generator on a worker thread.
 
-        def with_page(result):
-            page = result.get("result") if isinstance(result, dict) else None
-            if not isinstance(page, dict):
-                page = {"url": "", "title": "", "text": ""}
-            self._stream_answer(question, page)
-
-        self.api_eval(None, extract.TEXT, with_page)
-
-    def _stream_answer(self, question, page):
+        The generator does blocking network I/O, so it cannot run on the GTK
+        thread; every write comes back through idle_add.
+        """
         import threading
+
+        self._panel_write(header, replace=True)
 
         def work():
             try:
-                for chunk in ai.ask(question, page):
-                    GLib.idle_add(self._ask_write, chunk)
+                for chunk in make_generator():
+                    GLib.idle_add(self._panel_write, chunk)
             except ai.NoKey as e:
-                GLib.idle_add(self._ask_write, str(e))
-            except Exception as e:  # a crashed thread must not silently do nothing
-                GLib.idle_add(self._ask_write, "\n[error] %r" % (e,))
-            GLib.idle_add(self._ask_write, "\n\n")
+                GLib.idle_add(self._panel_write, str(e))
+            except Exception as e:
+                GLib.idle_add(self._panel_write, "\n[error] %r" % (e,))
+            GLib.idle_add(self._panel_write, "\n")
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _with_page(self, then, tab_id=None):
+        """Fetch the readable text of a tab, then hand it to `then`."""
+        def got(result):
+            page = result.get("result") if isinstance(result, dict) else None
+            then(page if isinstance(page, dict) else {"url": "", "title": "", "text": ""})
+
+        self.api_eval(tab_id, extract.TEXT, got)
+
+    # -- mode: TL;DR (a button, never automatic) ----------------------------
+
+    def tldr(self):
+        """Summarize the current page on demand.
+
+        Deliberately not run on page load: that would mean an API call for every
+        navigation, which is slow here and costs money on pages you never read.
+        """
+        self.open_panel("tldr")
+        self._panel_write("Reading page…", replace=True)
+        self._with_page(lambda page: self._run_stream(
+            lambda: ai.summarize(page),
+            "TL;DR — %s\n\n" % (page.get("title") or page.get("url") or "this page")))
+
+    # -- mode: research across tabs -----------------------------------------
+
+    def research(self, question=None):
+        """Read every open tab and synthesize across them."""
+        self.open_panel("research")
+        tabs = list(self.tabs)
+        if not tabs:
+            return self._panel_write("No tabs open.", replace=True)
+        self._panel_write("Reading %d tab%s…\n" % (len(tabs), "" if len(tabs) == 1 else "s"),
+                          replace=True)
+
+        pages = []
+
+        def next_tab(index):
+            if index >= len(tabs):
+                titles = "\n".join(
+                    "  %d. %s" % (i + 1, p.get("title") or p.get("url") or "(untitled)")
+                    for i, p in enumerate(pages))
+                return self._run_stream(
+                    lambda: ai.synthesize(pages, question),
+                    "Across %d tabs:\n%s\n\n" % (len(pages), titles))
+
+            def got(page):
+                if (page.get("text") or "").strip():
+                    pages.append(page)
+                next_tab(index + 1)
+
+            self._with_page(got, tab_id=tabs[index].id)
+
+        next_tab(0)
+
+    # -- mode: agentic command bar ------------------------------------------
+
+    def call_sync(self, method, *args, timeout=90):
+        """Run an api_* method on the GTK main loop and block until it answers.
+
+        Same bridge control.py uses for HTTP requests, exposed for the in-browser
+        agent. Only ever call this from a worker thread -- calling it from the
+        GTK thread would deadlock waiting on a loop that cannot run.
+        """
+        import queue
+
+        box = queue.Queue(1)
+
+        def on_main():
+            try:
+                getattr(self, method)(*args, box.put)
+            except Exception as e:
+                box.put({"ok": False, "error": repr(e)})
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(on_main)
+        try:
+            return box.get(timeout=timeout)
+        except queue.Empty:
+            return {"ok": False, "error": "timed out"}
+
+    def run_agent(self, goal):
+        import threading
+
+        self._panel_write("⌘ %s\n\n" % goal, replace=True)
+
+        def emit(text):
+            GLib.idle_add(self._panel_write, text)
+
+        self.active_agent = agent.Agent(self.call_sync, emit)
+
+        def work():
+            try:
+                self.active_agent.run(goal)
+            except Exception as e:
+                emit("\n[error] %r\n" % (e,))
+            emit("\n")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_panel_entry(self, entry):
+        text = entry.get_text().strip()
+        if not text:
+            return
+        entry.set_text("")
+        mode = self.panel_mode
+        if mode == "agent":
+            self.run_agent(text)
+        elif mode == "research":
+            self.research(text)
+        else:
+            self._with_page(lambda page: self._run_stream(
+                lambda: ai.ask(text, page), "You: %s\n\nClaude: " % text))
 
     # -- agent API ----------------------------------------------------------
     # Every method here takes a trailing `done` callback and calls it once.
@@ -459,12 +672,14 @@ class Browser(Gtk.Window):
 
     def api_open(self, url, background, wait, done):
         tab = self.new_tab(url, background=background)
+        self._begin_load(tab)
         self._await_load(tab, wait, done)
 
     def api_navigate(self, tab_id, url, wait, done):
         tab = self.find(tab_id)
         if not tab:
             return done({"ok": False, "error": "no such tab"})
+        self._begin_load(tab)
         tab.view.load_uri(normalize(url))
         self._await_load(tab, wait, done)
 
@@ -475,10 +690,12 @@ class Browser(Gtk.Window):
         if direction < 0:
             if not tab.view.can_go_back():
                 return done({"ok": False, "error": "no history behind", **tab.info()})
+            self._begin_load(tab)
             tab.view.go_back()
         else:
             if not tab.view.can_go_forward():
                 return done({"ok": False, "error": "no history ahead", **tab.info()})
+            self._begin_load(tab)
             tab.view.go_forward()
         self._await_load(tab, wait, done)
 
@@ -486,6 +703,7 @@ class Browser(Gtk.Window):
         tab = self.find(tab_id)
         if not tab:
             return done({"ok": False, "error": "no such tab"})
+        self._begin_load(tab)
         tab.view.reload()
         self._await_load(tab, wait, done)
 
@@ -502,6 +720,20 @@ class Browser(Gtk.Window):
             return done({"ok": False, "error": "no such tab"})
         self._await_load(tab, True, done)
 
+    def _begin_load(self, tab):
+        """Mark the tab busy *synchronously*, at the moment navigation is asked
+        for.
+
+        load_uri() is asynchronous: WebKit does not emit load-changed STARTED
+        before it returns. Without this, _await_load looks at a tab that is still
+        flagged idle, concludes the load already finished, and hands back the
+        previous page immediately -- so `open X` then `text` reports the page you
+        navigated away from. It showed up as 0.07s "page loads" in the benchmark.
+        """
+        tab.generation += 1
+        tab.loading = True
+        tab.failed = None
+
     def _await_load(self, tab, wait, done):
         if not wait:
             return done({"ok": True, **tab.info()})
@@ -510,7 +742,7 @@ class Browser(Gtk.Window):
             # navigation, which is what waiting unconditionally would do.
             return done({"ok": tab.failed is None, **tab.info(),
                          **({"error": tab.failed} if tab.failed else {})})
-        tab.waiters.append(done)
+        tab.waiters.append((tab.generation, done))
 
     def api_eval(self, tab_id, script, done):
         tab = self.find(tab_id)

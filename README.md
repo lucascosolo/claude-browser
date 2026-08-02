@@ -75,10 +75,22 @@ Right-clicking the menu entry offers **New Window** and **New Window (no agent A
 The address bar navigates when the input looks like an address and searches
 otherwise. Tabs appear only once there is more than one.
 
-**Ask Claude** (`Ctrl+K`) extracts the readable text of the page, sends it with your
-question, and streams the answer into a panel at the bottom. It needs
-`ANTHROPIC_API_KEY` in the environment; everything else in the browser works
-without one.
+### The Claude panel
+
+One panel at the bottom, four modes. All need `ANTHROPIC_API_KEY`; everything
+else in the browser works without one.
+
+| | | |
+|---|---|---|
+| `Ctrl+K` | **Ask** | Question about the current page. |
+| `Ctrl+Shift+S` | **TL;DR** | Summarize this page. A button, never automatic — a request per page load would be slow and costs money on pages you never read. |
+| `Ctrl+Shift+R` | **Research** | Reads *every open tab* and synthesizes across them. Leads with a table when they're comparable. |
+| `Ctrl+G` | **Command** | Give Claude a goal and it drives the browser — navigating, reading, clicking — in the window you're watching, on your own logged-in session. `Stop` cancels mid-run. |
+
+The command bar is the control API turned inward: the same navigate/read/click
+primitives an external agent gets over HTTP, handed to a tool-use loop inside
+the browser. It won't submit forms or change account state unless the goal
+plainly asks for it.
 
 ## Driving it from an agent
 
@@ -130,6 +142,36 @@ curl -s 127.0.0.1:8765/open -d '{"url":"https://example.com"}'
 Navigation routes block until the load finishes, so an agent can `open` then `text`
 without polling. Pass `wait=false` to return immediately. Every route takes an
 optional `tab` id and defaults to the focused tab.
+
+## Performance on slow hardware
+
+Developed against a Celeron N3060 — two cores at 1.6GHz, 4GB of RAM, swap in
+use. What's done about it:
+
+- **Ad/tracker blocking is on by default** (`CB_BLOCK=0` disables it). 82 rules
+  compiled into WebKit's native content-blocker bytecode and cached on disk.
+- **Tabs share one web process.** WebKit's default is one process per view,
+  which on a swapping box is what makes a fourth tab hurt. Note that
+  `set_process_model()` is a no-op in WebKitGTK 2.52 despite being the obvious
+  call — the mechanism that actually works is creating each view *related* to
+  the first, which is what `new_tab` does.
+- **Smooth scrolling and WebGL off**, browser cache model, memory-pressure
+  handler, and progress repaints coalesced to 10/s.
+
+**Honest caveat on the numbers:** `tools/bench.py` measures load time with and
+without the blocker, but on this hardware it could not produce a trustworthy
+result — the same URL took 2.9s in one run and timed out at 90s in another.
+Swap pressure and network variance both exceed the effect being measured. The
+tuning above is sound in principle and the blocker demonstrably loads (82 rules,
+verified), but no speedup figure here has been earned, so none is quoted.
+
+Python is not the bottleneck, which was worth checking: during a page load the
+CPU is entirely `WebKitWebProcess` (15–21%) and `WebKitNetworkProcess` (8–20%) —
+the Python chrome never rises above the noise floor. The interpreter costs 8.8MB
+of RSS against WebKit's ~350MB, and the GTK/WebKit libraries that make up the
+rest would be loaded by a C or Rust build too. The one real cost is startup:
+~2.9s, nearly all of it loading GObject typelibs. A Rust rewrite via Tauri would
+use this same WebKit engine and render no faster.
 
 ## Design notes
 

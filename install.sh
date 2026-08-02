@@ -12,22 +12,38 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-ICONS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+HICOLOR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
 BIN="$HOME/.local/bin"
 DESKTOP="$APPS/claude-browser.desktop"
+SIZES=(16 22 24 32 48 64 128 256 512)
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-    rm -fv "$DESKTOP" "$ICONS/claude-browser.svg" \
+    for s in "${SIZES[@]}"; do
+        rm -f "$HICOLOR/${s}x${s}/apps/claude-browser.png"
+    done
+    rm -fv "$DESKTOP" "$HICOLOR/scalable/apps/claude-browser.svg" \
            "$BIN/claude-browser" "$BIN/cbctl" "$BIN/cb-mcp"
     update-desktop-database "$APPS" 2>/dev/null || true
-    gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
+    gtk-update-icon-cache -f -t "$HICOLOR" 2>/dev/null || true
     echo "Removed. The checkout at $HERE is untouched."
     exit 0
 fi
 
-mkdir -p "$APPS" "$ICONS" "$BIN"
+mkdir -p "$APPS" "$BIN"
 
-install -m 0644 "$HERE/packaging/claude-browser.svg" "$ICONS/claude-browser.svg"
+if [[ ! -f "$HERE/packaging/icons/claude-browser-48.png" ]]; then
+    echo "Icons are missing. Generating them from logo.png..."
+    python3 "$HERE/packaging/make-icons.py"
+fi
+
+for s in "${SIZES[@]}"; do
+    mkdir -p "$HICOLOR/${s}x${s}/apps"
+    install -m 0644 "$HERE/packaging/icons/claude-browser-${s}.png" \
+                    "$HICOLOR/${s}x${s}/apps/claude-browser.png"
+done
+# An old scalable entry would outrank every sized PNG in icon lookup, so a
+# stale one from a previous install has to go.
+rm -f "$HICOLOR/scalable/apps/claude-browser.svg"
 
 # Absolute Exec path: a desktop entry is launched by the session, which does not
 # inherit your shell's PATH or working directory.
@@ -41,7 +57,7 @@ ln -sfn "$HERE/cb-mcp" "$BIN/cb-mcp"
 # XFCE's menu watches these directories, but the caches are what make the entry
 # appear immediately rather than at next login.
 update-desktop-database "$APPS" 2>/dev/null || true
-gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
+gtk-update-icon-cache -f -t "$HICOLOR" 2>/dev/null || true
 
 # Detached, and never waited on: `xfce4-panel --restart` re-execs the panel and
 # keeps the calling terminal attached, so a plain call hangs this script until
@@ -59,7 +75,7 @@ fi
 echo
 echo "Installed:"
 echo "  menu entry   $DESKTOP"
-echo "  icon         $ICONS/claude-browser.svg"
+echo "  icons        $HICOLOR/{16x16..512x512}/apps/claude-browser.png"
 echo "  commands     $BIN/{claude-browser,cbctl,cb-mcp}"
 echo
 echo "Find it in Applications > Internet, or search 'Claude Browser'."

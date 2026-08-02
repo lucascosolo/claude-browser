@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+from pathlib import Path
 
 from . import control
 
@@ -46,12 +47,24 @@ def main(argv=None):
     # StartupWMClass in claude-browser.desktop.
     GLib.set_prgname("claude-browser")
     GLib.set_application_name("Claude Browser")
+
+    # Prefer the themed icon, which install.sh puts in hicolor at every size so
+    # the panel picks the one it wants. Running straight from a checkout there
+    # is no themed icon, so fall back to the generated PNG on disk rather than
+    # showing the stock GTK placeholder.
     Gtk.Window.set_default_icon_name("claude-browser")
+    if not Gtk.IconTheme.get_default().has_icon("claude-browser"):
+        fallback = Path(__file__).resolve().parent.parent / "packaging" / "icons" / "claude-browser.png"
+        if fallback.exists():
+            try:
+                Gtk.Window.set_default_icon_from_file(str(fallback))
+            except GLib.Error:
+                pass  # a missing window icon is not worth failing to launch over
 
     dark = None if args.theme is None else (args.theme == "dark")
     browser = Browser(urls=args.urls or None, dark=dark)
     browser.show_all()
-    browser.ask_box.hide()
+    browser.panel.hide()
     browser.progress.hide()
     browser.notebook.set_show_tabs(len(browser.tabs) > 1)
 
