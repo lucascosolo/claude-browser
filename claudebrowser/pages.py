@@ -31,6 +31,9 @@ NAV = (
     ("cb:deck", "Deck", "M3 5h8v6H3zm10 0h8v6h-8zM3 13h8v6H3zm10 0h8v6h-8z"),
     ("cb:bookmarks", "Saved", "M6 3h12v18l-6-4.5L6 21z"),
     ("cb:history", "History", "M12 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-7-7v4l5-5-5-5zM11 8v5l4 2"),
+    ("cb:passwords", "Logins",
+     "M6 10V7a6 6 0 1 1 12 0v3h1a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1"
+     " 0 0 1 1-1zm2 0h8V7a4 4 0 0 0-8 0z"),
 )
 
 
@@ -246,6 +249,68 @@ def bookmarks_page(palette, nonce, rows, query=""):
                  search=("Search bookmarks…", query))
 
 
+def passwords_page(palette, nonce, rows, never=(), available=True):
+    """Saved logins. Secrets are not in this HTML until one is asked for.
+
+    The page renders usernames and origins only; a password reaches the document
+    when the eye is clicked and not before. That keeps the common case -- a page
+    left open on another workspace -- from being a plaintext credential dump.
+    """
+    if not available:
+        return shell("Logins", palette, nonce, "cb:passwords", _empty(
+            "&#128274;", "The system keyring is unavailable",
+            "Logins are stored in the freedesktop Secret Service. On this desktop "
+            "that is <code>gnome-keyring</code> — start it and reopen the browser."))
+
+    if rows:
+        body = '<div class="rows">%s</div>' % "".join(
+            _login_row(i, r["origin"], r["username"]) for i, r in enumerate(rows))
+    else:
+        body = _empty("&#128274;", "No saved logins",
+                      "Sign in to a site and the browser will offer to save it.")
+
+    if never:
+        body += ('<h2>Never ask on these sites <em>%d</em></h2>'
+                 '<div class="rows">%s</div>'
+                 % (len(never), "".join(_never_row(o) for o in never)))
+    return shell("Logins", palette, nonce, "cb:passwords", body)
+
+
+def _login_row(index, origin, username):
+    letter, hue = _mark(origin)
+    return """
+    <div class="row login">
+      <span class="mark sm" style="--h:%(hue)d">%(letter)s</span>
+      <span class="rt">%(user)s</span>
+      <span class="ru">%(origin)s</span>
+      <span class="rw"><code class="pw" data-k="%(i)d">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</code></span>
+      <button class="act" onclick="return cbui.pwshow(event, %(jo)s, %(ju)s, %(i)d)"
+              title="Show this password">&#128065;</button>
+      <button class="act" onclick="return cbui.pwdrop(event, %(jo)s, %(ju)s)"
+              title="Delete this saved login">&times;</button>
+    </div>""" % {
+        "hue": hue, "letter": _e(letter), "i": index,
+        "user": _e(username or "(no username)"),
+        "origin": _e(origin),
+        "jo": _js(origin), "ju": _js(username or ""),
+    }
+
+
+def _never_row(origin):
+    letter, hue = _mark(origin)
+    return """
+    <div class="row login">
+      <span class="mark sm" style="--h:%(hue)d">%(letter)s</span>
+      <span class="rt">%(origin)s</span>
+      <span class="ru">saving is turned off here</span>
+      <span class="rw"></span>
+      <button class="act" onclick="return cbui.pwallow(event, %(jo)s)"
+              title="Offer to save logins here again">&#8635;</button>
+    </div>""" % {
+        "hue": hue, "letter": _e(letter), "origin": _e(origin), "jo": _js(origin),
+    }
+
+
 def deck(palette, nonce, tabs):
     """Every open tab as a card.
 
@@ -421,6 +486,13 @@ h2 .more:hover { text-decoration:underline; }
 .act:hover { background:var(--panel); color:var(--text); }
 .act.on { color:var(--accent); }
 
+/* On cb:passwords the buttons are the reason the page exists, so they do not
+   hide until hover the way they do on a grid of bookmarks -- a delete you have
+   to discover by sweeping the mouse is a delete nobody finds. */
+.row.login .act { opacity:.5; }
+.row.login:hover .act { opacity:1; }
+.rows + h2 { margin-top:26px; }
+
 .day { font-size:11.5px; text-transform:uppercase; letter-spacing:.07em;
        color:var(--dim); font-weight:700; margin:22px 0 8px; }
 .rows { display:flex; flex-direction:column; gap:4px; }
@@ -430,6 +502,14 @@ h2 .more:hover { text-decoration:underline; }
 .ru { flex:1 1 auto; font-size:11.5px; color:var(--dim); white-space:nowrap;
       overflow:hidden; text-overflow:ellipsis; }
 .rw { flex:0 0 auto; font-size:11px; color:var(--dim); }
+
+/* A saved password renders as dots until it is asked for; `.shown` is the only
+   state in which a secret is in this document at all. */
+.pw { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
+      letter-spacing:.12em; color:var(--dim); }
+.pw.shown { color:var(--text); letter-spacing:0;
+            background:var(--soft); padding:1px 6px; border-radius:4px;
+            user-select:all; }
 
 .card { padding:12px 13px; cursor:pointer; display:flex; flex-direction:column; gap:7px; }
 .card.cur { border-color:var(--accent); box-shadow:0 0 0 2px var(--soft); }
@@ -510,6 +590,31 @@ _DOC = """<!doctype html>
       if (el) { el.style.transition = 'opacity .12s'; el.style.opacity = '0';
                 setTimeout(function () { el.remove(); }, 120); }
       return this.send({action: 'forget', url: url});
+    },
+    pwshow: function (ev, origin, username, index) {
+      ev.preventDefault(); ev.stopPropagation();
+      // The secret is not in this document yet. Ask for it; reveal() writes it
+      // in when the browser answers.
+      return this.send({action: 'pw_reveal', url: origin, title: username,
+                        idx: index});
+    },
+    reveal: function (index, secret) {
+      var el = document.querySelector('.pw[data-k="' + index + '"]');
+      if (el) { el.textContent = secret; el.classList.add('shown'); }
+    },
+    pwdrop: function (ev, origin, username) {
+      ev.preventDefault(); ev.stopPropagation();
+      var el = ev.currentTarget.closest('.row');
+      if (el) { el.style.transition = 'opacity .12s'; el.style.opacity = '0';
+                setTimeout(function () { el.remove(); }, 120); }
+      return this.send({action: 'pw_forget', url: origin, title: username});
+    },
+    pwallow: function (ev, origin) {
+      ev.preventDefault(); ev.stopPropagation();
+      var el = ev.currentTarget.closest('.row');
+      if (el) { el.style.transition = 'opacity .12s'; el.style.opacity = '0';
+                setTimeout(function () { el.remove(); }, 120); }
+      return this.send({action: 'pw_allow', url: origin});
     },
     confirmClear: function () {
       // Deliberately not window.confirm(): a modal dialog inside a WebView

@@ -18,11 +18,37 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import (agent, ai, auth, extract, pages, panel_html, perf, store,  # noqa: E402
-               style, tabnames)
+from . import (agent, ai, auth, extract, pages, panel_html, passwords, perf,  # noqa: E402
+               store, style, tabnames)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
+
+# What the hamburger holds: (heading, ((icon, label, accelerator, action), ...)).
+# Claude comes first because it is the reason this browser exists; everything
+# below it is ordinary browser furniture. Accelerators are shown rather than
+# hidden in tooltips -- a menu is where you learn the shortcut that means you
+# never open the menu again.
+MENU_SECTIONS = (
+    ("Claude", (
+        ("dialog-question-symbolic", "Ask about this page", "Ctrl+K", "ask"),
+        ("format-justify-left-symbolic", "TL;DR this page", "Ctrl+Shift+S", "tldr"),
+        ("view-list-symbolic", "Research across all tabs", "Ctrl+Shift+R", "research"),
+        ("system-run-symbolic", "Let Claude drive", "Ctrl+G", "agent"),
+    )),
+    ("New", (
+        ("tab-new-symbolic", "Tab", "Ctrl+T", "newtab"),
+        # user-not-tracked rather than a keyhole or a shield: the promise of a
+        # private tab is that nothing is written down, not that it is encrypted.
+        ("user-not-tracked-symbolic", "Private tab", "Ctrl+Shift+P", "private"),
+    )),
+    ("Library", (
+        ("view-grid-symbolic", "Deck", "Ctrl+Shift+A", "cb:deck"),
+        ("user-bookmarks-symbolic", "Bookmarks", "Ctrl+Shift+O", "cb:bookmarks"),
+        ("document-open-recent-symbolic", "History", "Ctrl+H", "cb:history"),
+        ("dialog-password-symbolic", "Saved logins", "", "cb:passwords"),
+    )),
+)
 INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history")
 # console.* is not exposed to the embedder in webkit2gtk, so we shim it in the
 # page at document-start and read the ring buffer back out with JS later.
@@ -179,15 +205,16 @@ class Browser(Gtk.Window):
         # reads. The tradeoff is that console output from inside an iframe is
         # not captured.
         self.content = WebKit2.UserContentManager()
-        self.content.add_script(
-            WebKit2.UserScript.new(
-                CONSOLE_SHIM,
-                WebKit2.UserContentInjectedFrames.TOP_FRAME,
-                WebKit2.UserScriptInjectionTime.START,
-                None,
-                None,
+        for script in (CONSOLE_SHIM, passwords.PASSWORD_JS):
+            self.content.add_script(
+                WebKit2.UserScript.new(
+                    script,
+                    WebKit2.UserContentInjectedFrames.TOP_FRAME,
+                    WebKit2.UserScriptInjectionTime.START,
+                    None,
+                    None,
+                )
             )
-        )
 
         # History and bookmarks. A failure here must not stop the browser from
         # opening -- a read-only home directory should cost you your history,
@@ -205,6 +232,14 @@ class Browser(Gtk.Window):
         self.nonce = secrets.token_urlsafe(24)
         self.content.register_script_message_handler("cbui")
         self.content.connect("script-message-received::cbui", self._on_ui_message)
+
+        # Saved logins. The keyring is optional in exactly the way history is:
+        # a machine without a Secret Service loses password saving, not its
+        # browser. `cb:passwords` says so rather than rendering an empty list.
+        self.vault = passwords.open_vault()
+        self.content.register_script_message_handler("cbpw")
+        self.content.connect("script-message-received::cbpw", self._on_pw_message)
+        self.pw_offer = None
 
         # Context tuning must happen before the first WebView exists, since the
         # process model is fixed once a web process has been spawned.
@@ -304,25 +339,9 @@ class Browser(Gtk.Window):
         self.btn_star.get_style_context().add_class("cb-star")
         right.pack_start(self.btn_star, False, False, 0)
         right.pack_start(
-            self._icon_button("format-justify-left-symbolic", "TL;DR this page (Ctrl+Shift+S)",
-                              lambda *_: self.tldr()), False, False, 0)
-        right.pack_start(
-            self._icon_button("view-list-symbolic", "Research across all tabs (Ctrl+Shift+R)",
-                              lambda *_: self.research()), False, False, 0)
-        right.pack_start(
-            self._icon_button("system-run-symbolic", "Command Claude to drive (Ctrl+G)",
-                              lambda *_: self.open_panel("agent")), False, False, 0)
-        right.pack_start(
-            self._icon_button("dialog-question-symbolic",
-                              "Ask Claude about this page (Ctrl+K)",
-                              lambda *_: self.toggle_ask()), False, False, 0)
-        right.pack_start(
-            self._icon_button("view-grid-symbolic", "Deck — every tab as a card "
-                                                    "(Ctrl+Shift+A)",
-                              lambda *_: self._open_internal("cb:deck")), False, False, 0)
-        right.pack_start(
             self._icon_button("tab-new-symbolic", "New tab (Ctrl+T)",
                               lambda *_: self.new_tab(HOME)), False, False, 0)
+        right.pack_start(self._build_menu(), False, False, 0)
         bar.pack_start(right, False, False, 0)
         root.pack_start(bar, False, False, 0)
 
@@ -330,6 +349,9 @@ class Browser(Gtk.Window):
         self.progress.get_style_context().add_class("cb-progress")
         self.progress.set_no_show_all(True)
         root.pack_start(self.progress, False, False, 0)
+
+        self.pw_bar = self._build_pw_bar()
+        root.pack_start(self.pw_bar, False, False, 0)
 
         # Page and panel share a draggable split rather than a fixed stack. As a
         # plain box the panel asked for a fixed 279px it could never give back:
@@ -776,6 +798,14 @@ class Browser(Gtk.Window):
             if key == "q":
                 term = GLib.uri_unescape_string(value, None) or ""
 
+        # Checked before the store, because saved logins live in the keyring and
+        # do not care whether the history database opened.
+        if name == "passwords":
+            if self.vault is None:
+                return pages.passwords_page(palette, self.nonce, [], available=False)
+            return pages.passwords_page(palette, self.nonce, self.vault.entries(),
+                                        never=self.vault.never_list())
+
         if self.store is None:
             return pages.shell(
                 name.title(), palette, self.nonce, "cb:" + name,
@@ -821,6 +851,19 @@ class Browser(Gtk.Window):
             self._sync_star()
         elif action == "forget" and self.store:
             self.store.forget(url)
+        elif action == "pw_forget" and self.vault:
+            self.vault.delete(url, title)
+        elif action == "pw_allow" and self.vault:
+            self.vault.clear_never(url)
+        elif action == "pw_reveal" and self.vault:
+            # The page asked for one secret by name. It gets exactly that one,
+            # written back into the row it came from -- cb:passwords is rendered
+            # without any password in it, which is the point of the eye button.
+            secret = self.vault.secret(url, title)
+            tab = self.current()
+            if secret is not None and tab is not None:
+                self._pw_js(tab, "cbui.reveal(%s, %s)"
+                            % (json.dumps(data.get("idx")), json.dumps(secret)))
         elif action == "clear_history" and self.store:
             self.store.clear_history()
             self.store.flush()
@@ -1010,6 +1053,8 @@ class Browser(Gtk.Window):
         elif event == WebKit2.LoadEvent.FINISHED:
             tab.loading = False
             self._remember(tab)
+            self._pw_expire(tab)
+            self._pw_autofill(tab)
             self._settle(tab, {"ok": tab.failed is None, **tab.info(),
                                **({"error": tab.failed} if tab.failed else {})})
         self._refresh(tab)
@@ -1188,6 +1233,206 @@ class Browser(Gtk.Window):
             return
         tab.view.set_zoom_level(1.0 if delta is None
                                 else max(0.3, min(4.0, tab.view.get_zoom_level() + delta)))
+
+    # -- the menu -----------------------------------------------------------
+    # The four Claude actions used to be four unlabelled icons in the toolbar,
+    # which is four chances to misread a wrench or a bulleted list. Under one
+    # heading they explain each other, and the toolbar goes back to holding only
+    # what acts on the page in front of you.
+
+    def _build_menu(self):
+        button = Gtk.MenuButton()
+        button.set_tooltip_text("Menu")
+        button.set_relief(Gtk.ReliefStyle.NONE)
+        button.set_image(
+            Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.MENU))
+        button.get_style_context().add_class("cb-menubtn")
+
+        popover = Gtk.Popover()
+        popover.get_style_context().add_class("cb-menu")
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.get_style_context().add_class("cb-menucard")
+
+        for index, (heading, items) in enumerate(MENU_SECTIONS):
+            title = Gtk.Label(label=heading, xalign=0)
+            ctx = title.get_style_context()
+            ctx.add_class("cb-menuhead")
+            if index:
+                ctx.add_class("cb-menuhead-gap")
+            card.pack_start(title, False, False, 0)
+            for icon, text, accel, key in items:
+                card.pack_start(self._menu_row(icon, text, accel, key, popover),
+                                False, False, 0)
+
+        card.show_all()
+        popover.add(card)
+        button.set_popover(popover)
+        self.menu_button = button
+        return button
+
+    def _menu_row(self, icon, text, accel, key, popover):
+        row = Gtk.Button()
+        row.set_relief(Gtk.ReliefStyle.NONE)
+        row.get_style_context().add_class("cb-menuitem")
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=11)
+        inner.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU),
+                         False, False, 0)
+        inner.pack_start(Gtk.Label(label=text, xalign=0), True, True, 0)
+        if accel:
+            hint = Gtk.Label(label=accel, xalign=1)
+            hint.get_style_context().add_class("cb-accel")
+            inner.pack_start(hint, False, False, 0)
+        row.add(inner)
+
+        def fire(*_):
+            popover.popdown()
+            # Run the action after the popover has actually gone. Doing both in
+            # one frame leaves the popover painted over the window when the
+            # action opens the Claude panel or moves focus.
+            GLib.idle_add(lambda: (self._menu_action(key), GLib.SOURCE_REMOVE)[1])
+
+        row.connect("clicked", fire)
+        return row
+
+    def _menu_action(self, key):
+        if key.startswith("cb:"):
+            return self._open_internal(key)
+        return {
+            "ask": self.toggle_ask,
+            "tldr": self.tldr,
+            "research": self.research,
+            "agent": lambda: self.open_panel("agent"),
+            "newtab": lambda: self.new_tab(HOME),
+            "private": lambda: self.new_tab(HOME, private=True),
+        }[key]()
+
+    # -- saved logins -------------------------------------------------------
+    # Two halves that never meet: filling is driven from here, against an origin
+    # taken from the WebView's own URL, so a page cannot ask for a password it
+    # was not given. Saving starts in the page, but the page only rings a bell --
+    # see the contract at the bottom of passwords.py.
+
+    def _build_pw_bar(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.get_style_context().add_class("cb-pwbar")
+        box.set_no_show_all(True)
+
+        self.pw_label = Gtk.Label(xalign=0)
+        self.pw_label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        box.pack_start(self.pw_label, True, True, 0)
+
+        for text, tip, handler in (
+            ("Save", "Save this login to the system keyring", self._pw_save),
+            ("Never", "Never offer to save a login for this site", self._pw_never),
+            ("Not now", "Dismiss until the next sign-in", self._pw_hide),
+        ):
+            btn = Gtk.Button(label=text)
+            btn.set_tooltip_text(tip)
+            btn.get_style_context().add_class("cb-pwbtn")
+            if text == "Save":
+                btn.get_style_context().add_class("cb-pwbtn-go")
+            btn.connect("clicked", lambda _b, h=handler: h())
+            box.pack_start(btn, False, False, 0)
+        return box
+
+    def _pw_js(self, tab, script, on_value=None):
+        def finished(view, result, _data=None):
+            try:
+                value = view.evaluate_javascript_finish(result)
+            except GLib.Error:
+                return          # a page that navigated out from under us
+            if on_value is not None:
+                on_value(value.to_string() if value is not None else "")
+
+        tab.view.evaluate_javascript(script, -1, None, None, None, finished, None)
+
+    def _pw_expire(self, tab):
+        """Drop a pending offer once the user has left the site it belongs to.
+
+        Deliberately not done when a load *starts*: the navigation that follows
+        a successful sign-in is the one that fires immediately after the offer
+        appears, and cancelling on it would mean the bar never survived long
+        enough to click. Leaving the origin is the real signal.
+        """
+        if not self.pw_offer or tab is not self.current():
+            return
+        if passwords.origin_of(tab.view.get_uri() or "") != self.pw_offer[0]:
+            self._pw_hide()
+
+    def _pw_autofill(self, tab):
+        """Put a saved login into a page that just finished loading."""
+        if self.vault is None or tab.failed:
+            return
+        origin = passwords.origin_of(tab.view.get_uri() or "")
+        if origin is None:
+            return
+        found = self.vault.credentials(origin)
+        if len(found) != 1:
+            # Nothing to do at zero. At two or more we would be picking an
+            # account on the user's behalf, and picking wrong signs them into
+            # the other one without ever saying so. Silence beats a coin flip.
+            return
+        self._pw_js(tab, "window.__cbPwFill ? window.__cbPwFill(%s, %s) : 0" % (
+            json.dumps(found[0]["username"]), json.dumps(found[0]["password"])))
+
+    def _on_pw_message(self, _manager, _result):
+        """A page reports that it has a credential worth offering.
+
+        The message body is a literal `1`. Everything real is read back out of
+        the *focused* view, because the content manager is shared by every tab
+        and the signal therefore cannot say which one rang. A background page
+        ringing the bell gets the foreground page's empty pocket.
+        """
+        if self.vault is None:
+            return
+        tab = self.current()
+        # A private tab does not write. Filling still works there -- reading a
+        # saved password leaves no trace -- but nothing new goes to the keyring.
+        if tab is None or tab.private:
+            return
+        origin = passwords.origin_of(tab.view.get_uri() or "")
+        if origin is None:
+            return
+        self._pw_js(tab, "window.__cbPwTake ? window.__cbPwTake() : ''",
+                    lambda raw: self._pw_maybe_offer(origin, raw))
+
+    def _pw_maybe_offer(self, origin, raw):
+        try:
+            found = json.loads(raw) if raw else None
+        except ValueError:
+            return
+        if not isinstance(found, dict):
+            return
+        username = found.get("username") or ""
+        password = found.get("password") or ""
+        if not self.vault.should_offer(origin, username, password):
+            return
+        self.pw_offer = (origin, username, password)
+        known = self.vault.secret(origin, username) is not None
+        site = origin.split("://", 1)[-1]
+        self.pw_label.set_text(
+            "Update the saved password for %s on %s?" % (username or "this login", site)
+            if known else
+            "Save the password for %s on %s?" % (username or "this login", site))
+        self.pw_bar.show()
+        for child in self.pw_bar.get_children():
+            child.show()
+
+    def _pw_hide(self):
+        self.pw_offer = None
+        self.pw_bar.hide()
+
+    def _pw_save(self):
+        if self.pw_offer and self.vault:
+            origin, username, password = self.pw_offer
+            self.vault.save(origin, username, password)
+        self._pw_hide()
+
+    def _pw_never(self):
+        if self.pw_offer and self.vault:
+            self.vault.set_never(self.pw_offer[0])
+        self._pw_hide()
 
     # -- the Claude panel ---------------------------------------------------
     # One panel, four modes. Each mode is just a different prompt over the same
