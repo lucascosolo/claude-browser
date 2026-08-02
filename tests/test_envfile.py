@@ -62,12 +62,68 @@ class LoadTest(unittest.TestCase):
         self.assertEqual(env, {"A": "1", "B": "2"})
         self.assertEqual(sorted(applied), ["A", "B"])
 
-    def test_real_environment_wins(self):
-        """`CB_BLOCK=0 ./cb` must still override the file for one run."""
+    def test_the_file_wins_over_the_environment(self):
+        """The browser must behave the same from a menu and from a terminal."""
         env = {"A": "from-shell"}
         applied = envfile.load(self.write("A=from-file\nB=2\n"), environ=env)
-        self.assertEqual(env["A"], "from-shell")
-        self.assertEqual(applied, ["B"])
+        self.assertEqual(env["A"], "from-file")
+        self.assertEqual(sorted(applied), ["A", "B"])
+
+    def test_says_so_when_it_overrides_the_environment(self):
+        warnings = []
+        envfile.load(self.write("A=from-file\n"), environ={"A": "from-shell"},
+                     warn=warnings.append)
+        self.assertTrue(any("overrides" in w for w in warnings), warnings)
+
+    def test_no_warning_when_they_agree(self):
+        warnings = []
+        envfile.load(self.write("A=same\n"), environ={"A": "same"}, warn=warnings.append)
+        self.assertEqual(warnings, [])
+
+    def test_secrets_never_reach_the_environment(self):
+        """A child process has no business holding the user's API key."""
+        env = {}
+        applied = envfile.load(self.write("ANTHROPIC_API_KEY=sk-ant-file\nA=1\n"),
+                               environ=env)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertIn("ANTHROPIC_API_KEY", applied)
+
+    def test_an_inherited_key_is_removed_not_merely_outranked(self):
+        """The bug this exists for: a shell exported a stale key before the
+        user fixed their profile, and every child kept inheriting the dead
+        value. Anything that reaches for os.environ must not find it."""
+        warnings = []
+        env = {"ANTHROPIC_API_KEY": "sk-ant-stale"}
+        envfile.load(self.write("ANTHROPIC_API_KEY=sk-ant-file\n"), environ=env,
+                     warn=warnings.append)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertTrue(any("ignoring" in w for w in warnings), warnings)
+
+    def test_setting_prefers_the_file(self):
+        path = self.write("CB_AUTH=api\n")
+        self.assertEqual(
+            envfile.setting("CB_AUTH", path=path, environ={"CB_AUTH": "subscription"}),
+            "api")
+
+    def test_setting_falls_back_to_the_environment(self):
+        path = self.write("A=1\n")
+        self.assertEqual(
+            envfile.setting("CB_AUTH", path=path, environ={"CB_AUTH": "api"}), "api")
+        self.assertEqual(envfile.setting("CB_AUTH", "auto", path=path, environ={}),
+                         "auto")
+
+    def test_values_reflects_an_edit_without_a_restart(self):
+        """A rejected key must be replaceable in the window complaining about it.
+
+        The replacement is the same length and lands in the same instant, which
+        is precisely what a size+mtime cache cannot see."""
+        path = self.write("ANTHROPIC_API_KEY=one\n")
+        self.assertEqual(envfile.values(path)["ANTHROPIC_API_KEY"], "one")
+        Path(path).write_text("ANTHROPIC_API_KEY=two\n")
+        self.assertEqual(envfile.values(path)["ANTHROPIC_API_KEY"], "two")
+
+    def test_values_of_a_missing_file_is_empty(self):
+        self.assertEqual(envfile.values("/nonexistent/env"), {})
 
     def test_missing_file_is_not_an_error(self):
         self.assertEqual(envfile.load("/nonexistent/env", environ={}), [])

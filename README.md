@@ -275,17 +275,27 @@ tolerated `export ` prefix so a line pasted out of a shell profile works as-is.
 Keep it `chmod 600` — it holds an API key, and the browser warns on startup if
 it is readable by anyone else.
 
-**The real environment always wins**, so `CB_BLOCK=0 ./cb` still overrides the
-file for one run, and `--env-file` points at a different one.
+**This file wins over the environment.** Anything you set here beats a variable
+exported in a shell, so the browser behaves identically from a terminal, the
+menu and the dock. `--env-file` points at a different one.
 
-**One environment variable beats this file, and that is the usual bug.** The
-rule is "the real environment wins", which is right for `CB_BLOCK=0 ./cb` and a
-trap for secrets: a stale `export ANTHROPIC_API_KEY=` left in `~/.bashrc`
-silently overrides the key you just edited into the settings file. The symptom
-is a browser that authenticates fine from the desktop menu — which has no shell
-environment — and 401s from a terminal. The browser now prints
-`config: ANTHROPIC_API_KEY from your environment overrides the one in …` at
-startup when the two differ, and says so again in the 401 card.
+It used to be the other way around — the usual "the real environment wins" rule
+— and that was a bug factory. A stale `export ANTHROPIC_API_KEY=` in `~/.bashrc`
+silently overrode the key you had just edited into this file, and the symptom
+was a browser that authenticated fine from the desktop menu (no shell
+environment) and 401'd from a terminal. Worse, an exported variable **cannot be
+fixed from a file**: a shell that exported a dead key keeps handing it to every
+process it spawns until you close it, so deleting the `export` line changes
+nothing in the terminals you already have open. Now the browser simply ignores
+it and prints `config: ignoring the ANTHROPIC_API_KEY in your environment; using
+the one in …`.
+
+**The API key never enters the process environment.** It is read out of this
+file at the moment a request is made — so it cannot be shadowed by an inherited
+variable, and it is not handed down to the control-API server or any other child
+process. Editing the key takes effect on the next request, with no restart:
+if a card says the key was rejected, fix the line and ask again in the same
+window. The card names the file the rejected key came from.
 
 ### Credentials
 
@@ -322,7 +332,7 @@ session eats it. It is a fallback, not a foundation.
 python3 -m unittest discover -s tests
 ```
 
-102 tests, no display or GTK bindings needed.
+116 tests, no display or GTK bindings needed.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the

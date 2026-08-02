@@ -15,13 +15,30 @@ Format is the familiar KEY=VALUE, one per line, `#` for comments, optional
 surrounding quotes, and a tolerated `export ` prefix so a snippet pasted out of
 a shell profile works unchanged.
 
-The real environment always wins, so `CB_BLOCK=0 ./cb` still overrides the file
-for one run.
+**This file wins over the environment.** It used to be the other way around,
+which is the intuitive rule for a command-line tool and the wrong one for this.
+A browser is launched from a menu, a terminal, and a dock, and it must behave
+identically from all three; deferring to whatever happens to be exported means
+the answer to "which key am I using?" depends on how the window was opened. Worse,
+an environment variable cannot be un-set from inside the app: a shell that
+exported a stale key before you fixed your `~/.bashrc` keeps handing that dead
+value to every process it spawns, forever, and no amount of editing files can
+reach it. Making this file authoritative gives the browser one credential that
+you can actually change.
+
+Secrets go further and never touch `os.environ` at all -- see SECRET_KEYS.
 """
 
 import os
 import stat
 from pathlib import Path
+
+#: Read straight out of the file by the code that needs them, and deliberately
+#: never exported into the process environment. Two reasons. It cannot be
+#: shadowed by an inherited variable, which is the whole point above; and it is
+#: not handed to child processes -- the control API server, a spawned helper, a
+#: crash reporter -- none of which have any business holding the user's API key.
+SECRET_KEYS = frozenset({"ANTHROPIC_API_KEY"})
 
 
 def config_dir():
@@ -57,8 +74,40 @@ def parse(text):
     return values
 
 
+def values(path=None):
+    """The settings file as a dict, read fresh every time.
+
+    Deliberately uncached. This is called once per API request, against a
+    sub-kilobyte file, on the way to a network round trip -- the read does not
+    show up. A cache keyed on size and mtime *looks* free and is not: an edit
+    that keeps the length the same (swapping one key for another of the same
+    shape -- the exact thing someone does here) within the filesystem's mtime
+    granularity is invisible to it, so the browser keeps using the key the user
+    just replaced. That is the failure this whole change exists to end.
+    """
+    path = Path(path) if path else config_path()
+    try:
+        return parse(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return {}
+
+
+def setting(name, default=None, path=None, environ=None):
+    """One setting, file first. The environment is a fallback, not an override.
+
+    Non-secret CB_* values are also pushed into os.environ by load() so that
+    module-level constants elsewhere see them; this is the direct route for
+    anything read after startup.
+    """
+    environ = os.environ if environ is None else environ
+    found = values(path).get(name)
+    if found:
+        return found
+    return environ.get(name) or default
+
+
 def load(path=None, environ=None, warn=None):
-    """Merge the config file into `environ` without clobbering what is set.
+    """Apply the config file to `environ`, overriding what is already set.
 
     Returns the list of keys it actually applied.
     """
@@ -86,18 +135,18 @@ def load(path=None, environ=None, warn=None):
 
     applied = []
     for key, value in parse(text).items():
-        if key in environ:
-            # An explicit environment variable outranks the file -- but say so
-            # when the two disagree. A stale `export ANTHROPIC_API_KEY` left in
-            # ~/.bashrc silently beats the key the user just edited into this
-            # file, and the symptom is a browser that authenticates from the
-            # desktop menu (no shell environment) and 401s from a terminal.
-            # That is unguessable from the outside, so it must not be quiet.
-            if warn and environ[key] != value:
-                warn("%s from your environment overrides the one in %s%s"
-                     % (key, path, " (a stale export in ~/.bashrc will do this)"
-                        if key.endswith("_KEY") else ""))
+        if key in SECRET_KEYS:
+            # Never exported. auth.api_key() reads it from the file directly.
+            # Clear any inherited copy so nothing downstream can pick up a stale
+            # one by reaching for os.environ out of habit.
+            if environ.pop(key, None) not in (None, value) and warn:
+                warn("ignoring the %s in your environment; using the one in %s"
+                     % (key, path))
+            applied.append(key)
             continue
+        if environ.get(key) not in (None, value) and warn:
+            warn("%s=%s in %s overrides the %s in your environment"
+                 % (key, value, path, key))
         environ[key] = value
         applied.append(key)
     return applied
@@ -108,12 +157,14 @@ TEMPLATE = """\
 # desktop menu, and the MCP server -- because a menu-launched app never sees
 # your shell environment.
 #
-# The real environment wins, so `CB_BLOCK=0 claude-browser` still overrides.
-# Keep this file private: chmod 600.
+# Whatever you set here wins over your shell environment, so the browser behaves
+# the same from a terminal, the desktop menu and the dock. Keep it private:
+# chmod 600.
 
-# Enables Ask, TL;DR, Research and the Command bar.
-# NOTE: an ANTHROPIC_API_KEY exported in ~/.bashrc overrides this line. If Claude
-# says the key was rejected, check there first -- a stale export is the usual cause.
+# Enables Ask, TL;DR, Research and the Command bar. This is the browser's own
+# key: it is read from this file only, is never put into the environment, and an
+# ANTHROPIC_API_KEY exported in a shell is ignored while this line is uncommented.
+# Edits take effect on the next request -- no restart needed.
 #ANTHROPIC_API_KEY=sk-ant-...
 
 # auto (default: API key, then a Claude Code subscription token), api, subscription.

@@ -1,7 +1,9 @@
 """Where the browser gets its credentials.
 
-  1. **API key.** `ANTHROPIC_API_KEY`, from the environment or the settings
-     file. This is the default and the supported path.
+  1. **API key.** `ANTHROPIC_API_KEY` from the browser's own settings file,
+     `~/.config/claude-browser/env`. This is the default and the supported
+     path. The file wins over any variable exported in a shell, and the value
+     is never copied into the process environment.
   2. **Claude subscription (Pro/Max).** Claude Code stores an OAuth credential
      in ~/.claude/.credentials.json when you log in. It is sent as
      `Authorization: Bearer <token>` with the `oauth-2025-04-20` beta header --
@@ -65,11 +67,33 @@ def subscription_status():
 
 
 def api_key():
-    return os.environ.get("ANTHROPIC_API_KEY") or None
+    """The browser's own key, from its settings file.
+
+    Read here rather than from os.environ so that an inherited variable -- which
+    the app cannot edit, delete, or even reliably trace back to a file -- can
+    never decide which credential a request uses. The environment is consulted
+    only when the settings file says nothing.
+    """
+    from . import envfile
+
+    return envfile.setting("ANTHROPIC_API_KEY") or None
+
+
+def key_source():
+    """Where api_key() came from, for the status line and error panels."""
+    from . import envfile
+
+    if envfile.values().get("ANTHROPIC_API_KEY"):
+        return str(envfile.config_path())
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "your environment"
+    return None
 
 
 def preference():
-    value = (os.environ.get("CB_AUTH") or "auto").strip().lower()
+    from . import envfile
+
+    value = (envfile.setting("CB_AUTH") or "auto").strip().lower()
     return value if value in ("auto", "subscription", "api") else "auto"
 
 
@@ -127,10 +151,11 @@ def _explain(pref):
     lines.append("")
     lines.append("Either log in with Claude Code (/login), or put a key in")
     lines.append("    %s" % envfile.config_path())
-    lines.append("as  ANTHROPIC_API_KEY=sk-ant-...  and restart the browser.")
+    lines.append("as  ANTHROPIC_API_KEY=sk-ant-...")
     lines.append("")
-    lines.append("A window launched from the desktop menu does not inherit your")
-    lines.append("shell environment, so an export in ~/.bashrc will not reach it.")
+    lines.append("That file is the browser's own credential. It is read from every")
+    lines.append("launcher -- terminal, desktop menu, dock -- and it wins over any")
+    lines.append("key exported in a shell, so there is nothing else to keep in sync.")
     return "\n".join(lines)
 
 

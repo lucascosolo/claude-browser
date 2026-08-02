@@ -9,6 +9,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -34,11 +35,34 @@ def http_error(code, message="nope", headers=None):
             b'{"error":{"message":"%s"}}' % message.encode()))
 
 
+def hide_real_settings_file(case):
+    """Point envfile at a path that does not exist, for the length of one test.
+
+    Credentials now come from the settings file rather than the environment,
+    which quietly made every auth test depend on whether the developer running
+    them happens to have a key in ~/.config/claude-browser/env. Tests that pass
+    or fail based on an untracked file in someone's home directory are worse
+    than no tests. With the file out of the way these fall back to the
+    environment, which the cases below control explicitly.
+    """
+    from claudebrowser import envfile
+
+    original = envfile.config_path
+    envfile.config_path = lambda: Path("/nonexistent/claude-browser/env")
+
+    def restore():
+        envfile.config_path = original
+
+    case.addCleanup(restore)
+    return restore
+
+
 class ApiRequestTest(unittest.TestCase):
     def setUp(self):
         # Pin to the API-key path: this machine has a real Claude subscription
         # credential on disk, and auth.candidates() would otherwise find it and
         # make these tests depend on the developer's login state.
+        hide_real_settings_file(self)
         self._key = ai.os.environ.get("ANTHROPIC_API_KEY")
         self._auth = ai.os.environ.get("CB_AUTH")
         ai.os.environ["CB_AUTH"] = "api"
@@ -153,6 +177,7 @@ class AuthTest(unittest.TestCase):
     def setUp(self):
         from claudebrowser import auth
         self.auth = auth
+        hide_real_settings_file(self)
         self._env = {k: os.environ.get(k) for k in ("CB_AUTH", "ANTHROPIC_API_KEY")}
         self._read = auth._read_subscription
 
@@ -255,6 +280,47 @@ class AuthTest(unittest.TestCase):
         os.environ["CB_AUTH"] = "api"
         os.environ["ANTHROPIC_API_KEY"] = "sk-ant-x"
         self.assertEqual([l for _h, l in self.auth.candidates()], ["API key"])
+
+    def use_settings_file(self, text):
+        from claudebrowser import envfile
+
+        handle = tempfile.NamedTemporaryFile("w", suffix=".env", delete=False)
+        handle.write(text)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        envfile.config_path = lambda: Path(handle.name)
+        return handle.name
+
+    def test_the_settings_file_beats_an_inherited_variable(self):
+        """The whole point: a stale export in a long-running shell cannot
+        decide which key the browser uses."""
+        self.use_settings_file("ANTHROPIC_API_KEY=sk-ant-mine\n")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-stale-from-some-shell"
+        self.assertEqual(self.auth.api_key(), "sk-ant-mine")
+
+    def test_environment_is_used_only_when_the_file_is_silent(self):
+        self.use_settings_file("# nothing set here\n")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-env"
+        self.assertEqual(self.auth.api_key(), "sk-ant-env")
+
+    def test_key_source_names_the_file(self):
+        path = self.use_settings_file("ANTHROPIC_API_KEY=sk-ant-mine\n")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-env"
+        self.assertEqual(self.auth.key_source(), path)
+
+    def test_key_source_admits_when_it_came_from_the_environment(self):
+        self.use_settings_file("")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-env"
+        self.assertEqual(self.auth.key_source(), "your environment")
+
+    def test_rejected_key_hint_points_at_the_file_it_came_from(self):
+        path = self.use_settings_file("ANTHROPIC_API_KEY=sk-ant-mine\n")
+        self.assertIn(path, ai._shadow_hint())
+
+    def test_rejected_key_hint_says_when_a_file_edit_would_not_help(self):
+        self.use_settings_file("")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-env"
+        self.assertIn("environment", ai._shadow_hint())
 
     def test_no_credential_explains_both_paths(self):
         self.fake_subscription(present=False)

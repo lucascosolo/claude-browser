@@ -70,7 +70,7 @@ class ApiError(Exception):
 
 def api_key():
     """Only the API key. Credential selection lives in auth.candidates()."""
-    key = os.environ.get("ANTHROPIC_API_KEY")
+    key = auth.api_key()
     if not key:
         raise NoKey(auth._explain(auth.preference()))
     return key
@@ -159,25 +159,34 @@ def _open_with(payload, credential, label, timeout, sleep, retries=MAX_RETRIES):
 
 
 def _shadow_hint():
-    """If a *different* key is sitting in the settings file, the rejected one
-    almost certainly came from the shell. Name the conflict rather than making
-    the user diff two files to find it."""
-    try:
-        from . import envfile
+    """Name the file the rejected key came out of.
 
-        path = envfile.config_path()
-        if not path.is_file():
+    "The API key was rejected" is only actionable if you know *which* key that
+    was. Point at the exact file so it can be corrected in one step -- and, when
+    the key came from an inherited variable instead, say so, because that is the
+    case where editing files achieves nothing.
+    """
+    try:
+        source = auth.key_source()
+        if source is None:
             return ""
-        stored = envfile.parse(path.read_text(encoding="utf-8", errors="replace"))
-        filed = stored.get("ANTHROPIC_API_KEY")
-        live = os.environ.get("ANTHROPIC_API_KEY")
-        if filed and live and filed != live:
-            return ("\n\nNote: a different ANTHROPIC_API_KEY is set in your shell "
-                    "environment, and it overrides the one in %s. Check for a stale "
-                    "`export ANTHROPIC_API_KEY=` in ~/.bashrc." % path)
+        if source == "your environment":
+            return ("\n\nThis key came from an ANTHROPIC_API_KEY in the environment, "
+                    "not from the browser's settings file. Put the key in\n    %s\n"
+                    "as  ANTHROPIC_API_KEY=sk-ant-...  -- that file wins, and it is "
+                    "the only copy the browser can see you change."
+                    % auth_config_path())
+        return ("\n\nThis key came from %s. Edit that line and try again -- the "
+                "change takes effect on the next request, with no restart." % source)
     except Exception:
         pass  # a diagnostic hint must never become the failure it is explaining
     return ""
+
+
+def auth_config_path():
+    from . import envfile
+
+    return envfile.config_path()
 
 
 def _describe_error(status, raw, label):
@@ -202,7 +211,8 @@ def _describe_error(status, raw, label):
             return ("Your Claude subscription is rate-limited right now.\n\n"
                     "This quota is shared with Claude Code, so a busy session can "
                     "use it up. It refills on its own -- wait a few minutes and try "
-                    "again, or set ANTHROPIC_API_KEY to bill the API instead.", kind)
+                    "again, or put an ANTHROPIC_API_KEY in\n    %s\n"
+                    "to bill the API instead." % auth_config_path(), kind)
         return ("Rate limited by the API. Wait a moment and try again.", kind)
 
     if status in (401, 403):
