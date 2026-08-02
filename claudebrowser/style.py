@@ -151,6 +151,16 @@ notebook.cb-tabs > header > tabs > tab:hover {{ color: {text}; }}
 }}
 .cb-tabclose:hover {{ color: {warn}; }}
 
+/* The drag handle between page and console. GTK gives a paned separator 1px by
+   default, which is accurate and unhittable; 6px with a visible line reads as a
+   grip and still lands under the pointer. */
+.cb-split > separator {{
+    background: {line};
+    min-height: 6px;
+    border: none;
+}}
+.cb-split > separator:hover {{ background: {accent}; }}
+
 /* ---- the Claude console, docked at the bottom like an inspector ---- */
 .cb-panel {{
     background: {panel};

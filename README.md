@@ -67,6 +67,7 @@ Right-clicking the menu entry offers **New Window** and **New Window (no agent A
 |---|---|
 | `Ctrl+L` | focus the address bar |
 | `Ctrl+K` | ask Claude about the current page |
+| `Ctrl+Shift+K` | **the Claude console at full height, and back** |
 | `Ctrl+T` / `Ctrl+W` | new tab / close tab |
 | `Ctrl+Shift+P` | **new private tab** |
 | `Ctrl+D` | **bookmark this page** |
@@ -126,13 +127,20 @@ painting.
 
 One console at the bottom — mode pills, a status line, and results as **cards**
 rendered by a WebView, because there is already a browser engine in the process.
-Every run says which credential it used and, on failure, why.
+Answers are rendered markdown: headings, lists, tables, quotes and code blocks,
+with links opening in a new tab rather than navigating the console away. Every
+run says which credential it used and, on failure, why.
+
+The console is docked, not fullscreen. **Drag the divider** above it to resize,
+or `Ctrl+Shift+K` for full height and back. It remembers the height you left it
+at, and shrinks itself rather than squeezing the page out of a short window.
 
 | | | |
 |---|---|---|
 | `Ctrl+K` | **Ask** | Question about the current page. |
 | `Ctrl+Shift+S` | **TL;DR** | Summarize this page. A button, never automatic — a request per page load would be slow and costs money on pages you never read. |
 | `Ctrl+Shift+R` | **Research** | Reads *every open tab* and synthesizes across them. Leads with a table when they're comparable. |
+| `Ctrl+Shift+K` | **Full height** | Grow the console to the whole window, and back. The divider above it resizes by hand. |
 | `Ctrl+G` | **Command** | Give Claude a goal and it drives the browser — navigating, reading, clicking — in the window you're watching, on your own logged-in session. `Stop` cancels mid-run. |
 
 The command bar is the control API turned inward: the same navigate/read/click

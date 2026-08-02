@@ -67,6 +67,13 @@ PANEL_MODES = [
 ]
 MODE_INDEX = {key: i for i, (key, _l, _p, _t) in enumerate(PANEL_MODES)}
 
+# The console's default height, and the floors that keep either half usable.
+# PANEL_MIN is what the drag can shrink the console to; PAGE_MIN is the strip of
+# page the console will not eat, however tall the user asks for.
+PANEL_HEIGHT = 280
+PANEL_MIN = 84
+PAGE_MIN = 120
+
 
 
 class Tab:
@@ -290,12 +297,22 @@ class Browser(Gtk.Window):
         self.progress.set_no_show_all(True)
         root.pack_start(self.progress, False, False, 0)
 
+        # Page and panel share a draggable split rather than a fixed stack. As a
+        # plain box the panel asked for a fixed 279px it could never give back:
+        # a WebView's minimum height is 0, so on any window under ~900px the page
+        # collapsed toward nothing and the console looked like it had gone
+        # fullscreen. A Paned lets the page keep its share, and lets the greeter
+        # drag the divider.
+        self.split = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.split.get_style_context().add_class("cb-split")
+        root.pack_start(self.split, True, True, 0)
+
         self.notebook = Gtk.Notebook()
         self.notebook.get_style_context().add_class("cb-tabs")
         self.notebook.set_show_border(False)
         self.notebook.set_scrollable(True)
         self.notebook.connect("switch-page", self._on_switch)
-        root.pack_start(self.notebook, True, True, 0)
+        self.split.pack1(self.notebook, True, True)
 
         self.panel_mode = "ask"
         self.active_agent = None
@@ -306,8 +323,17 @@ class Browser(Gtk.Window):
         # harmless instead.
         self.run_id = 0
         self.panel_busy = False
+        # How tall the console is, in pixels, as the user last left it. Only the
+        # number is remembered; every open re-derives the divider from the
+        # window's current height so a smaller window never inherits a split
+        # that does not fit it.
+        self.panel_height = PANEL_HEIGHT
+        self.panel_expanded = False
         self.panel = self._build_panel()
-        root.pack_start(self.panel, False, False, 0)
+        self.split.pack2(self.panel, False, False)
+        self.split.connect("button-release-event", self._on_split_released)
+        self._reclamp_id = None
+        self.connect("configure-event", self._on_configure)
 
     def _build_panel(self):
         """A console docked at the bottom, in the shape of an inspector:
@@ -345,6 +371,14 @@ class Browser(Gtk.Window):
         self.panel_stop.connect("clicked", lambda *_: self.stop_run())
         head.pack_start(self.panel_stop, False, False, 0)
 
+        self.panel_expand = Gtk.Button(label="⤢")
+        self.panel_expand.get_style_context().add_class("cb-panel-btn")
+        self.panel_expand.set_tooltip_text("Full height (Ctrl+Shift+K) — "
+                                           "or drag the top edge to resize")
+        self.panel_expand.set_can_focus(False)
+        self.panel_expand.connect("clicked", lambda *_: self.toggle_panel_expanded())
+        head.pack_start(self.panel_expand, False, False, 0)
+
         clear = Gtk.Button(label="Clear")
         clear.get_style_context().add_class("cb-panel-btn")
         clear.set_can_focus(False)
@@ -367,7 +401,14 @@ class Browser(Gtk.Window):
         pv.set_enable_developer_extras(False)
         pv.set_enable_webgl(False)
         pv.set_javascript_can_open_windows_automatically(False)
-        self.panel_view.set_size_request(-1, 215)
+        # A floor, not a height. The divider decides how tall the console
+        # actually is; this only stops a drag from squashing it to nothing.
+        self.panel_view.set_size_request(-1, PANEL_MIN)
+        # An answer can cite links, and the panel is a document like any other:
+        # a click would navigate the console itself away, leaving the whole
+        # Claude surface replaced by a web page with no way back. Every
+        # navigation after the initial load goes to a tab instead.
+        self.panel_view.connect("decide-policy", self._on_panel_policy)
         self.panel_ready = False
         self.panel_queue = []
         self.panel_view.connect("load-changed", self._on_panel_loaded)
@@ -397,6 +438,102 @@ class Browser(Gtk.Window):
         box.set_no_show_all(True)
         box.hide()
         return box
+
+    def _on_panel_policy(self, _view, decision, kind):
+        """Send a link clicked in an answer to a tab, never to the panel."""
+        if kind not in (WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+                        WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION):
+            return False
+        req = decision.get_navigation_action().get_request()
+        uri = req.get_uri() or ""
+        # The panel's own document is loaded from a string, which arrives here
+        # as about:blank; that one load must be allowed through.
+        if not uri or uri.startswith("about:"):
+            return False
+        decision.ignore()
+        if uri.startswith(("http://", "https://")):
+            self.new_tab(uri)
+        return True
+
+    # -- console geometry ---------------------------------------------------
+    #
+    # One number is authoritative: `panel_height`, the console height in pixels
+    # as the user last dragged it. The divider is always derived from it against
+    # the window we currently have, never the other way round -- a squeezed
+    # divider must not become the remembered size, or a shrink-then-grow leaves
+    # the console stuck small.
+
+    def _panel_target(self, height=None):
+        """The divider position a console of `height` pixels wants, clamped.
+
+        Returns None while the split has no allocation yet."""
+        total = self.split.get_allocated_height()
+        if total <= 1:
+            return None
+        if self.panel_expanded:
+            return 0
+        want = self.panel_height if height is None else height
+        want = max(PANEL_MIN, min(want, max(PANEL_MIN, total - PAGE_MIN)))
+        return total - want
+
+    def _apply_panel_height(self, height=None):
+        """Move the divider to where `height` asks for, clamped to the window."""
+        target = self._panel_target(height)
+        if target is None:             # not allocated yet; retry after layout
+            GLib.idle_add(lambda: (self._apply_panel_height(height), False)[1])
+            return
+        if height is not None:
+            self.panel_height = height
+        # No guard is needed against reading this back as a drag: the remembered
+        # height comes from the button release on the handle, which a
+        # programmatic move never produces.
+        self.split.set_position(target)
+
+    def _on_configure(self, *_):
+        """Re-clamp after a window resize, from an idle rather than in-line.
+
+        A remembered height is in pixels, so a shorter window would otherwise
+        keep the old console and squeeze the page to a sliver -- the exact
+        failure this replaced. It has to run *after* the resize settles:
+        set_position() called during the allocation the resize triggers is
+        overwritten by that same allocation, so the clamp silently did nothing.
+        configure-event fires per motion tick, so the pending re-clamp is
+        collapsed to one."""
+        if self._reclamp_id is None and self.panel.get_visible():
+            self._reclamp_id = GLib.idle_add(self._reclamp)
+        return False
+
+    def _reclamp(self):
+        self._reclamp_id = None
+        if self.panel.get_visible():
+            self._apply_panel_height()
+        return GLib.SOURCE_REMOVE
+
+    def _on_split_released(self, *_):
+        """Remember the height the user just dragged to.
+
+        Memory is taken from the button release on the handle, not from
+        notify::position: GtkPaned also moves the divider itself whenever the
+        window no longer fits, and at the notify handler that is
+        indistinguishable from a deliberate drag."""
+        if not self.panel.get_visible():
+            return False
+        height = self.split.get_allocated_height() - self.split.get_position()
+        if height >= PANEL_MIN:
+            self.panel_height = height
+        # Dragging the divider back down is itself a request to stop being full
+        # height.
+        if self.panel_expanded and self.split.get_position() > 0:
+            self.panel_expanded = False
+        return False
+
+    def toggle_panel_expanded(self):
+        """Full window height, and back to the docked console."""
+        if not self.panel.get_visible():
+            self.open_panel(self.panel_mode)
+        self.panel_expanded = not self.panel_expanded
+        self._apply_panel_height()
+        return True
 
     def close_panel(self):
         if getattr(self, "panel_busy", False):
@@ -452,6 +589,8 @@ class Browser(Gtk.Window):
             ("r", Gdk.ModifierType.CONTROL_MASK): self._reload,
             ("k", Gdk.ModifierType.CONTROL_MASK): self.toggle_ask,
             ("g", Gdk.ModifierType.CONTROL_MASK): lambda: self.open_panel("agent"),
+            ("k", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                self.toggle_panel_expanded,
             ("s", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK): self.tldr,
             ("r", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
                 lambda: self.research(),
@@ -964,6 +1103,8 @@ class Browser(Gtk.Window):
         self.panel_entry.set_placeholder_text(placeholder)
         was_hidden = not self.panel.get_visible()
         self.panel.show()
+        if was_hidden:
+            self._apply_panel_height()
         self.panel_entry.grab_focus()
         if was_hidden or not getattr(self, "_card_id", None):
             # An empty panel should explain itself rather than sit blank.

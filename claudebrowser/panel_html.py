@@ -48,7 +48,7 @@ def call(fn, *args):
     return "cb.%s(%s)" % (fn, ",".join(json.dumps(a) for a in args))
 
 
-_TEMPLATE = """<!doctype html>
+_TEMPLATE = r"""<!doctype html>
 <meta charset="utf-8">
 <style>
   :root {
@@ -101,8 +101,43 @@ _TEMPLATE = """<!doctype html>
   .card.error h3 { color: var(--warn); }
   .card.ok h3 { color: var(--ok); }
 
-  .body { white-space: pre-wrap; word-wrap: break-word; }
+  /* The body is rendered markdown, so block spacing is the elements' own; a
+     pre-wrap body would double every gap. Only <pre> keeps literal whitespace. */
+  .body { word-wrap: break-word; overflow-wrap: anywhere; }
   .body:empty::after { content: "…"; color: var(--dim); }
+  .body > :first-child { margin-top: 0; }
+  .body > :last-child { margin-bottom: 0; }
+  .body p { margin: 0 0 7px; }
+  .body h1, .body h2, .body h3, .body h4, .body h5, .body h6 {
+    margin: 11px 0 5px; line-height: 1.3; font-weight: 650; display: block;
+    text-transform: none; letter-spacing: 0; color: var(--text);
+  }
+  .body h1 { font-size: 1.3em; }
+  .body h2 { font-size: 1.18em; }
+  .body h3 { font-size: 1.08em; }
+  .body h4, .body h5, .body h6 { font-size: 1em; color: var(--dim); }
+  .body ul, .body ol { margin: 0 0 7px; padding-left: 1.35em; }
+  .body li { margin: 1px 0; }
+  .body blockquote {
+    margin: 0 0 7px; padding: 1px 0 1px 10px;
+    border-left: 2px solid var(--accent-soft); color: var(--dim);
+  }
+  .body pre { margin: 0 0 8px; white-space: pre; }
+  .body code { background: var(--bg); border: 1px solid var(--line);
+               border-radius: 4px; padding: 0 4px; }
+  .body pre code { background: none; border: none; padding: 0; }
+  .body hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
+  .body table {
+    border-collapse: collapse; margin: 0 0 8px; font-size: 12.5px;
+    display: block; overflow-x: auto; max-width: 100%%;
+  }
+  .body th, .body td {
+    border: 1px solid var(--line); padding: 3px 8px; text-align: left;
+    vertical-align: top;
+  }
+  .body th { background: var(--bg); font-weight: 650; }
+  .body strong { font-weight: 650; color: var(--text); }
+  .body del { color: var(--dim); }
 
   .meta { margin-top: 7px; font-size: 11.5px; color: var(--dim); }
 
@@ -138,6 +173,170 @@ _TEMPLATE = """<!doctype html>
     window.__pinned = atBottom;
   });
 
+  // ---- markdown ---------------------------------------------------------
+  // Claude answers in markdown, so a body that prints its source shows the
+  // asterisks and the fences instead of the formatting. This is a deliberately
+  // small renderer -- headings, emphasis, code, lists, quotes, rules, links and
+  // GFM tables -- because the alternative is shipping a parser into a browser
+  // that has to work offline.
+  //
+  // Everything is HTML-escaped BEFORE any markup is produced, so model output
+  // can never introduce an element. The only tags in the result are ones this
+  // function wrote.
+  var MD = (function () {
+    function esc(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function inline(s) {
+      // Inline code is parked first: whatever is inside it must survive the
+      // emphasis passes literally, backticks being markdown's own escape.
+      var code = [];
+      s = s.replace(/`([^`\n]+)`/g, function (_m, c) {
+        code.push('<code>' + c + '</code>');
+        return '\u0001' + (code.length - 1) + '\u0001';
+      });
+      s = s.replace(/\[([^\]\n]*)\]\(([^)\s]+)\)/g, function (_m, t, href) {
+        // Only schemes that cannot execute, and quotes stripped so the href
+        // cannot end the attribute early.
+        // Anything that is not a plainly inert scheme is left as the source
+        // markdown wrote it, rather than half-rewritten into bare text.
+        if (!/^(https?:|mailto:)/i.test(href)) return _m;
+        return '<a href="' + href.replace(/["']/g, '') + '">' + (t || href) + '</a>';
+      });
+      s = s.replace(/\*\*([^\n]+?)\*\*/g, '<strong>$1</strong>');
+      s = s.replace(/(^|[\s(\[])\*([^*\n]+?)\*/g, '$1<em>$2</em>');
+      s = s.replace(/(^|[\s(\[])_([^_\n]+?)_/g, '$1<em>$2</em>');
+      s = s.replace(/~~([^\n]+?)~~/g, '<del>$1</del>');
+      return s.replace(/\u0001(\d+)\u0001/g, function (_m, i) { return code[+i]; });
+    }
+
+    function cells(line) {
+      return line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|')
+                 .map(function (c) { return c.trim(); });
+    }
+
+    function isRule(line) {
+      // A table's --- separator, distinguished from a horizontal rule by the
+      // pipes it must contain.
+      return /\|/.test(line) && /^[\s:|-]*-[\s:|-]*$/.test(line);
+    }
+
+    return function (src) {
+      var fences = [];
+      // A fence still streaming has no closer yet; ending at $ renders the code
+      // that has arrived instead of dumping the rest of the answer into a <pre>
+      // only once the model gets around to closing it.
+      var t = esc(String(src)).replace(/\r\n?/g, '\n')
+        .replace(/```[^\n`]*\n?([\s\S]*?)(?:\n```|```|$)/g, function (_m, code) {
+          fences.push('<pre><code>' + code + '</code></pre>');
+          return '\u0000' + (fences.length - 1) + '\u0000';
+        });
+
+      var lines = t.split('\n'), i = 0, html = '';
+      var para = [], list = null, quote = [];
+
+      function flushPara() {
+        if (para.length) { html += '<p>' + inline(para.join(' ')) + '</p>'; para = []; }
+      }
+      function flushList() {
+        if (!list) return;
+        html += '<' + list.tag + '>' + list.items.map(function (x) {
+          return '<li>' + inline(x) + '</li>';
+        }).join('') + '</' + list.tag + '>';
+        list = null;
+      }
+      function flushQuote() {
+        if (quote.length) {
+          html += '<blockquote>' + inline(quote.join(' ')) + '</blockquote>';
+          quote = [];
+        }
+      }
+      function flushAll() { flushPara(); flushList(); flushQuote(); }
+
+      while (i < lines.length) {
+        var ln = lines[i], m;
+
+        m = ln.match(/^\u0000(\d+)\u0000\s*$/);
+        if (m) { flushAll(); html += fences[+m[1]]; i++; continue; }
+
+        if (/^\s*$/.test(ln)) { flushAll(); i++; continue; }
+
+        m = ln.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/);
+        if (m) {
+          flushAll();
+          // Demoted two levels: the card already owns the h3 above the body, so
+          // an answer's own "# Heading" must not outrank the card's title.
+          var lvl = Math.min(m[1].length + 2, 6);
+          html += '<h' + lvl + '>' + inline(m[2]) + '</h' + lvl + '>';
+          i++; continue;
+        }
+
+        if (/^\s{0,3}([-*_])\s*(\1\s*){2,}$/.test(ln)) {
+          flushAll(); html += '<hr>'; i++; continue;
+        }
+
+        if (/\|/.test(ln) && i + 1 < lines.length && isRule(lines[i + 1])) {
+          flushAll();
+          var head = cells(ln), rows = [];
+          i += 2;
+          while (i < lines.length && /\|/.test(lines[i]) && !/^\s*$/.test(lines[i])) {
+            rows.push(cells(lines[i])); i++;
+          }
+          html += '<table><thead><tr>' + head.map(function (c) {
+            return '<th>' + inline(c) + '</th>';
+          }).join('') + '</tr></thead><tbody>' + rows.map(function (r) {
+            return '<tr>' + r.map(function (c) {
+              return '<td>' + inline(c) + '</td>';
+            }).join('') + '</tr>';
+          }).join('') + '</tbody></table>';
+          continue;
+        }
+
+        // &gt;, not >: the whole text was escaped before this parser ran, so
+        // a quote marker no longer looks like one.
+        m = ln.match(/^\s{0,3}&gt;\s?(.*)$/);
+        if (m) { flushPara(); flushList(); quote.push(m[1]); i++; continue; }
+
+        var ul = ln.match(/^\s*[-*+]\s+(.*)$/);
+        var ol = ln.match(/^\s*\d+[.)]\s+(.*)$/);
+        if (ul || ol) {
+          flushPara(); flushQuote();
+          var tag = ul ? 'ul' : 'ol';
+          if (!list || list.tag !== tag) { flushList(); list = { tag: tag, items: [] }; }
+          list.items.push((ul || ol)[1]);
+          i++; continue;
+        }
+
+        // An indented line under a list item is that item continuing.
+        if (list && !para.length && /^\s+\S/.test(ln)) {
+          list.items[list.items.length - 1] += ' ' + ln.trim();
+          i++; continue;
+        }
+
+        flushList(); flushQuote();
+        para.push(ln.trim());
+        i++;
+      }
+      flushAll();
+      return html;
+    };
+  })();
+  window.__md = MD;   // so the renderer can be exercised without a model
+
+  // Re-rendering the whole body per chunk is cheap (an answer is a page or two)
+  // and is the only way to stay correct while streaming: markdown is not
+  // parseable one fragment at a time. One render per frame, not per chunk.
+  function paint(el) {
+    if (el.__painting) return;
+    el.__painting = true;
+    requestAnimationFrame(function () {
+      el.__painting = false;
+      el.querySelector('.body').innerHTML = MD(el.__raw || '');
+      scroll();
+    });
+  }
+
   window.cb = {
     clear: function () { root.innerHTML = ''; cards = {}; window.__pinned = true; },
 
@@ -157,8 +356,11 @@ _TEMPLATE = """<!doctype html>
     append: function (id, text) {
       var el = cards[id];
       if (!el) { this.card(id, '', ''); el = cards[id]; }
-      el.querySelector('.body').textContent += text;
-      scroll();
+      // The markdown source is the record; the DOM is a view of it. Appending
+      // to the DOM instead would mean parsing a chunk at a time, which cannot
+      // work -- a fence or a list is not knowable from its first fragment.
+      el.__raw = (el.__raw || '') + text;
+      paint(el);
     },
 
     step: function (id, text) {
@@ -185,6 +387,10 @@ _TEMPLATE = """<!doctype html>
       if (kind) el.className = 'card ' + kind;
       var active = el.querySelector('.step.active');
       if (active) active.classList.remove('active');
+      // A final synchronous render: the last chunk's frame may not have run,
+      // and an unclosed fence mid-stream settles here.
+      el.__painting = false;
+      el.querySelector('.body').innerHTML = MD(el.__raw || '');
       scroll();
     }
   };
