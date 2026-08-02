@@ -100,13 +100,60 @@ HTML = r"""JSON.stringify({url: location.href, html: document.documentElement.ou
 TITLE = r"""JSON.stringify({url: location.href, title: document.title})"""
 
 
+# A visible pulse wherever the agent just acted.
+#
+# Claude driving a page you are watching is unnerving when the page moves on its
+# own and nothing says why. The halo is the cheapest honest answer: it marks the
+# exact point of every synthetic click and every field write, so an action you
+# did not make is attributable at a glance.
+#
+# Deliberately self-contained and idempotent -- it is prepended to snippets that
+# run many times in one page's life, and it must never depend on a stylesheet,
+# a font, or anything the page could have removed.
+HALO = r"""
+(function () {
+  if (window.__cbHalo) return;
+  window.__cbHalo = function (x, y) {
+    try {
+      var dot = document.createElement('div');
+      dot.setAttribute('data-cb-halo', '1');
+      dot.style.cssText = [
+        'position:fixed', 'left:0', 'top:0', 'width:46px', 'height:46px',
+        'margin:-23px 0 0 -23px', 'border-radius:50%', 'pointer-events:none',
+        'z-index:2147483647', 'border:2px solid rgba(217,119,87,.9)',
+        'background:radial-gradient(circle,rgba(217,119,87,.45) 0%,' +
+          'rgba(217,119,87,.18) 45%,rgba(217,119,87,0) 70%)',
+        'box-shadow:0 0 20px 6px rgba(217,119,87,.55)',
+        'transform:translate(' + x + 'px,' + y + 'px) scale(.35)',
+        'opacity:1',
+        'transition:transform .5s cubic-bezier(.2,.8,.3,1),opacity .5s ease-out'
+      ].join(';');
+      (document.body || document.documentElement).appendChild(dot);
+      requestAnimationFrame(function () {
+        dot.style.transform = 'translate(' + x + 'px,' + y + 'px) scale(1.4)';
+        dot.style.opacity = '0';
+      });
+      setTimeout(function () { if (dot.parentNode) dot.parentNode.removeChild(dot); }, 800);
+    } catch (e) {}
+  };
+  window.__cbHaloAt = function (el) {
+    if (!el || !el.getBoundingClientRect) return;
+    var r = el.getBoundingClientRect();
+    window.__cbHalo(r.left + r.width / 2, r.top + r.height / 2);
+  };
+})();
+"""
+
 def click(selector: str) -> str:
     """Click the first match. Reports whether anything was actually hit --
     a silent no-op is the worst possible answer to give an agent."""
     return (
+        HALO +
         "(function(){var e=document.querySelector(%s);"
         "if(!e)return JSON.stringify({ok:false,error:'no match'});"
-        "e.scrollIntoView({block:'center'});e.click();"
+        "e.scrollIntoView({block:'center'});"
+        # After scrollIntoView, so the halo lands on where the element ended up.
+        "window.__cbHaloAt(e);e.click();"
         "return JSON.stringify({ok:true,tag:e.tagName.toLowerCase()});})()"
         % _js_str(selector)
     )
@@ -116,8 +163,10 @@ def fill(selector: str, value: str) -> str:
     """Set a field's value and fire input+change, so frameworks that listen for
     events (React, Vue) actually see the write. Assigning .value alone does not."""
     return (
+        HALO +
         "(function(){var e=document.querySelector(%s);"
         "if(!e)return JSON.stringify({ok:false,error:'no match'});"
+        "e.scrollIntoView({block:'center'});window.__cbHaloAt(e);"
         "e.focus();e.value=%s;"
         "e.dispatchEvent(new Event('input',{bubbles:true}));"
         "e.dispatchEvent(new Event('change',{bubbles:true}));"

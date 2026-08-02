@@ -18,7 +18,8 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import agent, ai, auth, extract, pages, panel_html, perf, store, style  # noqa: E402
+from . import (agent, ai, auth, extract, pages, panel_html, perf, store,  # noqa: E402
+               style, tabnames)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -75,12 +76,23 @@ PANEL_MIN = 84
 PAGE_MIN = 120
 
 
+# How long a tab keeps its "Claude is driving" glow after the last agent call.
+# Long enough to bridge the gap between steps in an agent loop, short enough
+# that the glow is gone before the user wonders whether it is stuck on.
+AGENT_GLOW_MS = 2600
+
+
 def needs_tab(method):
     """Resolve the leading tab id, or answer "no such tab" and stop.
 
     Seven api_* methods opened with the same three lines. Doing it here also
     makes the contract visible in the signature: a decorated method is handed a
     Tab, never an id, so it cannot forget the check.
+
+    It is also the one place every agent-initiated, tab-targeted call passes
+    through, which makes it the honest place to light the "Claude is driving"
+    indicator -- a marker set anywhere further in would miss whatever forgot
+    to call it.
     """
     import functools
 
@@ -90,6 +102,7 @@ def needs_tab(method):
         tab = self.find(tab_id)
         if tab is None:
             return done({"ok": False, "error": "no such tab"})
+        self.note_agent_activity(tab)
         return method(self, tab, *rest)
 
     return wrapper
@@ -254,9 +267,10 @@ class Browser(Gtk.Window):
         return btn
 
     def _build_chrome(self):
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root = self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         root.get_style_context().add_class("cb-root")
         self.add(root)
+        self._agent_glow_id = None
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         bar.get_style_context().add_class("cb-bar")
@@ -926,13 +940,23 @@ class Browser(Gtk.Window):
 
     def _tab_label(self, tab):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        box.get_style_context().add_class("cb-tablabel")
+        tab.label_box = box
         if tab.private:
             badge = Gtk.Label(label="private")
             badge.get_style_context().add_class("cb-priv-badge")
             box.pack_start(badge, False, False, 0)
         tab.label = Gtk.Label(label="New tab")
         tab.label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
-        tab.label.set_max_width_chars(18)
+        # width_chars is the *minimum*, and it is the whole reason tabs were
+        # readable or not. An ellipsizing GtkLabel reports its minimum width as
+        # the width of the ellipsis alone, so GtkNotebook is free to shrink every
+        # tab to a single "...". Setting max_width_chars without width_chars --
+        # which is what this did -- caps the maximum and leaves the minimum at
+        # nothing, so the tabs collapsed as soon as there were two of them.
+        tab.label.set_width_chars(14)
+        tab.label.set_max_width_chars(24)
+        tab.label.set_xalign(0)
         box.pack_start(tab.label, True, True, 0)
         close = Gtk.Button()
         close.get_style_context().add_class("cb-tabclose")
@@ -1055,11 +1079,21 @@ class Browser(Gtk.Window):
 
         GLib.timeout_add(100, fire)
 
+    def _relabel_tabs(self):
+        """Repaint every tab's name. The rule lives in tabnames.py, which has no
+        GTK import so it can be tested -- the interesting cases are collisions
+        between tabs, not any single tab."""
+        names = tabnames.label_tabs([
+            (t.view.get_uri() or "", t.view.get_title() or "", t.loading)
+            for t in self.tabs])
+        for tab, name in zip(self.tabs, names):
+            if getattr(tab, "label", None):
+                tab.label.set_text(name)
+                tab.label.set_tooltip_text(tab.view.get_uri() or "")
+
     def _refresh(self, tab):
+        self._relabel_tabs()
         title = tab.view.get_title() or tab.view.get_uri() or "New tab"
-        if getattr(tab, "label", None):
-            tab.label.set_text(title)
-            tab.label.set_tooltip_text(tab.view.get_uri() or "")
         if tab is not self.current():
             return
         self.set_title("%s — claude-browser%s"
@@ -1080,10 +1114,57 @@ class Browser(Gtk.Window):
         else:
             self.progress.hide()
 
+    # -- "Claude is driving" indicator --------------------------------------
+
+    def note_agent_activity(self, tab):
+        """Mark `tab` as agent-driven for the next few seconds.
+
+        Every control-API and in-browser-agent call lands here, so the glow
+        tracks real activity rather than a flag someone remembered to set. The
+        deadline is refreshed rather than queued: an agent taking twelve steps
+        against one tab should light it once and hold, not stack twelve timers.
+        """
+        import time
+
+        tab.agent_until = time.monotonic() + AGENT_GLOW_MS / 1000.0
+        if getattr(tab, "label_box", None):
+            tab.label_box.get_style_context().add_class("cb-agent")
+        self._paint_agent_frame()
+        if self._agent_glow_id is None:
+            self._agent_glow_id = GLib.timeout_add(400, self._expire_agent_glow)
+
+    def _expire_agent_glow(self):
+        import time
+
+        now = time.monotonic()
+        live = False
+        for tab in self.tabs:
+            if getattr(tab, "agent_until", 0) > now:
+                live = True
+            elif getattr(tab, "label_box", None):
+                tab.label_box.get_style_context().remove_class("cb-agent")
+        self._paint_agent_frame()
+        if live:
+            return GLib.SOURCE_CONTINUE
+        self._agent_glow_id = None
+        return GLib.SOURCE_REMOVE
+
+    def _paint_agent_frame(self):
+        """The window frame glows only while the driven tab is the one on
+        screen -- a background tab being read is not something to alarm the
+        user about, and the tab's own glow already says it is happening."""
+        import time
+
+        tab = self.current()
+        active = bool(tab and getattr(tab, "agent_until", 0) > time.monotonic())
+        ctx = self.root.get_style_context()
+        (ctx.add_class if active else ctx.remove_class)("cb-agent-window")
+
     def _on_switch(self, _nb, view, _index):
         tab = next((t for t in self.tabs if t.view is view), None)
         if tab:
             GLib.idle_add(self._refresh, tab)
+            GLib.idle_add(self._paint_agent_frame)
 
     # -- chrome actions -----------------------------------------------------
 
@@ -1443,6 +1524,7 @@ class Browser(Gtk.Window):
 
     def api_open(self, url, background, wait, done):
         tab = self.new_tab(url, background=background)
+        self.note_agent_activity(tab)
         self._begin_load(tab)
         self._await_load(tab, wait, done)
 

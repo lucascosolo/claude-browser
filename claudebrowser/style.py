@@ -151,6 +151,24 @@ notebook.cb-tabs > header > tabs > tab:hover {{ color: {text}; }}
 }}
 .cb-tabclose:hover {{ color: {warn}; }}
 
+/* ---- "Claude is driving this tab" ----
+   GTK3 has no animation we can rely on here, so the tell is static and loud
+   rather than pulsing: an accent ring on the tab, and an accent frame around
+   the whole window while that tab is the one on screen. Both use the same ink
+   as every other Claude surface, so it reads as "the assistant", not "an
+   error". */
+.cb-tablabel.cb-agent {{
+    background: {accent_soft};
+    border: 1px solid {accent};
+    border-radius: 5px;
+    padding: 0 4px;
+    margin: -1px -2px;
+}}
+.cb-root.cb-agent-window {{
+    border: 2px solid {accent};
+    background: {accent_soft};
+}}
+
 /* The drag handle between page and console. GTK gives a paned separator 1px by
    default, which is accurate and unhittable; 6px with a visible line reads as a
    grip and still lands under the pointer. */

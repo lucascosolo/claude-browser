@@ -24,6 +24,8 @@ def main(argv=None):
                         help="override the system light/dark preference")
     parser.add_argument("--env-file", help="settings file (default: "
                                            "~/.config/claude-browser/env)")
+    parser.add_argument("--new-window", action="store_true",
+                        help="always open a new window, even if one is running")
     args = parser.parse_args(argv)
 
     # Before anything reads os.environ. A desktop launcher gives us no shell
@@ -38,6 +40,11 @@ def main(argv=None):
               % (", ".join(sorted(applied)), args.env_file or envfile.config_path()),
               flush=True)
 
+    # Whether --port was named, recorded before the default is filled in below:
+    # a caller who asked for a specific control port wants their own process,
+    # not a handoff to whatever is on 8765.
+    explicit_port = args.port is not None
+
     # Resolved here, not in the argparse defaults, so the settings file loaded
     # above is visible to them. An explicit flag still wins.
     if args.port is None:
@@ -46,6 +53,25 @@ def main(argv=None):
         args.token = os.environ.get("CB_TOKEN") or None
     if args.theme is None:
         args.theme = os.environ.get("CB_THEME") or None
+
+    # A second launch hands its URLs to the first window and gets out of the way.
+    #
+    # This is what a *default browser* has to do. `xdg-open`, a mail client, a
+    # chat app -- they all run `claude-browser <url>` with no idea one is already
+    # running, and the old behaviour was to try to bind the control port, fail,
+    # and exit 1 with "Another claude-browser is probably running". The link
+    # simply never opened, which made the browser unusable as a system default
+    # however it was registered.
+    #
+    # --new-window opts out, and so does --port/--no-control: asking for a
+    # separate control surface is asking for a separate process.
+    if (args.urls and not args.new_window and not args.no_control
+            and not explicit_port):
+        from . import client
+
+        if client.handoff(args.urls):
+            client.present()
+            return 0
 
     try:
         import gi
@@ -96,12 +122,17 @@ def main(argv=None):
         server = control.Control(browser, port=args.port, token=args.token)
         try:
             server.start()
+            print("control API: http://127.0.0.1:%d  (loopback only%s)"
+                  % (args.port, ", token required" if args.token else ""), flush=True)
         except OSError as e:
-            sys.exit("cannot bind control port %s: %s\n"
-                     "Another claude-browser is probably running. Use --port or --no-control."
-                     % (args.port, e))
-        print("control API: http://127.0.0.1:%d  (loopback only%s)"
-              % (args.port, ", token required" if args.token else ""), flush=True)
+            # A window without the agent API still browses. Refusing to open one
+            # was the right call when this was a developer tool run by hand; as
+            # the system default it means a clicked link goes nowhere because
+            # something unrelated holds the port.
+            server = None
+            print("control API: disabled -- port %s is in use (%s).\n"
+                  "This window browses normally. For a second agent-drivable "
+                  "window, use --port." % (args.port, e), flush=True)
 
     try:
         Gtk.main()
