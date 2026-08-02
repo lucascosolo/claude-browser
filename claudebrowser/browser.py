@@ -17,7 +17,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import agent, ai, extract, perf, style  # noqa: E402
+from . import agent, ai, auth, extract, panel_html, perf, style  # noqa: E402
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "about:blank")
@@ -53,18 +53,18 @@ CONSOLE_SHIM = """
 
 READ_CONSOLE = "JSON.stringify({entries: window.__cb_console || []})"
 
-PANEL_MODES = {
-    "ask": {"label": "Ask Claude about this page",
-            "placeholder": "Ask about this page…   (Esc to close)", "takes_input": True},
-    "tldr": {"label": "TL;DR",
-             "placeholder": "Ask a follow-up…", "takes_input": True},
-    "research": {"label": "Research across all open tabs",
-                 "placeholder": "Optional: what to compare…  (Enter to re-run)",
-                 "takes_input": True},
-    "agent": {"label": "Command — Claude drives the browser",
-              "placeholder": "Describe a goal…  e.g. find the pricing page and list the tiers",
-              "takes_input": True},
-}
+PANEL_MODES = [
+    ("ask",      "Ask",      "Ask about this page…",
+     "Ask Claude about the page you are on"),
+    ("tldr",     "TL;DR",    "Ask a follow-up…",
+     "Summarize this page (runs immediately)"),
+    ("research", "Research", "What should I compare? (optional)",
+     "Read every open tab and synthesize across them"),
+    ("agent",    "Command",  "Describe a goal — Claude will drive the browser…",
+     "Give Claude a goal and watch it work"),
+]
+MODE_INDEX = {key: i for i, (key, _l, _p, _t) in enumerate(PANEL_MODES)}
+
 
 
 class Tab:
@@ -114,6 +114,7 @@ class Browser(Gtk.Window):
         settings = Gtk.Settings.get_default()
         if dark is None:
             dark = bool(settings and settings.get_property("gtk-application-prefer-dark-theme"))
+        self.dark = dark
         self._apply_css(dark)
 
         # One shared content manager. The console shim runs at document-start,
@@ -244,43 +245,122 @@ class Browser(Gtk.Window):
         root.pack_start(self.panel, False, False, 0)
 
     def _build_panel(self):
+        """A console docked at the bottom, in the shape of an inspector:
+        mode pills, a status line, scrollback, and a prompt."""
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        box.get_style_context().add_class("cb-ask")
-        box.set_no_show_all(True)
+        box.get_style_context().add_class("cb-panel")
 
-        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.panel_label = Gtk.Label(label="Ask Claude")
-        self.panel_label.set_xalign(0)
-        self.panel_label.get_style_context().add_class("cb-hint")
-        head.pack_start(self.panel_label, True, True, 0)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        head.get_style_context().add_class("cb-panel-head")
+
+        self.mode_buttons = {}
+        first = None
+        for key, label, _placeholder, tip in PANEL_MODES:
+            btn = Gtk.RadioButton.new_with_label_from_widget(first, label)
+            if first is None:
+                first = btn
+            btn.set_mode(False)          # render as a toggle, not a radio dot
+            btn.get_style_context().add_class("cb-mode")
+            btn.set_tooltip_text(tip)
+            btn.set_can_focus(False)
+            btn.connect("toggled", self._on_mode_toggled, key)
+            head.pack_start(btn, False, False, 0)
+            self.mode_buttons[key] = btn
+
+        self.status = Gtk.Label(label="")
+        self.status.set_xalign(0)
+        self.status.get_style_context().add_class("cb-status")
+        head.pack_start(self.status, True, True, 0)
+
         self.panel_stop = Gtk.Button(label="Stop")
-        self.panel_stop.get_style_context().add_class("cb-tabclose")
+        self.panel_stop.get_style_context().add_class("cb-panel-btn")
+        self.panel_stop.get_style_context().add_class("stop")
         self.panel_stop.set_can_focus(False)
         self.panel_stop.set_sensitive(False)
         self.panel_stop.connect("clicked", lambda *_: self.stop_run())
         head.pack_start(self.panel_stop, False, False, 0)
-        close = self._icon_button("window-close-symbolic", "Close (Esc)",
-                                  lambda *_: self.panel.hide())
+
+        clear = Gtk.Button(label="Clear")
+        clear.get_style_context().add_class("cb-panel-btn")
+        clear.set_can_focus(False)
+        clear.connect("clicked", lambda *_: self._panel_write("", replace=True))
+        head.pack_start(clear, False, False, 0)
+
+        close = Gtk.Button(label="✕")
+        close.get_style_context().add_class("cb-panel-btn")
+        close.set_can_focus(False)
+        close.connect("clicked", lambda *_: self.close_panel())
         head.pack_start(close, False, False, 0)
         box.pack_start(head, False, False, 0)
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_min_content_height(170)
-        self.panel_view = Gtk.TextView()
-        self.panel_view.get_style_context().add_class("cb-ask-view")
-        self.panel_view.set_editable(False)
-        self.panel_view.set_cursor_visible(False)
-        self.panel_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        scroll.add(self.panel_view)
-        self.panel_scroll = scroll
-        box.pack_start(scroll, True, True, 0)
+        # The output surface is a WebView rendering local HTML, not a text
+        # widget. We are already running a browser engine, so cards, colour and
+        # typography come free; it is driven entirely by evaluate_javascript.
+        self.panel_view = WebKit2.WebView()
+        self.panel_view.set_background_color(Gdk.RGBA(0, 0, 0, 0))
+        pv = self.panel_view.get_settings()
+        pv.set_enable_developer_extras(False)
+        pv.set_enable_webgl(False)
+        pv.set_javascript_can_open_windows_automatically(False)
+        self.panel_view.set_size_request(-1, 215)
+        self.panel_ready = False
+        self.panel_queue = []
+        self.panel_view.connect("load-changed", self._on_panel_loaded)
+        self.panel_view.load_html(panel_html.page(style.palette(self.dark)), None)
+        box.pack_start(self.panel_view, True, True, 0)
 
+        prompt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        prompt_row.get_style_context().add_class("cb-prompt-row")
+        chevron = Gtk.Label(label="›")
+        chevron.get_style_context().add_class("cb-chevron")
+        prompt_row.pack_start(chevron, False, False, 0)
         self.panel_entry = Gtk.Entry()
-        self.panel_entry.get_style_context().add_class("cb-omnibox")
+        self.panel_entry.get_style_context().add_class("cb-prompt")
+        self.panel_entry.set_has_frame(False)
         self.panel_entry.connect("activate", self._on_panel_entry)
-        box.pack_start(self.panel_entry, False, False, 0)
+        prompt_row.pack_start(self.panel_entry, True, True, 0)
+        box.pack_start(prompt_row, False, False, 0)
+
+        # Show the children NOW, then mark the container no-show-all and hide it.
+        #
+        # Getting this backwards is what made every Claude feature look broken:
+        # with no_show_all set first, the window's show_all() never reached the
+        # children, and a later panel.show_all() is a no-op for the same reason.
+        # The panel appeared as an empty strip while answers were written into a
+        # TextView that was never shown.
+        box.show_all()
+        box.set_no_show_all(True)
+        box.hide()
         return box
+
+    def close_panel(self):
+        if getattr(self, "panel_busy", False):
+            self.stop_run()
+        self.panel.hide()
+        tab = self.current()
+        if tab:
+            tab.view.grab_focus()
+
+    def _on_mode_toggled(self, button, key):
+        """Clicking a pill switches mode. TL;DR and Research act immediately --
+        they need no input, and making the user press Enter on an empty prompt
+        to get a summary would be a pointless extra step."""
+        if not button.get_active() or getattr(self, "_setting_mode", False):
+            return
+        self.open_panel(key)
+        if key == "tldr":
+            self.tldr()
+        elif key == "research":
+            self.research()
+
+    def _set_status(self, text, kind=""):
+        ctx = self.status.get_style_context()
+        for name in ("busy", "ok", "warn"):
+            ctx.remove_class(name)
+        if kind:
+            ctx.add_class(kind)
+        self.status.set_text(text)
+        return GLib.SOURCE_REMOVE
 
     def _stop_agent(self):
         if getattr(self, "active_agent", None):
@@ -293,7 +373,10 @@ class Browser(Gtk.Window):
         self.run_id += 1          # strands any in-flight worker
         self.panel_busy = False
         self.panel_stop.set_sensitive(False)
-        self._panel_write("\n[stopped]\n")
+        self._flush_pending()
+        self._panel_done("")
+        self._set_status("stopped", "warn")
+        return GLib.SOURCE_REMOVE
 
     def _bind_keys(self):
         accel = {
@@ -527,14 +610,21 @@ class Browser(Gtk.Window):
     # extract-then-stream path, so they share rendering, scrolling and cancel.
 
     def open_panel(self, mode):
+        placeholder = PANEL_MODES[MODE_INDEX[mode]][2]
         self.panel_mode = mode
-        self.panel_label.set_text(PANEL_MODES[mode]["label"])
-        self.panel_entry.set_placeholder_text(PANEL_MODES[mode]["placeholder"])
-        self.panel_entry.set_sensitive(PANEL_MODES[mode]["takes_input"])
+        self._setting_mode = True
+        self.mode_buttons[mode].set_active(True)
+        self._setting_mode = False
+        self.panel_entry.set_placeholder_text(placeholder)
+        was_hidden = not self.panel.get_visible()
         self.panel.show()
-        self.panel.show_all()
-        if PANEL_MODES[mode]["takes_input"]:
-            self.panel_entry.grab_focus()
+        self.panel_entry.grab_focus()
+        if was_hidden or not getattr(self, "_card_id", None):
+            # An empty panel should explain itself rather than sit blank.
+            self._js("cb.hint(%s)" % json.dumps(panel_html.empty_hint(mode)))
+            self._card_id = None
+        if not getattr(self, "panel_busy", False):
+            self._set_status("using %s" % auth.describe(), "")
         return self.panel
 
     def toggle_ask(self):
@@ -543,17 +633,89 @@ class Browser(Gtk.Window):
         else:
             self.open_panel("ask")
 
-    def _panel_write(self, text, replace=False):
-        buf = self.panel_view.get_buffer()
-        if replace:
-            buf.set_text(text)
-        else:
-            buf.insert(buf.get_end_iter(), text)
-        adj = self.panel_scroll.get_vadjustment()
-        adj.set_value(adj.get_upper() - adj.get_page_size())
+    def _on_panel_loaded(self, _view, event):
+        if event != WebKit2.LoadEvent.FINISHED:
+            return
+        self.panel_ready = True
+        # Anything emitted before the document finished loading was parked;
+        # replay it now so a fast first answer is never dropped on the floor.
+        queued, self.panel_queue = self.panel_queue, []
+        for script in queued:
+            self.panel_view.evaluate_javascript(script, -1, None, None, None, None, None)
+
+    def _js(self, script):
+        """Run one statement in the panel document, queueing until it is ready."""
+        if not self.panel_ready:
+            self.panel_queue.append(script)
+            return GLib.SOURCE_REMOVE
+        self.panel_view.evaluate_javascript(script, -1, None, None, None, None, None)
         return GLib.SOURCE_REMOVE
 
-    def _run_stream(self, make_generator, header):
+    # -- card-level output --------------------------------------------------
+    # _panel_write keeps its old signature so every caller is unchanged; it now
+    # streams into the body of the current card instead of a text buffer.
+
+    def _new_card(self, kind="", title=""):
+        self._card_id = getattr(self, "_card_seq", 0) + 1
+        self._card_seq = self._card_id
+        self._flush_pending()
+        self._js(panel_html.call("card", str(self._card_id), kind, title))
+        return str(self._card_id)
+
+    def _panel_write(self, text, replace=False, tag=None):
+        if replace:
+            self._js("cb.clear()")
+            self._pending = ""
+            self._new_card("error" if tag == "error" else "", "")
+        if not text:
+            return GLib.SOURCE_REMOVE
+        if tag == "error":
+            card = self._new_card("error", "Error")
+            self._js(panel_html.call("append", card, text))
+            return GLib.SOURCE_REMOVE
+        # Buffered: one evaluate_javascript per streamed token would swamp a
+        # 1.6GHz core. Coalesce and flush on a timer instead.
+        self._pending = getattr(self, "_pending", "") + text
+        if not getattr(self, "_flush_queued", False):
+            self._flush_queued = True
+            GLib.timeout_add(90, self._flush_pending)
+        return GLib.SOURCE_REMOVE
+
+    def _flush_pending(self):
+        self._flush_queued = False
+        pending, self._pending = getattr(self, "_pending", ""), ""
+        if pending and getattr(self, "_card_id", None):
+            self._js(panel_html.call("append", str(self._card_id), pending))
+        return GLib.SOURCE_REMOVE
+
+    def _panel_step(self, text):
+        """An agent step, rendered as a chip rather than another line."""
+        self._flush_pending()
+        if getattr(self, "_card_id", None):
+            self._js(panel_html.call("step", str(self._card_id), text))
+        return GLib.SOURCE_REMOVE
+
+    def _panel_done(self, kind=""):
+        self._flush_pending()
+        if getattr(self, "_card_id", None):
+            self._js(panel_html.call("done", str(self._card_id), kind))
+        return GLib.SOURCE_REMOVE
+
+    def _require_key(self):
+        """Nothing here may fail quietly. If no credential exists, the panel
+        says so, names the file to put one in, and stops before any request."""
+        try:
+            auth.candidates()
+        except auth.NoCredential as e:
+            self._js("cb.clear()")
+            card = self._new_card("error", "No credential")
+            self._js(panel_html.call("append", card, str(e)))
+            self._js(panel_html.call("meta", card, "Nothing was sent."))
+            self._set_status("no credential", "warn")
+            return False
+        return True
+
+    def _run_stream(self, make_generator, title="Claude", subtitle="", clear=True):
         """Drive a text-producing generator on a worker thread.
 
         The generator does blocking network I/O, so it cannot run on the GTK
@@ -562,27 +724,54 @@ class Browser(Gtk.Window):
         import threading
 
         token = self._start_run()
-        self._panel_write(header, replace=True)
+        if clear:
+            # Ask mode has already drawn the user's question as its own card;
+            # clearing here would wipe it before the answer arrived.
+            self._js("cb.clear()")
+        self._pending = ""
+        card = self._new_card("", ("%s \u2014 %s" % (title, subtitle)) if subtitle else title)
+        self.got_output = False
 
         def write(chunk):
             if token == self.run_id:
+                self.got_output = True
                 self._panel_write(chunk)
+            return GLib.SOURCE_REMOVE
+
+        def fail(message):
+            if token == self.run_id:
+                self._panel_write(message, tag="error")
+                self._finish_run(token, "failed", "error")
             return GLib.SOURCE_REMOVE
 
         def work():
             try:
                 for chunk in make_generator():
                     if token != self.run_id:
-                        return GLib.idle_add(self._finish_run, token)
+                        return
                     GLib.idle_add(write, chunk)
-            except ai.NoKey as e:
-                GLib.idle_add(write, str(e))
+            except (ai.NoKey, ai.ApiError) as e:
+                return GLib.idle_add(fail, str(e))
             except Exception as e:
-                GLib.idle_add(write, "\n[error] %r" % (e,))
-            GLib.idle_add(write, "\n")
-            GLib.idle_add(self._finish_run, token)
+                # Nothing may fail silently: an unexpected exception is still a
+                # card the user can read.
+                return GLib.idle_add(fail, "%s: %s" % (type(e).__name__, e))
+            GLib.idle_add(self._settle_stream, token, card)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _settle_stream(self, token, card):
+        """Close out a stream, distinguishing 'finished' from 'said nothing'."""
+        if token != self.run_id:
+            return GLib.SOURCE_REMOVE
+        self._flush_pending()
+        if not getattr(self, "got_output", False):
+            self._js(panel_html.call(
+                "append", card,
+                "The model returned no text. This usually means the request was "
+                "refused or the response was empty."))
+            return self._finish_run(token, "empty response", "error")
+        return self._finish_run(token, "done", "ok")
 
     def _start_run(self):
         """Invalidate anything already running and claim the panel."""
@@ -590,13 +779,20 @@ class Browser(Gtk.Window):
         self.run_id += 1
         self.panel_busy = True
         self.panel_stop.set_sensitive(True)
+        self._set_status("working\u2026", "busy")
         return self.run_id
 
-    def _finish_run(self, token):
+    def _finish_run(self, token, status="done", kind="ok"):
         if token == self.run_id:
             self.panel_busy = False
             self.panel_stop.set_sensitive(False)
+            label = status
+            if kind == "ok" and ai.LAST_CREDENTIAL:
+                label = "%s \u00b7 %s" % (status, ai.LAST_CREDENTIAL)
+            self._set_status(label, kind)
+            self._panel_done(kind if kind in ("ok", "error") else "")
         return GLib.SOURCE_REMOVE
+
 
     def _with_page(self, then, tab_id=None):
         """Fetch the readable text of a tab, then hand it to `then`."""
@@ -605,6 +801,7 @@ class Browser(Gtk.Window):
             then(page if isinstance(page, dict) else {"url": "", "title": "", "text": ""})
 
         self.api_eval(tab_id, extract.TEXT, got)
+
 
     # -- mode: TL;DR (a button, never automatic) ----------------------------
 
@@ -615,32 +812,40 @@ class Browser(Gtk.Window):
         navigation, which is slow here and costs money on pages you never read.
         """
         self.open_panel("tldr")
-        self._panel_write("Reading page…", replace=True)
+        if not self._require_key():
+            return
+        self._set_status("reading page…", "busy")
         self._with_page(lambda page: self._run_stream(
             lambda: ai.summarize(page),
-            "TL;DR — %s\n\n" % (page.get("title") or page.get("url") or "this page")))
+            title="TL;DR",
+            subtitle=page.get("title") or page.get("url") or "this page"))
 
     # -- mode: research across tabs -----------------------------------------
 
     def research(self, question=None):
         """Read every open tab and synthesize across them."""
         self.open_panel("research")
+        if not self._require_key():
+            return
         tabs = list(self.tabs)
         if not tabs:
-            return self._panel_write("No tabs open.", replace=True)
-        self._panel_write("Reading %d tab%s…\n" % (len(tabs), "" if len(tabs) == 1 else "s"),
-                          replace=True)
+            self._panel_write("No tabs are open to research.", replace=True, tag="error")
+            return self._set_status("nothing to read", "warn")
+        self._set_status("reading %d tab%s…" % (len(tabs), "" if len(tabs) == 1 else "s"),
+                         "busy")
 
         pages = []
 
         def next_tab(index):
             if index >= len(tabs):
-                titles = "\n".join(
-                    "  %d. %s" % (i + 1, p.get("title") or p.get("url") or "(untitled)")
-                    for i, p in enumerate(pages))
+                if not pages:
+                    self._panel_write("None of the open tabs had readable text.",
+                                      replace=True, tag="error")
+                    return self._set_status("nothing to read", "warn")
                 return self._run_stream(
                     lambda: ai.synthesize(pages, question),
-                    "Across %d tabs:\n%s\n\n" % (len(pages), titles))
+                    title="Research",
+                    subtitle="%d tab%s" % (len(pages), "" if len(pages) == 1 else "s"))
 
             def got(page):
                 if (page.get("text") or "").strip():
@@ -680,12 +885,23 @@ class Browser(Gtk.Window):
     def run_agent(self, goal):
         import threading
 
+        if not self._require_key():
+            return
         token = self._start_run()
-        self._panel_write("⌘ %s\n\n" % goal, replace=True)
+        self._js("cb.clear()")
+        self._pending = ""
+        self._new_card("you", "Goal")
+        self._js(panel_html.call("append", str(self._card_id), goal))
+        card = self._new_card("", "Claude")
 
         def emit(text):
             def write():
-                if token == self.run_id:
+                if token != self.run_id:
+                    return GLib.SOURCE_REMOVE
+                # Agent progress lines become chips; prose becomes body text.
+                if text.startswith("  \u2192 "):
+                    self._panel_step(text.strip()[2:].strip())
+                else:
                     self._panel_write(text)
                 return GLib.SOURCE_REMOVE
             GLib.idle_add(write)
@@ -697,9 +913,10 @@ class Browser(Gtk.Window):
             try:
                 runner.run(goal)
             except Exception as e:
-                emit("\n[error] %r\n" % (e,))
-            emit("\n")
-            GLib.idle_add(self._finish_run, token)
+                GLib.idle_add(self._panel_write, "%s: %s" % (type(e).__name__, e),
+                              False, "error")
+                return GLib.idle_add(self._finish_run, token, "failed", "error")
+            GLib.idle_add(self._finish_run, token, "done", "ok")
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -714,8 +931,14 @@ class Browser(Gtk.Window):
         elif mode == "research":
             self.research(text)
         else:
+            if not self._require_key():
+                return
+            self._js("cb.clear()")
+            self._pending = ""
+            self._new_card("you", "You")
+            self._js(panel_html.call("append", str(self._card_id), text))
             self._with_page(lambda page: self._run_stream(
-                lambda: ai.ask(text, page), "You: %s\n\nClaude: " % text))
+                lambda: ai.ask(text, page), title="Claude", clear=False))
 
     # -- agent API ----------------------------------------------------------
     # Every method here takes a trailing `done` callback and calls it once.

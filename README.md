@@ -77,8 +77,9 @@ otherwise. Tabs appear only once there is more than one.
 
 ### The Claude panel
 
-One panel at the bottom, four modes. All need `ANTHROPIC_API_KEY`; everything
-else in the browser works without one.
+One console at the bottom — mode pills, a status line, and results as **cards**
+rendered by a WebView, because there is already a browser engine in the process.
+Every run says which credential it used and, on failure, why.
 
 | | | |
 |---|---|---|

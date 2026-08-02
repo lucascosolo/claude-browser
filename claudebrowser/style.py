@@ -1,39 +1,58 @@
-"""The entire visual language of the browser, in one string.
+"""The visual language of the browser, in one file.
 
-Deliberately small. Chrome is one 40px bar; everything else is page.
-Colors are defined once here and nowhere else.
+Chrome stays minimal -- one 40px bar -- but not colourless. The palette is
+Claude's: a warm coral-orange accent against warm neutrals, rather than the
+blue-grey default every GTK app already looks like.
+
+Colour is used for meaning, never decoration:
+  accent   the active mode, focus, progress, the prompt caret
+  ok       a finished run
+  warn     something failed, and why
+Everything else is neutral so those three read instantly.
 """
 
-# Two palettes, one structure. GTK3 has no prefers-color-scheme, so we pick at
-# startup from the GTK theme's own dark preference and swap the whole block.
+# Claude's warm neutrals and coral accent. The dark surfaces are warm-tinted
+# (note the red channel leads) so the orange sits on them without clashing.
 _DARK = {
-    "bg": "#16171a",
-    "bar": "#1c1e22",
-    "line": "#292c31",
-    "text": "#e6e8ea",
-    "dim": "#8b9096",
-    "field": "#232629",
-    "field_focus": "#282c30",
-    "accent": "#6aa9ff",
-    "tab_active": "#2b2f34",
+    "bg": "#1f1e1d",
+    "bar": "#262624",
+    "panel": "#232221",
+    "line": "#3a3937",
+    "text": "#f0eee6",
+    "dim": "#9a968c",
+    "field": "#2a2927",
+    "field_focus": "#302e2c",
+    "accent": "#d97757",       # Claude coral
+    "accent_soft": "#4a2e24",  # accent at low alpha, pre-blended for GTK3
+    "on_accent": "#1f1e1d",
+    "ok": "#7fb069",
+    "warn": "#e0894f",
+    "tab_active": "#2f2d2b",
 }
 
+# On white, the coral has to darken to stay readable as text (#d97757 is only
+# ~2.9:1 on white; this is ~4.6:1). Same hue, different job.
 _LIGHT = {
     "bg": "#ffffff",
-    "bar": "#f6f7f8",
-    "line": "#e2e5e9",
-    "text": "#1a1c1e",
-    "dim": "#6b7178",
+    "bar": "#faf9f5",
+    "panel": "#f7f5ef",
+    "line": "#e5e1d8",
+    "text": "#3d3d3a",
+    "dim": "#6f6c63",
     "field": "#ffffff",
     "field_focus": "#ffffff",
-    "accent": "#1a6fe0",
+    "accent": "#b8532f",
+    "accent_soft": "#f6e4dc",
+    "on_accent": "#ffffff",
+    "ok": "#4a7c3f",
+    "warn": "#a8541f",
     "tab_active": "#ffffff",
 }
 
 _TEMPLATE = """
 window, .cb-root {{ background: {bg}; }}
 
-/* The one bar. 40px, no gradients, no shadows, no window title. */
+/* ---- the one bar ---- */
 .cb-bar {{
     background: {bar};
     border-bottom: 1px solid {line};
@@ -46,21 +65,27 @@ window, .cb-root {{ background: {bg}; }}
     box-shadow: none;
     color: {dim};
     padding: 4px 7px;
-    margin: 0;
+    margin: 0 1px;
     min-width: 20px;
     min-height: 20px;
+    border-radius: 6px;
 }}
-.cb-nav button:hover {{ color: {text}; background: {field_focus}; border-radius: 5px; }}
+.cb-nav button:hover {{ color: {text}; background: {field_focus}; }}
+.cb-nav button:active {{ color: {accent}; }}
 .cb-nav button:disabled {{ color: {line}; }}
 
-/* Omnibox: a text field that does not look like a text field until focused. */
+/* The Claude actions get the accent, so they read as a group. */
+.cb-nav button.cb-ai {{ color: {accent}; }}
+.cb-nav button.cb-ai:hover {{ background: {accent_soft}; color: {accent}; }}
+
+/* ---- omnibox ---- */
 .cb-omnibox {{
     background: {field};
     color: {text};
     border: 1px solid {line};
-    border-radius: 7px;
+    border-radius: 8px;
     padding: 5px 11px;
-    margin: 0 4px;
+    margin: 0 6px;
     caret-color: {accent};
 }}
 .cb-omnibox:focus {{
@@ -68,20 +93,14 @@ window, .cb-root {{ background: {bg}; }}
     border-color: {accent};
     box-shadow: none;
 }}
-.cb-omnibox selection {{ background: {accent}; color: {bg}; }}
+.cb-omnibox selection {{ background: {accent}; color: {on_accent}; }}
 
-/* Progress: a 2px hairline under the bar, not a widget. */
-.cb-progress {{
-    background: transparent;
-    min-height: 2px;
-}}
-.cb-progress progress {{
-    background: {accent};
-    min-height: 2px;
-}}
+/* ---- load progress: a 2px accent hairline ---- */
+.cb-progress {{ background: transparent; min-height: 2px; }}
+.cb-progress progress {{ background: {accent}; min-height: 2px; }}
 .cb-progress trough {{ background: transparent; border: none; min-height: 2px; }}
 
-/* Tabs. Hidden entirely when there is only one. */
+/* ---- tabs ---- */
 notebook.cb-tabs > header {{
     background: {bar};
     border-bottom: 1px solid {line};
@@ -90,45 +109,120 @@ notebook.cb-tabs > header {{
 notebook.cb-tabs > header > tabs > tab {{
     background: transparent;
     border: none;
+    border-bottom: 2px solid transparent;
     color: {dim};
     padding: 5px 10px;
-    margin: 3px 1px;
-    border-radius: 6px;
+    margin: 2px 1px 0 1px;
+    border-radius: 6px 6px 0 0;
     font-size: 0.88em;
     min-height: 0;
 }}
 notebook.cb-tabs > header > tabs > tab:checked {{
     background: {tab_active};
+    border-bottom-color: {accent};
     color: {text};
 }}
 notebook.cb-tabs > header > tabs > tab:hover {{ color: {text}; }}
 .cb-tabclose {{
+    background: transparent; border: none; box-shadow: none;
+    padding: 0 2px; margin: 0; min-width: 14px; min-height: 14px;
+    color: {dim};
+}}
+.cb-tabclose:hover {{ color: {warn}; }}
+
+/* ---- the Claude console, docked at the bottom like an inspector ---- */
+.cb-panel {{
+    background: {panel};
+    border-top: 1px solid {line};
+}}
+
+.cb-panel-head {{
+    background: {bar};
+    border-bottom: 1px solid {line};
+    padding: 3px 6px;
+}}
+
+/* Mode selector: segmented pills, the active one carrying the accent. */
+.cb-mode {{
     background: transparent;
     border: none;
     box-shadow: none;
-    padding: 0 2px;
-    margin: 0;
-    min-width: 14px;
-    min-height: 14px;
     color: {dim};
+    padding: 3px 11px;
+    margin: 1px;
+    border-radius: 999px;
+    font-size: 0.86em;
+    min-height: 0;
 }}
-.cb-tabclose:hover {{ color: {text}; }}
+.cb-mode:hover {{ color: {text}; background: {field_focus}; }}
+.cb-mode:checked {{
+    background: {accent};
+    color: {on_accent};
+    font-weight: 600;
+}}
+.cb-mode:checked:hover {{ background: {accent}; color: {on_accent}; }}
 
-/* The ask-Claude panel: same bar treatment, docked at the bottom. */
-.cb-ask {{
+.cb-status {{ color: {dim}; font-size: 0.82em; padding: 0 8px; }}
+.cb-status.busy {{ color: {accent}; }}
+.cb-status.ok {{ color: {ok}; }}
+.cb-status.warn {{ color: {warn}; }}
+
+.cb-panel-view {{
+    background: {panel};
+    color: {text};
+    padding: 8px 10px;
+    font-family: monospace;
+    font-size: 0.92em;
+}}
+.cb-panel-view text {{ background: {panel}; color: {text}; }}
+.cb-panel-view text selection {{ background: {accent}; color: {on_accent}; }}
+
+/* Prompt row: a console line, accent caret and chevron. */
+.cb-prompt-row {{
     background: {bar};
     border-top: 1px solid {line};
-    padding: 6px;
+    padding: 3px 6px;
 }}
-.cb-ask-view {{
-    background: {bar};
+.cb-chevron {{
+    color: {accent};
+    font-family: monospace;
+    font-weight: 700;
+    padding: 0 4px 0 6px;
+}}
+.cb-prompt {{
+    background: transparent;
     color: {text};
-    padding: 6px 10px;
+    border: none;
+    box-shadow: none;
+    padding: 5px 4px;
+    font-family: monospace;
+    caret-color: {accent};
 }}
-.cb-ask-view text {{ background: {bar}; color: {text}; }}
-.cb-hint {{ color: {dim}; font-size: 0.85em; padding: 0 6px; }}
+.cb-prompt:focus {{ background: transparent; border: none; box-shadow: none; }}
+.cb-prompt selection {{ background: {accent}; color: {on_accent}; }}
+
+.cb-panel-btn {{
+    background: transparent;
+    border: 1px solid {line};
+    box-shadow: none;
+    color: {dim};
+    border-radius: 6px;
+    padding: 2px 10px;
+    margin: 0 2px;
+    font-size: 0.84em;
+    min-height: 0;
+}}
+.cb-panel-btn:hover {{ color: {text}; border-color: {dim}; }}
+.cb-panel-btn:disabled {{ color: {line}; border-color: {line}; }}
+.cb-panel-btn.stop:hover {{ color: {warn}; border-color: {warn}; }}
 """
 
 
+def palette(dark: bool) -> dict:
+    """The raw colours, for widgets that cannot be styled with CSS
+    (GtkTextTag takes colours directly, not style classes)."""
+    return dict(_DARK if dark else _LIGHT)
+
+
 def css(dark: bool) -> bytes:
-    return _TEMPLATE.format(**(_DARK if dark else _LIGHT)).encode()
+    return _TEMPLATE.format(**palette(dark)).encode()

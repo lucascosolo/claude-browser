@@ -6,6 +6,7 @@ loop that stops making progress.
 """
 
 import io
+import os
 import sys
 import unittest
 import urllib.error
@@ -34,16 +35,22 @@ def http_error(code, message="nope", headers=None):
 
 class ApiRequestTest(unittest.TestCase):
     def setUp(self):
+        # Pin to the API-key path: this machine has a real Claude subscription
+        # credential on disk, and auth.candidates() would otherwise find it and
+        # make these tests depend on the developer's login state.
         self._key = ai.os.environ.get("ANTHROPIC_API_KEY")
+        self._auth = ai.os.environ.get("CB_AUTH")
+        ai.os.environ["CB_AUTH"] = "api"
         ai.os.environ["ANTHROPIC_API_KEY"] = "test-key"
         self.slept = []
         self.calls = 0
 
     def tearDown(self):
-        if self._key is None:
-            ai.os.environ.pop("ANTHROPIC_API_KEY", None)
-        else:
-            ai.os.environ["ANTHROPIC_API_KEY"] = self._key
+        for name, value in (("ANTHROPIC_API_KEY", self._key), ("CB_AUTH", self._auth)):
+            if value is None:
+                ai.os.environ.pop(name, None)
+            else:
+                ai.os.environ[name] = value
 
     def patch(self, sequence):
         """Each element is an exception to raise or a response to return."""
@@ -57,6 +64,7 @@ class ApiRequestTest(unittest.TestCase):
 
     def test_missing_key_raises_before_any_request(self):
         ai.os.environ.pop("ANTHROPIC_API_KEY", None)
+        # CB_AUTH=api from setUp, so the subscription path is not consulted.
         self.patch([AssertionError("should not be reached")])
         with self.assertRaises(ai.NoKey):
             ai._open({"model": "m"}, sleep=self.slept.append)
@@ -100,13 +108,111 @@ class ApiRequestTest(unittest.TestCase):
             ai._open({"model": "m"}, sleep=self.slept.append)
         self.assertIn("network error", str(caught.exception))
 
-    def test_stream_surfaces_error_instead_of_raising(self):
-        """The panel renders whatever the generator yields; an exception
-        escaping here would leave it blank with no explanation."""
+    def test_stream_raises_so_the_panel_can_mark_it_failed(self):
+        """It must raise, not yield the message as if it were an answer --
+        yielding made a failure render as a normal card with status "done"."""
         self.patch([http_error(500, "boom")])
         ai.time.sleep = lambda *_: None
-        out = "".join(ai._stream("sys", "prompt"))
-        self.assertIn("api error 500", out)
+        with self.assertRaises(ai.ApiError) as caught:
+            list(ai._stream("sys", "prompt"))
+        self.assertIn("server error (500)", str(caught.exception))
+        self.assertIn("transient", str(caught.exception))
+
+
+class ErrorMessageTest(unittest.TestCase):
+    """The API's own message is often one useless word -- a rate-limited
+    subscription literally returns {"message": "Error"} -- so these messages
+    have to carry the meaning themselves."""
+
+    def describe(self, status, body, label):
+        return ai._describe_error(status, body, label)[0]
+
+    def test_rate_limited_subscription_explains_the_shared_quota(self):
+        text = self.describe(429, '{"error":{"type":"rate_limit_error","message":"Error"}}',
+                             "max subscription")
+        self.assertIn("rate-limited", text)
+        self.assertIn("Claude Code", text, "should say what shares the quota")
+        self.assertNotIn('"message": "Error"', text)
+
+    def test_bad_api_key_says_the_key_is_the_problem(self):
+        text = self.describe(401, '{"error":{"message":"API key is invalid."}}', "API key")
+        self.assertIn("API key was rejected", text)
+        self.assertIn("sk-ant-", text, "should say what a valid key looks like")
+
+    def test_rejected_subscription_points_at_login(self):
+        text = self.describe(403, '{"error":{"message":"nope"}}', "max subscription")
+        self.assertIn("/login", text)
+
+    def test_unparseable_body_still_produces_something_useful(self):
+        text = self.describe(418, "<html>gateway</html>", "API key")
+        self.assertIn("418", text)
+
+
+class AuthTest(unittest.TestCase):
+    def setUp(self):
+        from claudebrowser import auth
+        self.auth = auth
+        self._env = {k: os.environ.get(k) for k in ("CB_AUTH", "ANTHROPIC_API_KEY")}
+        self._read = auth._read_subscription
+
+    def tearDown(self):
+        self.auth._read_subscription = self._read
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def fake_subscription(self, present=True, expired=False):
+        import time as _t
+        expires = (_t.time() - 60) * 1000 if expired else (_t.time() + 3600) * 1000
+        self.auth._read_subscription = (
+            (lambda: ("tok", "max", expires)) if present else (lambda: None))
+
+    def test_subscription_preferred_over_api_key(self):
+        """The whole point: spend the subscription before metered credit."""
+        os.environ["CB_AUTH"] = "auto"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-x"
+        self.fake_subscription()
+        labels = [label for _h, label in self.auth.candidates()]
+        self.assertEqual(labels, ["max subscription", "API key"])
+
+    def test_subscription_uses_bearer_and_beta_header_not_x_api_key(self):
+        """OAuth tokens go on Authorization, never x-api-key."""
+        self.fake_subscription()
+        os.environ["CB_AUTH"] = "subscription"
+        headers, _label = self.auth.candidates()[0]
+        self.assertTrue(headers["authorization"].startswith("Bearer "))
+        self.assertEqual(headers["anthropic-beta"], self.auth.OAUTH_BETA)
+        self.assertNotIn("x-api-key", headers)
+
+    def test_expired_subscription_is_skipped(self):
+        self.fake_subscription(expired=True)
+        os.environ["CB_AUTH"] = "auto"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-x"
+        self.assertEqual([l for _h, l in self.auth.candidates()], ["API key"])
+
+    def test_expired_subscription_status_says_how_to_fix(self):
+        self.fake_subscription(expired=True)
+        _kind, note = self.auth.subscription_status()
+        self.assertIn("/login", note)
+
+    def test_api_preference_ignores_subscription(self):
+        self.fake_subscription()
+        os.environ["CB_AUTH"] = "api"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-x"
+        self.assertEqual([l for _h, l in self.auth.candidates()], ["API key"])
+
+    def test_no_credential_explains_both_paths(self):
+        self.fake_subscription(present=False)
+        os.environ["CB_AUTH"] = "auto"
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        with self.assertRaises(self.auth.NoCredential) as caught:
+            self.auth.candidates()
+        text = str(caught.exception)
+        self.assertIn("/login", text)
+        self.assertIn("ANTHROPIC_API_KEY", text)
+        self.assertIn("desktop menu", text, "should mention the launcher trap")
 
 
 class SseTest(unittest.TestCase):

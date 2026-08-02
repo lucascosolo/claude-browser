@@ -14,6 +14,8 @@ import time
 import urllib.error
 import urllib.request
 
+from . import auth
+
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
 
@@ -52,6 +54,10 @@ SYNTHESIS_SYSTEM = (
 )
 
 
+# Which credential served the last successful request, for the UI to report.
+LAST_CREDENTIAL = None
+
+
 class NoKey(Exception):
     """No credential available. Raised before any network call is attempted."""
 
@@ -59,41 +65,60 @@ class NoKey(Exception):
 class ApiError(Exception):
     """A request failed in a way retrying did not fix."""
 
+    auth_failure = False
+
 
 def api_key():
+    """Only the API key. Credential selection lives in auth.candidates()."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
-        raise NoKey(
-            "Set ANTHROPIC_API_KEY to use Claude features. "
-            "Everything else in the browser works without it."
-        )
+        raise NoKey(auth._explain(auth.preference()))
     return key
 
 
 def _open(payload, timeout=600, sleep=time.sleep):
-    """POST with bounded retries. Returns the open response for the caller to read.
+    """POST with bounded retries, trying each credential in turn.
 
     `sleep` is injectable so tests can exercise the retry path without waiting.
     """
+    try:
+        options = auth.candidates()
+    except auth.NoCredential as e:
+        raise NoKey(str(e))
+
+    last = None
+    for index, (credential, label) in enumerate(options):
+        try:
+            return _open_with(payload, credential, label, timeout, sleep)
+        except ApiError as e:
+            # An auth rejection is the one case worth trying the next credential
+            # for -- notably a subscription token the API declines for this
+            # client. Anything else is the real answer; do not mask it.
+            if not e.auth_failure or index == len(options) - 1:
+                raise
+            last = e
+    raise last or ApiError("[error] no credential worked")
+
+
+def _open_with(payload, credential, label, timeout, sleep):
+    global LAST_CREDENTIAL
+
     body = json.dumps(payload).encode()
-    headers = {
-        "x-api-key": api_key(),
-        "anthropic-version": API_VERSION,
-        "content-type": "application/json",
-    }
+    headers = dict(credential)
+    headers["anthropic-version"] = API_VERSION
+    headers["content-type"] = "application/json"
     if payload.get("stream"):
         headers["accept"] = "text/event-stream"
 
     for attempt in range(MAX_RETRIES + 1):
         req = urllib.request.Request(API_URL, data=body, headers=headers, method="POST")
         try:
-            return urllib.request.urlopen(req, timeout=timeout)
+            response = urllib.request.urlopen(req, timeout=timeout)
+            LAST_CREDENTIAL = label
+            return response
         except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:500]
-            try:
-                detail = json.loads(detail)["error"]["message"]
-            except Exception:
-                pass
+            raw = e.read().decode("utf-8", "replace")[:800]
+            detail, kind = _describe_error(e.code, raw, label)
             if e.code in RETRY_STATUS and attempt < MAX_RETRIES:
                 # Honour Retry-After when the server sends one; otherwise back
                 # off exponentially with jitter so several panels retrying at
@@ -105,7 +130,11 @@ def _open(payload, timeout=600, sleep=time.sleep):
                     delay = (2 ** attempt) + random.random()
                 sleep(min(delay, 30))
                 continue
-            raise ApiError("[api error %s] %s" % (e.code, detail))
+            error = ApiError(detail)
+            error.auth_failure = e.code in (401, 403)
+            error.status = e.code
+            error.kind = kind
+            raise error
         except urllib.error.URLError as e:
             if attempt < MAX_RETRIES:
                 sleep(min((2 ** attempt) + random.random(), 30))
@@ -117,6 +146,49 @@ def _open(payload, timeout=600, sleep=time.sleep):
                 continue
             raise ApiError("[connection error] %s" % (e,))
     raise ApiError("[error] exhausted retries")
+
+
+def _describe_error(status, raw, label):
+    """Turn an API error into something a person can act on.
+
+    The API's own message is often a single unhelpful word -- a rate-limited
+    subscription literally returns {"message": "Error"} -- so the status code
+    and error type carry the real meaning and we spell it out here. "It failed"
+    with no reason is the thing this browser must never do.
+    """
+    kind = ""
+    message = raw
+    try:
+        parsed = json.loads(raw).get("error", {})
+        kind = parsed.get("type", "")
+        message = parsed.get("message") or raw
+    except Exception:
+        pass
+
+    if status == 429:
+        if "subscription" in label:
+            return ("Your Claude subscription is rate-limited right now.\n\n"
+                    "This quota is shared with Claude Code, so a busy session can "
+                    "use it up. It refills on its own -- wait a few minutes and try "
+                    "again, or set ANTHROPIC_API_KEY to bill the API instead.", kind)
+        return ("Rate limited by the API. Wait a moment and try again.", kind)
+
+    if status in (401, 403):
+        if "subscription" in label:
+            return ("Your Claude subscription login was rejected (%s).\n\n"
+                    "Run /login in Claude Code to refresh it." % (message,), kind)
+        return ("The API key was rejected: %s\n\n"
+                "Check the value of ANTHROPIC_API_KEY -- keys start with 'sk-ant-' "
+                "and can be revoked from the Anthropic console." % (message,), kind)
+
+    if status == 404:
+        return ("The model was not found (%s). This build asks for %s."
+                % (message, MODEL), kind)
+    if status >= 500:
+        return ("Anthropic returned a server error (%s): %s\n"
+                "This is usually transient." % (status, message), kind)
+
+    return ("[%s] HTTP %s: %s" % (label, status, message), kind)
 
 
 # -- one-shot text features -------------------------------------------------
@@ -138,11 +210,9 @@ def _stream(system, prompt):
         "stream": True,
         "messages": [{"role": "user", "content": prompt}],
     }
-    try:
-        resp = _open(payload)
-    except ApiError as e:
-        yield str(e)
-        return
+    # ApiError propagates: the panel turns it into a red card with a "failed"
+    # status. Yielding the message as if it were an answer looked like success.
+    resp = _open(payload)
     try:
         with resp:
             for text in _sse_text(resp):
