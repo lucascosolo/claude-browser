@@ -5,12 +5,12 @@ from the start rather than bolted on.
 
 It renders with **WebKitGTK** — the same engine that backs Safari — using the copy
 already installed on your system. There is no bundled Chromium, no Electron, and no
-node_modules. The whole thing is about 1,200 lines of Python against the standard
+node_modules. The whole thing is about 2,000 lines of Python against the standard
 library, and it idles in roughly the memory one Chrome tab uses.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  ←  →  ⟳   │ https://example.com          │   ✦    ＋    │   40px of chrome
+│ ← → ⟳ ⌂ │ https://example.com    │ ☆  ✦ ⚟ ＋ │   40px of chrome
 ├──────────────────────────────────────────────────────────┤
 │                                                          │
 │                     the page                             │
@@ -68,12 +68,59 @@ Right-clicking the menu entry offers **New Window** and **New Window (no agent A
 | `Ctrl+L` | focus the address bar |
 | `Ctrl+K` | ask Claude about the current page |
 | `Ctrl+T` / `Ctrl+W` | new tab / close tab |
-| `Ctrl+R`, `Alt+←/→` | reload, back, forward |
+| `Ctrl+Shift+P` | **new private tab** |
+| `Ctrl+D` | **bookmark this page** |
+| `Ctrl+H` / `Ctrl+Shift+O` | **history / bookmarks** |
+| `Ctrl+Shift+A` | **the Deck — every tab as a card** |
+| `Ctrl+R`, `Alt+←/→`, `Alt+Home` | reload, back, forward, start page |
 | `Ctrl+±`, `Ctrl+0` | zoom |
 | `F12` | web inspector |
 
 The address bar navigates when the input looks like an address and searches
-otherwise. Tabs appear only once there is more than one.
+otherwise, and suggests as you type from your history and bookmarks —
+bookmarks first, then by visit count with a recency bonus, and a match on the
+start of a hostname outranks one buried in a title. Tabs appear only once there
+is more than one.
+
+### Its own pages
+
+Four internal pages on the `cb:` scheme, laid out as cards and sharing the
+Claude panel's visual language. A slim icon rail moves between them.
+
+| | |
+|---|---|
+| `cb:home` | Start page: one input that both searches and navigates, four quick actions, then bookmarks and recent pages as tiles. This is the default new tab (`CB_HOME` overrides it). |
+| `cb:deck` | **Every open tab as a card.** A tab strip stops being navigation somewhere around the eighth tab — the labels ellipsize to nothing and you are clicking by position. The deck is the same set laid out where the titles are readable. |
+| `cb:bookmarks` | Everything saved, filterable. |
+| `cb:history` | Grouped by day, filterable, with per-entry delete and a two-step clear. |
+
+Tiles carry a **site mark** — a letter on a colour hashed from the hostname —
+rather than a favicon. Favicons would mean a network request per tile on the
+machine we are optimising for, and they leak your history to every site you
+have ever visited the moment you open a new tab. The mark is stable, instant
+and offline.
+
+Filtering inside these pages is done in the page, not by re-rendering from
+Python: a full page load per keystroke is not a search box.
+
+### Private tabs
+
+`Ctrl+Shift+P` opens a tab with its own ephemeral `WebsiteDataManager` —
+separate cookie jar, no disk cache, nothing kept when it closes — and nothing
+it visits is written to history. The bar picks up a dashed accent underline and
+the tab gets a badge, so a private tab is never something you have to remember.
+
+The one real cost: a private view cannot also be a *related* view, and related
+views are how ordinary tabs share a single web process. So a private tab does
+spawn its own — deliberately, since inheriting the relative's storage is the
+exact thing being avoided.
+
+History and bookmarks live in one SQLite file at
+`~/.local/share/claude-browser/browsing.db`. History is deduplicated by URL
+with a visit count rather than appended per visit, which is what keeps the
+history page scannable and gives autocomplete something to rank by. Writes go
+through a background thread so a disk seek never lands on the frame the page is
+painting.
 
 ### The Claude panel
 
@@ -275,7 +322,7 @@ session eats it. It is a fallback, not a foundation.
 python3 -m unittest discover -s tests
 ```
 
-79 tests, no display or GTK bindings needed.
+102 tests, no display or GTK bindings needed.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the
@@ -289,5 +336,12 @@ malformed tool blocks.
 
 `test_envfile.py` covers settings parsing and precedence, including the
 world-readable warning and that the shipped template sets nothing.
+
+`test_store.py` covers history, bookmarks and the pages built on them: that a
+later empty title cannot erase a good one, that `retitle` does not count a
+visit (`notify::title` fires several times per load, and counting each would
+make one page look like five), that internal pages are never recorded, and that
+hostile page titles cannot break out of the `onclick="..."` attribute their URL
+is written into.
 
 The GTK layer itself is not covered; it needs a display.

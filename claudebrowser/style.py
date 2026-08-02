@@ -78,6 +78,27 @@ window, .cb-root {{ background: {bg}; }}
 .cb-nav button.cb-ai {{ color: {accent}; }}
 .cb-nav button.cb-ai:hover {{ background: {accent_soft}; color: {accent}; }}
 
+/* The bookmark star: lit means saved. The one control here whose colour is
+   state rather than decoration. */
+.cb-nav button.cb-star.on {{ color: {accent}; }}
+.cb-nav button.cb-star.on:hover {{ background: {accent_soft}; }}
+
+/* ---- private tabs ----
+   A private window must be obvious at a glance without being loud: a dashed
+   accent underline on the bar, and a badge on the tab itself. */
+.cb-private .cb-bar {{
+    border-bottom: 1px dashed {accent};
+    background: {panel};
+}}
+.cb-priv-badge {{
+    background: {accent_soft};
+    color: {accent};
+    font-size: 0.68em;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 4px;
+}}
+
 /* ---- omnibox ---- */
 .cb-omnibox {{
     background: {field};

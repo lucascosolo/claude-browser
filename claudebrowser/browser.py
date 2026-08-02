@@ -10,17 +10,19 @@ import io
 import json
 import os
 import re
+import secrets
 
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
-from gi.repository import Gdk, GLib, Gtk, WebKit2  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import agent, ai, auth, extract, panel_html, perf, style  # noqa: E402
+from . import agent, ai, auth, extract, pages, panel_html, perf, store, style  # noqa: E402
 from .urls import normalize  # noqa: E402
 
-HOME = os.environ.get("CB_HOME", "about:blank")
+HOME = os.environ.get("CB_HOME", "cb:home")
+INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history")
 # console.* is not exposed to the embedder in webkit2gtk, so we shim it in the
 # page at document-start and read the ring buffer back out with JS later.
 CONSOLE_SHIM = """
@@ -73,9 +75,22 @@ class Tab:
 
     _next_id = 1
 
-    def __init__(self, manager, related=None):
+    def __init__(self, manager, related=None, private=False):
         self.id = Tab._next_id
         Tab._next_id += 1
+        self.private = private
+        # A private view gets its own ephemeral WebsiteDataManager: separate
+        # cookie jar, no disk cache, nothing written when it closes. It cannot
+        # also be a *related* view -- related views inherit their relative's
+        # storage, which is the entire thing we are avoiding -- so private tabs
+        # give up the shared-web-process trick and cost one more process.
+        if private:
+            self.view = WebKit2.WebView(
+                web_context=WebKit2.WebContext.get_default(),
+                user_content_manager=manager,
+                is_ephemeral=True,
+            )
+        elif related is not None:
         # Creating a view "related" to an existing one puts both in the same web
         # process. This is the only mechanism that still works for that in
         # WebKitGTK 2.52 -- set_process_model was deprecated to a no-op -- and it
@@ -83,7 +98,6 @@ class Tab:
         # on a machine that is already swapping. A related view inherits the
         # content manager and context from its relative, so the console shim and
         # the content blocker come along with it.
-        if related is not None:
             self.view = WebKit2.WebView.new_with_related_view(related)
         else:
             self.view = WebKit2.WebView.new_with_user_content_manager(manager)
@@ -102,6 +116,7 @@ class Tab:
             "url": self.view.get_uri() or "",
             "title": self.view.get_title() or "",
             "loading": self.loading,
+            "private": self.private,
         }
 
 
@@ -134,10 +149,35 @@ class Browser(Gtk.Window):
             )
         )
 
+        # History and bookmarks. A failure here must not stop the browser from
+        # opening -- a read-only home directory should cost you your history,
+        # not your browser -- so the store is optional from here on.
+        try:
+            self.store = store.Store()
+            self.store.prune()
+        except Exception as e:
+            print("store: disabled (%s)" % e, flush=True)
+            self.store = None
+
+        # Proves a script message came from one of our own pages. See pages.py:
+        # the handler is on the shared content manager, so every page in the
+        # browser can reach it, and only ours can produce this value.
+        self.nonce = secrets.token_urlsafe(24)
+        self.content.register_script_message_handler("cbui")
+        self.content.connect("script-message-received::cbui", self._on_ui_message)
+
         # Context tuning must happen before the first WebView exists, since the
         # process model is fixed once a web process has been spawned.
-        for note in perf.tune_context(WebKit2.WebContext.get_default()):
+        context = WebKit2.WebContext.get_default()
+        for note in perf.tune_context(context):
             print("perf: %s" % note, flush=True)
+
+        context.register_uri_scheme("cb", self._serve_internal)
+        security = context.get_security_manager()
+        if security:
+            # Without this our pages are treated as an opaque origin, which
+            # blocks the inline script that drives every button on them.
+            security.register_uri_scheme_as_secure("cb")
         # Deferred to idle so the window paints first: compiling the blocklist
         # takes real time on a slow CPU and there is no reason to stare at a
         # blank screen through it.
@@ -149,9 +189,21 @@ class Browser(Gtk.Window):
         self._build_chrome()
         self._bind_keys()
 
-        self.connect("destroy", Gtk.main_quit)
+        self.connect("destroy", self._on_destroy)
         for url in (urls or [HOME]):
             self.new_tab(url)
+
+    def _on_destroy(self, *_a):
+        """Let queued history writes land before the process goes away. The
+        last page you visited before quitting is exactly the one most likely to
+        be sitting in the queue."""
+        if self.store:
+            try:
+                self.store.flush()
+                self.store.close()
+            except Exception:
+                pass
+        Gtk.main_quit()
 
     # -- construction -------------------------------------------------------
 
@@ -190,7 +242,9 @@ class Browser(Gtk.Window):
                                          lambda *_: self._go(1))
         self.btn_reload = self._icon_button("view-refresh-symbolic", "Reload (Ctrl+R)",
                                             lambda *_: self._reload())
-        for b in (self.btn_back, self.btn_fwd, self.btn_reload):
+        self.btn_home = self._icon_button("go-home-symbolic", "Start page (Alt+Home)",
+                                          lambda *_: self._go_home())
+        for b in (self.btn_back, self.btn_fwd, self.btn_reload, self.btn_home):
             nav.pack_start(b, False, False, 0)
         bar.pack_start(nav, False, False, 0)
 
@@ -198,10 +252,16 @@ class Browser(Gtk.Window):
         self.omnibox.get_style_context().add_class("cb-omnibox")
         self.omnibox.set_placeholder_text("Search or enter address")
         self.omnibox.connect("activate", self._on_omnibox)
+        self._build_completion()
         bar.pack_start(self.omnibox, True, True, 0)
 
         right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         right.get_style_context().add_class("cb-nav")
+        self.btn_star = self._icon_button("non-starred-symbolic",
+                                          "Bookmark this page (Ctrl+D)",
+                                          lambda *_: self.toggle_bookmark())
+        self.btn_star.get_style_context().add_class("cb-star")
+        right.pack_start(self.btn_star, False, False, 0)
         right.pack_start(
             self._icon_button("format-justify-left-symbolic", "TL;DR this page (Ctrl+Shift+S)",
                               lambda *_: self.tldr()), False, False, 0)
@@ -212,8 +272,13 @@ class Browser(Gtk.Window):
             self._icon_button("system-run-symbolic", "Command Claude to drive (Ctrl+G)",
                               lambda *_: self.open_panel("agent")), False, False, 0)
         right.pack_start(
-            self._icon_button("starred-symbolic", "Ask Claude about this page (Ctrl+K)",
+            self._icon_button("dialog-question-symbolic",
+                              "Ask Claude about this page (Ctrl+K)",
                               lambda *_: self.toggle_ask()), False, False, 0)
+        right.pack_start(
+            self._icon_button("view-grid-symbolic", "Deck — every tab as a card "
+                                                    "(Ctrl+Shift+A)",
+                              lambda *_: self._open_internal("cb:deck")), False, False, 0)
         right.pack_start(
             self._icon_button("tab-new-symbolic", "New tab (Ctrl+T)",
                               lambda *_: self.new_tab(HOME)), False, False, 0)
@@ -390,6 +455,18 @@ class Browser(Gtk.Window):
             ("s", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK): self.tldr,
             ("r", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
                 lambda: self.research(),
+            ("d", Gdk.ModifierType.CONTROL_MASK): self.toggle_bookmark,
+            ("h", Gdk.ModifierType.CONTROL_MASK):
+                lambda: self._open_internal("cb:history"),
+            ("o", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                lambda: self._open_internal("cb:bookmarks"),
+            ("a", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                lambda: self._open_internal("cb:deck"),
+            ("p", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                lambda: self.new_tab(HOME, private=True),
+            ("n", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                lambda: self.new_tab(HOME, private=True),
+            ("Home", Gdk.ModifierType.MOD1_MASK): self._go_home,
             ("q", Gdk.ModifierType.CONTROL_MASK): Gtk.main_quit,
             ("equal", Gdk.ModifierType.CONTROL_MASK): lambda: self._zoom(0.1),
             ("minus", Gdk.ModifierType.CONTROL_MASK): lambda: self._zoom(-0.1),
@@ -422,18 +499,254 @@ class Browser(Gtk.Window):
             return True
         return False
 
+    def _build_completion(self):
+        """Address-bar suggestions from history and bookmarks.
+
+        The model is rebuilt on each keystroke and the match function always
+        returns True, because the ranking (bookmarks first, then frecency) is
+        done in SQL -- GtkEntryCompletion's own matching is a substring test
+        that would undo it.
+        """
+        self._suggest_model = Gtk.ListStore(str, str, str)   # display, url, mark
+        completion = Gtk.EntryCompletion()
+        completion.set_model(self._suggest_model)
+        completion.set_match_func(lambda *_a: True)
+        completion.set_minimum_key_length(1)
+        completion.set_popup_completion(True)
+        completion.set_popup_single_match(True)
+
+        mark = Gtk.CellRendererText()
+        mark.set_property("xalign", 0.5)
+        completion.pack_start(mark, False)
+        completion.add_attribute(mark, "text", 2)
+        label = Gtk.CellRendererText()
+        label.set_property("ellipsize", 3)  # PANGO_ELLIPSIZE_END
+        completion.pack_start(label, True)
+        completion.add_attribute(label, "markup", 0)
+
+        completion.connect("match-selected", self._on_suggestion)
+        self.omnibox.set_completion(completion)
+        self.omnibox.connect("changed", self._on_omnibox_changed)
+
+    def _on_omnibox_changed(self, entry):
+        if self.store is None or not entry.has_focus():
+            return
+        text = entry.get_text().strip()
+        self._suggest_model.clear()
+        if len(text) < 1:
+            return
+        for row in self.store.suggest(text, limit=8):
+            title = GLib.markup_escape_text(row["title"] or "")
+            url = GLib.markup_escape_text(row["url"])
+            display = ("<b>%s</b>  <span size='small' alpha='60%%'>%s</span>"
+                       % (title, url)) if title else url
+            self._suggest_model.append(
+                [display, row["url"], "★" if row.get("bookmark") else ""])
+
+    def _on_suggestion(self, _completion, model, treeiter):
+        url = model[treeiter][1]
+        self.omnibox.set_text(url)
+        tab = self.current() or self.new_tab()
+        self._begin_load(tab)
+        tab.view.load_uri(normalize(url))
+        tab.view.grab_focus()
+        return True
+
+    # -- the browser's own pages --------------------------------------------
+
+    def _open_internal(self, url):
+        """Reuse an already-open internal page rather than stacking duplicates
+        -- pressing Ctrl+H four times should not leave four history tabs."""
+        for tab in self.tabs:
+            if (tab.view.get_uri() or "").lower().rstrip("/") == url:
+                self.notebook.set_current_page(self.notebook.page_num(tab.view))
+                tab.view.reload()
+                return tab
+        tab = self.current()
+        if tab and (tab.view.get_uri() or "") in ("", "about:blank"):
+            self._begin_load(tab)
+            tab.view.load_uri(url)
+            return tab
+        return self.new_tab(url)
+
+    def _go_home(self):
+        tab = self.current() or self.new_tab(HOME)
+        self._begin_load(tab)
+        tab.view.load_uri(HOME)
+        return tab
+
+
+    def _serve_internal(self, request):
+        """Render cb:* on demand. These are generated per request rather than
+        cached, because their whole content is state that just changed."""
+        uri = request.get_uri() or "cb:home"
+        body = uri[3:] if uri.lower().startswith("cb:") else uri
+        name, _sep, query = body.partition("?")
+        name = name.strip("/").lower() or "home"
+        try:
+            data = self._render_internal(name, query).encode("utf-8")
+        except Exception as e:
+            data = ("<meta charset=utf-8><body style='font:14px system-ui;padding:40px'>"
+                    "<h1>cb:%s failed to render</h1><pre>%s: %s</pre>"
+                    % (name, type(e).__name__, e)).encode("utf-8")
+        stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data))
+        request.finish(stream, len(data), "text/html; charset=utf-8")
+
+    def _render_internal(self, name, query=""):
+        palette = style.palette(self.dark)
+        term = ""
+        for part in (query or "").split("&"):
+            key, _sep, value = part.partition("=")
+            if key == "q":
+                term = GLib.uri_unescape_string(value, None) or ""
+
+        if self.store is None:
+            return pages.shell(
+                name.title(), palette, self.nonce, "cb:" + name,
+                pages._empty("&#9888;", "History and bookmarks are unavailable",
+                             "The browser could not open its database."))
+
+        if name == "history":
+            rows = self.store.history(term or None)
+            marked = {r["url"] for r in self.store.bookmarks()}
+            return pages.history_page(palette, self.nonce, rows, term, marked)
+        if name == "bookmarks":
+            return pages.bookmarks_page(palette, self.nonce,
+                                        self.store.bookmarks(term or None), term)
+        if name == "deck":
+            current = self.current()
+            return pages.deck(palette, self.nonce, [
+                dict(t.info(), current=(t is current)) for t in self.tabs])
+        return pages.home(palette, self.nonce, self.store.bookmarks(limit=12),
+                          self.store.history(limit=12), self.store.counts())
+
+    def _on_ui_message(self, _manager, result):
+        """Actions posted by cb: pages. Every one is nonce-checked first."""
+        try:
+            value = result.get_js_value() if hasattr(result, "get_js_value") else result
+            data = json.loads(value.to_json(0) if hasattr(value, "to_json")
+                              else value.to_string())
+        except Exception:
+            return
+        if not isinstance(data, dict) or data.get("t") != self.nonce:
+            # Either malformed, or a page that is not ours trying its luck.
+            return
+
+        action = data.get("action") or ""
+        url, title = data.get("url") or "", data.get("title") or ""
+
+        if action == "go":
+            tab = self.current() or self.new_tab()
+            self._begin_load(tab)
+            tab.view.load_uri(normalize(url))
+            tab.view.grab_focus()
+        elif action == "bookmark" and self.store:
+            self.store.bookmark(url, title)
+            self._sync_star()
+        elif action == "unbookmark" and self.store:
+            self.store.unbookmark(url)
+            self._sync_star()
+        elif action == "forget" and self.store:
+            self.store.forget(url)
+        elif action == "clear_history" and self.store:
+            self.store.clear_history()
+            self.store.flush()
+            self._reload_internal()
+        elif action == "switch":
+            tab = self.find(data.get("tab"))
+            if tab:
+                self.notebook.set_current_page(self.notebook.page_num(tab.view))
+        elif action == "closetab":
+            self.close_tab(self.find(data.get("tab")))
+            self._reload_internal()
+        elif action == "newtab":
+            self.new_tab(HOME)
+        elif action == "private":
+            self.new_tab(HOME, private=True)
+        elif action.startswith("claude:"):
+            mode = action.split(":", 1)[1]
+            if mode == "tldr":
+                self.tldr()
+            elif mode == "research":
+                self.research()
+            else:
+                self.open_panel(mode)
+
+    def _reload_internal(self):
+        """Re-render any open cb: page after the data behind it changed."""
+        for tab in self.tabs:
+            if (tab.view.get_uri() or "").lower().startswith("cb:"):
+                tab.view.reload()
+
+    # -- bookmarks ----------------------------------------------------------
+
+    def toggle_bookmark(self):
+        tab = self.current()
+        if not tab or not self.store:
+            return
+        url = tab.view.get_uri() or ""
+        if not store.recordable(url):
+            return
+        on = self.store.toggle_bookmark(url, tab.view.get_title() or "")
+        self._paint_star(on)
+        self._flash("Bookmarked" if on else "Bookmark removed")
+        self._reload_internal()
+
+    def _paint_star(self, on):
+        self.btn_star.set_image(Gtk.Image.new_from_icon_name(
+            "starred-symbolic" if on else "non-starred-symbolic",
+            Gtk.IconSize.SMALL_TOOLBAR))
+        ctx = self.btn_star.get_style_context()
+        (ctx.add_class if on else ctx.remove_class)("on")
+        self.btn_star.set_tooltip_text(
+            "Remove bookmark (Ctrl+D)" if on else "Bookmark this page (Ctrl+D)")
+
+    def _sync_star(self):
+        """Repaint the star for whatever tab is in front.
+
+        Cached on the URL: _refresh runs on every progress tick, and while one
+        indexed lookup is cheap, doing it ten times a second during a page load
+        is work stolen from the load itself.
+        """
+        tab = self.current()
+        url = (tab.view.get_uri() or "") if tab else ""
+        if url == getattr(self, "_star_url", None):
+            return
+        self._star_url = url
+        self._paint_star(bool(self.store and self.store.is_bookmarked(url)))
+
+    def _flash(self, message):
+        """A short confirmation in the omnibox's place. Bookmarking with no
+        feedback at all leaves you pressing Ctrl+D twice to check."""
+        self.omnibox.set_text(message)
+        self._flashing = True
+        self._flash_token = getattr(self, "_flash_token", 0) + 1
+        token = self._flash_token
+
+        def restore():
+            if token == self._flash_token:
+                self._flashing = False
+                tab = self.current()
+                if tab and not self.omnibox.has_focus():
+                    self.omnibox.set_text(tab.view.get_uri() or "")
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add(1400, restore)
+
     # -- tabs ---------------------------------------------------------------
 
-    def new_tab(self, url=HOME, background=False):
-        related = self.tabs[0].view if self.tabs else None
-        tab = Tab(self.content, related=related)
+    def new_tab(self, url=HOME, background=False, private=False):
+        # A private tab must not be created *related* to a normal one, or it
+        # inherits the very storage it exists to avoid.
+        related = self.tabs[0].view if (self.tabs and not private) else None
+        tab = Tab(self.content, related=related, private=private)
         view = tab.view
 
         perf.tune_view(view)
 
         view.connect("load-changed", self._on_load, tab)
         view.connect("load-failed", self._on_fail, tab)
-        view.connect("notify::title", lambda *_: self._refresh(tab))
+        view.connect("notify::title", lambda *_: (self._retitle(tab), self._refresh(tab)))
         view.connect("notify::uri", lambda *_: self._refresh(tab))
         # Progress fires many times a second per frame. Repainting the whole bar
         # each time is work stolen from the layout we are waiting on, so this one
@@ -454,6 +767,10 @@ class Browser(Gtk.Window):
 
     def _tab_label(self, tab):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        if tab.private:
+            badge = Gtk.Label(label="private")
+            badge.get_style_context().add_class("cb-priv-badge")
+            box.pack_start(badge, False, False, 0)
         tab.label = Gtk.Label(label="New tab")
         tab.label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
         tab.label.set_max_width_chars(18)
@@ -509,9 +826,32 @@ class Browser(Gtk.Window):
             tab.failed = None
         elif event == WebKit2.LoadEvent.FINISHED:
             tab.loading = False
+            self._remember(tab)
             self._settle(tab, {"ok": tab.failed is None, **tab.info(),
                                **({"error": tab.failed} if tab.failed else {})})
         self._refresh(tab)
+
+    def _remember(self, tab):
+        """Record a visit -- unless this tab is private, which is the whole
+        contract of a private tab and so is checked here rather than anywhere
+        a caller might forget."""
+        if tab.private or self.store is None or tab.failed:
+            return
+        url = tab.view.get_uri() or ""
+        if not store.recordable(url):
+            return
+        self.store.record(url, tab.view.get_title() or "")
+        tab._recorded = url
+
+    def _retitle(self, tab):
+        """Titles usually arrive after the load finishes. Update in place --
+        recording again would count one page load as several visits and skew
+        every ranking built on the count."""
+        if tab.private or self.store is None:
+            return
+        url = tab.view.get_uri() or ""
+        if url and url == getattr(tab, "_recorded", None):
+            self.store.retitle(url, tab.view.get_title() or "")
 
     def _on_fail(self, _view, _event, uri, error, tab):
         # A load that was cancelled or interrupted because a *newer* navigation
@@ -563,9 +903,15 @@ class Browser(Gtk.Window):
             tab.label.set_tooltip_text(tab.view.get_uri() or "")
         if tab is not self.current():
             return
-        self.set_title("%s — claude-browser" % title)
-        if not self.omnibox.has_focus():
+        self.set_title("%s — claude-browser%s"
+                       % (title, " (private)" if tab.private else ""))
+        # A flash message owns the omnibox for its second; repainting the URL
+        # over it on the next progress tick would make it invisible.
+        if not self.omnibox.has_focus() and not getattr(self, "_flashing", False):
             self.omnibox.set_text(tab.view.get_uri() or "")
+        self._sync_star()
+        root = self.get_style_context()
+        (root.add_class if tab.private else root.remove_class)("cb-private")
         self.btn_back.set_sensitive(tab.view.can_go_back())
         self.btn_fwd.set_sensitive(tab.view.can_go_forward())
         progress = tab.view.get_estimated_load_progress()

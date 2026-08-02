@@ -23,7 +23,9 @@ def looks_like_url(text: str) -> bool:
     text = text.strip()
     if not text or " " in text:
         return False
-    if _FULL_SCHEME.match(text) or text.startswith(("about:", "file:", "data:")):
+    # "cb:home" carries a scheme but no "//", so it needs naming explicitly --
+    # otherwise the omnibox helpfully web-searches for the phrase "cb:home".
+    if _FULL_SCHEME.match(text) or text.startswith(("about:", "file:", "data:", "cb:")):
         return True
     host = text.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].split(":", 1)[0]
     if host == "localhost" or _IPV4.match(host):
