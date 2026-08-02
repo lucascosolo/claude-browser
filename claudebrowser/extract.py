@@ -5,20 +5,41 @@ They are injected with evaluate_javascript(), so the last expression is the
 return value -- every snippet ends in a JSON.stringify(...) call.
 """
 
-# Readable text. Strips the furniture (nav/script/style/footer) that makes a
-# raw innerText dump mostly noise, then collapses whitespace runs. This is the
-# single most-used endpoint, so it is worth the extra DOM walk.
+# Readable text: the single most-used endpoint, so it gets the careful version.
 TEXT = r"""
 (function () {
-  var drop = 'script,style,noscript,svg,canvas,iframe,nav,header,footer,aside,' +
-             '[aria-hidden="true"],[role="navigation"],[role="banner"]';
+  // Walks the LIVE dom rather than cloning it.
+  //
+  // The obvious implementation -- clone the subtree, delete the chrome, read
+  // .innerText -- is both slower and subtly wrong. innerText is defined to do
+  // layout, but a cloned node is detached and has no layout, so it silently
+  // degrades to textContent semantics: you pay for a full DOM copy and still
+  // get hidden text back with no block separation. Walking in place costs no
+  // copy and lets us use getClientRects() as a real visibility test.
+  var SKIP = /^(SCRIPT|STYLE|NOSCRIPT|SVG|CANVAS|IFRAME|NAV|HEADER|FOOTER|ASIDE|TEMPLATE|SELECT)$/;
+  var BREAK = /^(P|DIV|SECTION|ARTICLE|LI|TR|BLOCKQUOTE|PRE|BR|H[1-6]|UL|OL|TABLE)$/;
   var root = document.querySelector('main,article,[role="main"]') || document.body;
   if (!root) return JSON.stringify({ title: document.title, url: location.href, text: '' });
-  var clone = root.cloneNode(true);
-  clone.querySelectorAll(drop).forEach(function (n) { n.remove(); });
-  var text = (clone.innerText || '').replace(/[ \t\u00a0]+/g, ' ')
-                                    .replace(/\n{3,}/g, '\n\n')
-                                    .trim();
+
+  var out = [];
+  (function walk(node) {
+    for (var c = node.firstChild; c; c = c.nextSibling) {
+      if (c.nodeType === 3) { out.push(c.nodeValue); continue; }
+      if (c.nodeType !== 1) continue;
+      if (SKIP.test(c.tagName)) continue;
+      if (c.getAttribute('aria-hidden') === 'true' || c.hasAttribute('hidden')) continue;
+      var role = c.getAttribute('role');
+      if (role === 'navigation' || role === 'banner') continue;
+      if (c.getClientRects().length === 0) continue;   // display:none / not rendered
+      walk(c);
+      if (BREAK.test(c.tagName)) out.push('\n');
+    }
+  })(root);
+
+  var text = out.join('').replace(/[ \t ]+/g, ' ')
+                         .replace(/ ?\n ?/g, '\n')
+                         .replace(/\n{3,}/g, '\n\n')
+                         .trim();
   return JSON.stringify({ title: document.title, url: location.href, text: text });
 })()
 """

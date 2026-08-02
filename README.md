@@ -151,19 +151,31 @@ use. What's done about it:
 - **Ad/tracker blocking is on by default** (`CB_BLOCK=0` disables it). 82 rules
   compiled into WebKit's native content-blocker bytecode and cached on disk.
 - **Tabs share one web process.** WebKit's default is one process per view,
-  which on a swapping box is what makes a fourth tab hurt. Note that
-  `set_process_model()` is a no-op in WebKitGTK 2.52 despite being the obvious
-  call — the mechanism that actually works is creating each view *related* to
-  the first, which is what `new_tab` does.
-- **Smooth scrolling and WebGL off**, browser cache model, memory-pressure
-  handler, and progress repaints coalesced to 10/s.
+  which on a swapping box is what makes a fourth tab hurt. Measured: opening
+  three more tabs added **zero** web processes. Note `set_process_model()` is a
+  no-op in 2.52 despite being the obvious call — the mechanism that works is
+  creating each view *related* to the first, which is what `new_tab` does.
+- **Page reads walk the live DOM** instead of cloning it. The obvious version —
+  clone, strip the chrome, read `.innerText` — is slower *and* wrong: a detached
+  clone has no layout, so `innerText` silently degrades to `textContent`, losing
+  block separation and leaking hidden text. Walking in place costs no copy and
+  allows a real `getClientRects()` visibility test.
+- **Console shim only in the top frame.** An ad-heavy page carries dozens of
+  iframes and injecting into each was pure cost.
+- **Blocklist compiles after first paint**, smooth scrolling and WebGL off,
+  browser cache model, memory-pressure handler, progress repaints coalesced
+  to 10/s.
 
-**Honest caveat on the numbers:** `tools/bench.py` measures load time with and
-without the blocker, but on this hardware it could not produce a trustworthy
-result — the same URL took 2.9s in one run and timed out at 90s in another.
-Swap pressure and network variance both exceed the effect being measured. The
-tuning above is sound in principle and the blocker demonstrably loads (82 rules,
-verified), but no speedup figure here has been earned, so none is quoted.
+Three APIs here exist, are documented, and do nothing in WebKitGTK 2.52:
+`set_process_model`, `set_enable_hyperlink_auditing`, and `innerText` on a
+detached node. `hasattr()` cannot tell you that — only running it can.
+
+**No speedup figure is quoted, deliberately.** `tools/bench.py` exists and
+measures load time with and without the blocker, but on this hardware it could
+not produce a trustworthy result — the same URL took 2.9s in one run and timed
+out at 90s in another. Swap pressure and network variance both exceed the effect.
+The blocker demonstrably loads (82 rules, verified) and the process sharing is
+measured above; everything else here is sound in principle and unquantified.
 
 Python is not the bottleneck, which was worth checking: during a page load the
 CPU is entirely `WebKitWebProcess` (15–21%) and `WebKitNetworkProcess` (8–20%) —
@@ -214,7 +226,16 @@ from a page the agent is reading.
 python3 -m unittest discover -s tests
 ```
 
-28 tests covering URL intent, JS escaping, SSE parsing, control routing, the CLI, and
-the MCP server. They run without a display or the GTK bindings — the stub in
-`tests/test_offline.py` speaks the control protocol so the agent-facing layers are
-exercised end to end. The GTK layer itself is not covered by them; it needs a display.
+51 tests, no display or GTK bindings needed.
+
+`test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
+the CLI and the MCP server — a stub speaks the control protocol so the
+agent-facing layers run end to end.
+
+`test_ai.py` covers the failure paths that are expensive to discover in front of
+a user: retry and backoff (including `Retry-After`, and *not* retrying a 4xx),
+refusals, truncated turns, missing API key, and an agent loop that stops making
+progress — repeat detection, step budget, output budget, cancellation, and
+malformed tool blocks.
+
+The GTK layer itself is not covered; it needs a display.

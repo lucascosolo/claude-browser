@@ -116,13 +116,17 @@ class Browser(Gtk.Window):
             dark = bool(settings and settings.get_property("gtk-application-prefer-dark-theme"))
         self._apply_css(dark)
 
-        # One shared content manager: the console shim is injected into every
-        # page of every tab, at document-start, before page scripts run.
+        # One shared content manager. The console shim runs at document-start,
+        # before page scripts, so it catches errors thrown during startup.
+        # TOP_FRAME, not ALL_FRAMES: an ad-heavy page can carry dozens of
+        # iframes, and injecting into each one is pure cost for output nobody
+        # reads. The tradeoff is that console output from inside an iframe is
+        # not captured.
         self.content = WebKit2.UserContentManager()
         self.content.add_script(
             WebKit2.UserScript.new(
                 CONSOLE_SHIM,
-                WebKit2.UserContentInjectedFrames.ALL_FRAMES,
+                WebKit2.UserContentInjectedFrames.TOP_FRAME,
                 WebKit2.UserScriptInjectionTime.START,
                 None,
                 None,
@@ -133,10 +137,13 @@ class Browser(Gtk.Window):
         # process model is fixed once a web process has been spawned.
         for note in perf.tune_context(WebKit2.WebContext.get_default()):
             print("perf: %s" % note, flush=True)
-        perf.load_content_filter(
+        # Deferred to idle so the window paints first: compiling the blocklist
+        # takes real time on a slow CPU and there is no reason to stare at a
+        # blank screen through it.
+        GLib.idle_add(lambda: perf.load_content_filter(
             self.content,
             lambda n: print("perf: content blocker active (%s rules)" % n, flush=True),
-        )
+        ) or GLib.SOURCE_REMOVE)
 
         self._build_chrome()
         self._bind_keys()
@@ -226,6 +233,13 @@ class Browser(Gtk.Window):
 
         self.panel_mode = "ask"
         self.active_agent = None
+        # Every run gets a token. Stop (and any newer run) bumps it, so a worker
+        # thread that is mid-stream discovers it is stale and drops its output
+        # instead of interleaving with whatever replaced it. A generator doing
+        # blocking socket reads cannot be interrupted from outside; this makes it
+        # harmless instead.
+        self.run_id = 0
+        self.panel_busy = False
         self.panel = self._build_panel()
         root.pack_start(self.panel, False, False, 0)
 
@@ -239,11 +253,12 @@ class Browser(Gtk.Window):
         self.panel_label.set_xalign(0)
         self.panel_label.get_style_context().add_class("cb-hint")
         head.pack_start(self.panel_label, True, True, 0)
-        stop = Gtk.Button(label="Stop")
-        stop.get_style_context().add_class("cb-tabclose")
-        stop.set_can_focus(False)
-        stop.connect("clicked", lambda *_: self._stop_agent())
-        head.pack_start(stop, False, False, 0)
+        self.panel_stop = Gtk.Button(label="Stop")
+        self.panel_stop.get_style_context().add_class("cb-tabclose")
+        self.panel_stop.set_can_focus(False)
+        self.panel_stop.set_sensitive(False)
+        self.panel_stop.connect("clicked", lambda *_: self.stop_run())
+        head.pack_start(self.panel_stop, False, False, 0)
         close = self._icon_button("window-close-symbolic", "Close (Esc)",
                                   lambda *_: self.panel.hide())
         head.pack_start(close, False, False, 0)
@@ -270,6 +285,15 @@ class Browser(Gtk.Window):
     def _stop_agent(self):
         if getattr(self, "active_agent", None):
             self.active_agent.cancel()
+            self.active_agent = None
+
+    def stop_run(self):
+        """Cancel whatever the panel is doing: agent loop or streamed answer."""
+        self._stop_agent()
+        self.run_id += 1          # strands any in-flight worker
+        self.panel_busy = False
+        self.panel_stop.set_sensitive(False)
+        self._panel_write("\n[stopped]\n")
 
     def _bind_keys(self):
         accel = {
@@ -301,7 +325,8 @@ class Browser(Gtk.Window):
             return True
         if event.keyval == Gdk.KEY_Escape:
             if self.panel.get_visible():
-                self._stop_agent()
+                if getattr(self, "panel_busy", False):
+                    self.stop_run()
                 self.panel.hide()
                 tab = self.current()
                 if tab:
@@ -532,23 +557,46 @@ class Browser(Gtk.Window):
         """Drive a text-producing generator on a worker thread.
 
         The generator does blocking network I/O, so it cannot run on the GTK
-        thread; every write comes back through idle_add.
+        thread; every write comes back through idle_add, gated on the run token.
         """
         import threading
 
+        token = self._start_run()
         self._panel_write(header, replace=True)
+
+        def write(chunk):
+            if token == self.run_id:
+                self._panel_write(chunk)
+            return GLib.SOURCE_REMOVE
 
         def work():
             try:
                 for chunk in make_generator():
-                    GLib.idle_add(self._panel_write, chunk)
+                    if token != self.run_id:
+                        return GLib.idle_add(self._finish_run, token)
+                    GLib.idle_add(write, chunk)
             except ai.NoKey as e:
-                GLib.idle_add(self._panel_write, str(e))
+                GLib.idle_add(write, str(e))
             except Exception as e:
-                GLib.idle_add(self._panel_write, "\n[error] %r" % (e,))
-            GLib.idle_add(self._panel_write, "\n")
+                GLib.idle_add(write, "\n[error] %r" % (e,))
+            GLib.idle_add(write, "\n")
+            GLib.idle_add(self._finish_run, token)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _start_run(self):
+        """Invalidate anything already running and claim the panel."""
+        self._stop_agent()
+        self.run_id += 1
+        self.panel_busy = True
+        self.panel_stop.set_sensitive(True)
+        return self.run_id
+
+    def _finish_run(self, token):
+        if token == self.run_id:
+            self.panel_busy = False
+            self.panel_stop.set_sensitive(False)
+        return GLib.SOURCE_REMOVE
 
     def _with_page(self, then, tab_id=None):
         """Fetch the readable text of a tab, then hand it to `then`."""
@@ -632,19 +680,26 @@ class Browser(Gtk.Window):
     def run_agent(self, goal):
         import threading
 
+        token = self._start_run()
         self._panel_write("⌘ %s\n\n" % goal, replace=True)
 
         def emit(text):
-            GLib.idle_add(self._panel_write, text)
+            def write():
+                if token == self.run_id:
+                    self._panel_write(text)
+                return GLib.SOURCE_REMOVE
+            GLib.idle_add(write)
 
-        self.active_agent = agent.Agent(self.call_sync, emit)
+        runner = agent.Agent(self.call_sync, emit)
+        self.active_agent = runner
 
         def work():
             try:
-                self.active_agent.run(goal)
+                runner.run(goal)
             except Exception as e:
                 emit("\n[error] %r\n" % (e,))
             emit("\n")
+            GLib.idle_add(self._finish_run, token)
 
         threading.Thread(target=work, daemon=True).start()
 

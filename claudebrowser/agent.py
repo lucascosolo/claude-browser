@@ -22,6 +22,8 @@ from . import ai, extract
 MAX_STEPS = 14
 PAGE_CHARS = 15_000     # per read_page result fed back to the model
 RESULT_CHARS = 20_000   # hard ceiling on any single tool result
+TOTAL_RESULT_CHARS = 120_000  # ceiling across the whole run
+REPEAT_LIMIT = 3        # identical tool calls before we call it a loop
 
 SYSTEM = """You are driving a real web browser on the user's behalf. The window \
 is visible to them and uses their existing logins and cookies.
@@ -123,6 +125,8 @@ class Agent:
         self.call = call
         self.emit = emit
         self.cancelled = False
+        self.spent = 0          # characters of tool output fed back so far
+        self.seen = {}          # (tool, args) -> count, for loop detection
 
     def cancel(self):
         self.cancelled = True
@@ -171,6 +175,9 @@ class Agent:
     # -- the loop -----------------------------------------------------------
 
     def run(self, goal):
+        goal = (goal or "").strip()
+        if not goal:
+            return self.emit("Give me a goal to work on.\n")
         messages = [{"role": "user", "content": goal}]
 
         for step in range(MAX_STEPS):
@@ -181,8 +188,10 @@ class Agent:
                 response = ai.tool_turn(messages, TOOLS, SYSTEM)
             except ai.NoKey as e:
                 return self.emit(str(e) + "\n")
+            except ai.ApiError as e:
+                return self.emit("\n%s\n" % e)
             except Exception as e:
-                return self.emit("\n[error] %s\n" % e)
+                return self.emit("\n[error] %r\n" % (e,))
 
             if response.get("type") == "error":
                 return self.emit("\n[api error] %s\n"
@@ -197,9 +206,14 @@ class Agent:
                 if block.get("type") == "text" and block.get("text", "").strip():
                     self.emit(block["text"].rstrip() + "\n")
 
-            if response.get("stop_reason") == "refusal":
+            stop = response.get("stop_reason")
+            if stop == "refusal":
                 return self.emit("\n[the model declined this request]\n")
-            if response.get("stop_reason") != "tool_use":
+            if stop == "max_tokens":
+                # A truncated turn can carry a half-written tool_use block, so
+                # continuing would send a malformed request. Stop cleanly.
+                return self.emit("\n[stopped: response hit the output limit]\n")
+            if stop != "tool_use":
                 return
 
             results = []
@@ -209,16 +223,39 @@ class Agent:
                 if self.cancelled:
                     self.emit("\n[stopped]\n")
                     return
-                self.emit("  → %s\n" % _describe(block["name"], block.get("input", {})))
-                try:
-                    output = self.dispatch(block["name"], block.get("input", {}))
-                except Exception as e:
-                    output = {"error": repr(e)}
+                name = block.get("name")
+                args = block.get("input") or {}
+                if not block.get("id"):
+                    continue  # malformed block; nothing to answer
+                self.emit("  → %s\n" % _describe(name, args))
+
+                # Loop detection. Without it a model that keeps re-reading the
+                # same page burns the step budget and the user's money making
+                # no progress, and the only visible symptom is a stalled panel.
+                signature = (name, json.dumps(args, sort_keys=True))
+                self.seen[signature] = self.seen.get(signature, 0) + 1
+                if self.seen[signature] > REPEAT_LIMIT:
+                    output = {"error": "repeated this exact call %d times; "
+                                       "try a different approach or stop"
+                                       % self.seen[signature]}
+                elif self.spent >= TOTAL_RESULT_CHARS:
+                    output = {"error": "output budget for this run is exhausted; "
+                                       "answer with what you have"}
+                else:
+                    try:
+                        output = self.dispatch(name, args)
+                    except Exception as e:
+                        output = {"error": repr(e)}
+
+                encoded = json.dumps(output, ensure_ascii=False)[:RESULT_CHARS]
+                self.spent += len(encoded)
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block["id"],
-                    "content": json.dumps(output, ensure_ascii=False)[:RESULT_CHARS],
+                    "content": encoded,
                 })
+            if not results:
+                return self.emit("\n[stopped: no usable tool calls in that turn]\n")
             messages.append({"role": "user", "content": results})
 
         self.emit("\n[stopped after %d steps]\n" % MAX_STEPS)

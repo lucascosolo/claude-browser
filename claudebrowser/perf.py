@@ -182,6 +182,16 @@ def tune_view(view):
     if hasattr(s, "set_enable_media_stream"):
         s.set_enable_media_stream(False)   # no camera/mic; saves a process
 
+    # NOTE: set_enable_hyperlink_auditing() is the third API in this codebase
+    # that exists, is documented, and does nothing -- 2.52 logs "deprecated and
+    # does nothing" once per view. hasattr() is not enough to tell; only running
+    # it is. Left out rather than left in looking useful. (The other two:
+    # set_process_model, and innerText on a detached clone.)
+
+    # Probing codec support builds a capability table this browser never uses.
+    if hasattr(s, "set_enable_media_capabilities"):
+        s.set_enable_media_capabilities(False)
+
     # GPU compositing is a real win for scrolling even on weak Intel parts, but
     # it is also the first thing to blame when rendering misbehaves, so it stays
     # switchable: CB_GPU=off forces software, CB_GPU=on forces compositing.
