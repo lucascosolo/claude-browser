@@ -10,7 +10,7 @@ library, and it idles in roughly the memory one Chrome tab uses.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ ← → ⟳ ⌂ │ https://example.com    │ ☆  ✦ ⚟ ＋ │   40px of chrome
+│ ← → ⟳ ⌂ │ https://example.com    │   ☆  ＋  ☰ │   40px of chrome
 ├──────────────────────────────────────────────────────────┤
 │                                                          │
 │                     the page                             │
@@ -92,6 +92,13 @@ Right-clicking the menu entry offers **New Window** and **New Window (no agent A
 | `Ctrl+±`, `Ctrl+0` | zoom |
 | `F12` | web inspector |
 
+Everything above also lives in the **hamburger menu** at the right of the
+toolbar, grouped as *Claude* / *New* / *Library*, with each shortcut printed
+beside its row. The four Claude actions used to be four separate icons in the
+toolbar; unlabelled, they were four chances to misread a wrench or a bulleted
+list. The toolbar now holds only what acts on the page in front of you — the
+bookmark star and a new tab.
+
 The address bar navigates when the input looks like an address and searches
 otherwise, and suggests as you type from your history and bookmarks —
 bookmarks first, then by visit count with a recency bonus, and a match on the
@@ -100,7 +107,7 @@ is more than one.
 
 ### Its own pages
 
-Four internal pages on the `cb:` scheme, laid out as cards and sharing the
+Five internal pages on the `cb:` scheme, laid out as cards and sharing the
 Claude panel's visual language. A slim icon rail moves between them.
 
 | | |
@@ -109,6 +116,7 @@ Claude panel's visual language. A slim icon rail moves between them.
 | `cb:deck` | **Every open tab as a card.** A tab strip stops being navigation somewhere around the eighth tab, however well the tabs are named. The deck is the same set laid out with room for full titles. |
 | `cb:bookmarks` | Everything saved, filterable. |
 | `cb:history` | Grouped by day, filterable, with per-entry delete and a two-step clear. |
+| `cb:passwords` | **Saved logins**, plus the sites you told it never to ask about. |
 
 Tiles carry a **site mark** — a letter on a colour hashed from the hostname —
 rather than a favicon. Favicons would mean a network request per tile on the
@@ -174,6 +182,43 @@ always visible:
 
 The marker is set in the one place every tab-targeted agent call passes through,
 so it cannot be forgotten by a new code path.
+
+## Saved logins
+
+Sign in to a site and the browser offers to save the login; come back and it
+fills it in. Everything lives at `cb:passwords`, where you can reveal, delete,
+or lift a "never ask here".
+
+**Where the passwords are.** In your system keyring, over the freedesktop Secret
+Service — `gnome-keyring` on this desktop, already unlocked by PAM at login and
+already inspectable with `seahorse`. Not in a file this project invents. A
+password file of our own would need a master key, and the only place to put a
+master key is another file next to it, which is not encryption; it is
+obfuscation with extra steps. One keyring item per `(origin, username)`, where
+the origin is `scheme://host[:port]` — never a path, because a password belongs
+to a site rather than a page, and never a bare hostname, because `http://` and
+`https://` are different security origins.
+
+**Why not Google Password Manager.** It is not a service other browsers can talk
+to. The autofill half lives inside Chrome and Android; the sync half rides Chrome
+Sync, whose API is gated behind client credentials Google issues to Chrome builds
+and documents for nobody else. There is no endpoint, no extension point and no
+file on disk to read, so "use Google's password manager here" is not a thing that
+can be built — only a thing that can be faked badly. `passwords.google.com`
+renders fine in a tab if you want to look one up by hand.
+
+Signing *in* to a Google account is a different question and works: Google serves
+this browser the real sign-in form, not the "this browser may not be secure"
+interstitial.
+
+**How autofill decides.** Filling is driven from the browser side against the
+URL the WebView actually has; the script injected into the page only reports a
+credential it captured and can never ask for one. A page cannot request a
+password, and it is never filled into a field that already has something in it.
+With two or more accounts saved for a site nothing is filled at all — picking one
+for you and picking wrong signs you into the other account without saying so.
+
+Nothing is written from a private tab.
 
 ## Driving it from an agent
 
@@ -362,7 +407,7 @@ session eats it. It is a fallback, not a foundation.
 python3 -m unittest discover -s tests
 ```
 
-149 tests, no display or GTK bindings needed.
+177 tests, no display or GTK bindings needed.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the

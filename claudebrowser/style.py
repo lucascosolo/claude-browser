@@ -61,18 +61,19 @@ window, .cb-root {{ background: {bg}; }}
 
 .cb-nav button {{
     background: transparent;
-    border: none;
+    border: 1px solid transparent;
     box-shadow: none;
     color: {dim};
-    padding: 4px 7px;
+    padding: 5px 8px;
     margin: 0 1px;
     min-width: 20px;
     min-height: 20px;
-    border-radius: 6px;
+    border-radius: 7px;
+    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
 }}
-.cb-nav button:hover {{ color: {text}; background: {field_focus}; }}
-.cb-nav button:active {{ color: {accent}; }}
-.cb-nav button:disabled {{ color: {line}; }}
+.cb-nav button:hover {{ color: {text}; background: {field_focus}; border-color: {line}; }}
+.cb-nav button:active {{ color: {accent}; background: {accent_soft}; border-color: transparent; }}
+.cb-nav button:disabled {{ color: {line}; background: transparent; border-color: transparent; }}
 
 /* The Claude actions get the accent, so they read as a group. */
 .cb-nav button.cb-ai {{ color: {accent}; }}
@@ -104,15 +105,19 @@ window, .cb-root {{ background: {bg}; }}
     background: {field};
     color: {text};
     border: 1px solid {line};
-    border-radius: 8px;
-    padding: 5px 11px;
+    border-radius: 9px;
+    padding: 6px 12px;
     margin: 0 6px;
     caret-color: {accent};
+    transition: border-color 120ms ease, box-shadow 120ms ease;
 }}
+/* A focus ring rather than a hard accent outline: 3px of very transparent
+   accent reads as "this is live" without redrawing the box in a new colour
+   every time the address bar is clicked, which is most of the time. */
 .cb-omnibox:focus {{
     background: {field_focus};
     border-color: {accent};
-    box-shadow: none;
+    box-shadow: 0 0 0 3px alpha({accent}, 0.16);
 }}
 .cb-omnibox selection {{ background: {accent}; color: {on_accent}; }}
 
@@ -120,6 +125,120 @@ window, .cb-root {{ background: {bg}; }}
 .cb-progress {{ background: transparent; min-height: 2px; }}
 .cb-progress progress {{ background: {accent}; min-height: 2px; }}
 .cb-progress trough {{ background: transparent; border: none; min-height: 2px; }}
+
+/* ---- the save-password bar ----
+   Sits under the toolbar and above the page. It is a prompt, not an alert, so
+   it does not shout: the surface is the same warm neutral as every other panel
+   and the accent appears exactly twice -- a 3px spine on the left edge, and the
+   one button that actually does something. An accent-washed background with a
+   flat accent button was the first attempt and read as an error banner; colour
+   spent everywhere buys no emphasis anywhere. */
+.cb-pwbar {{
+    background: {panel};
+    border-bottom: 1px solid {line};
+    border-left: 3px solid {accent};
+    padding: 9px 8px 9px 13px;
+}}
+.cb-pwbar label {{ color: {text}; font-size: 0.94em; }}
+
+/* background-image and box-shadow both have to be cleared explicitly: the stock
+   theme paints its button bevel with a gradient image and an inset shadow, and
+   setting only `background` leaves both of them showing through as a ghost
+   outline around what is supposed to be a flat text button. */
+.cb-pwbtn {{
+    background: transparent;
+    background-image: none;
+    box-shadow: none;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 4px 13px;
+    margin: 0 1px;
+    min-height: 0;
+    color: {dim};
+    font-size: 0.92em;
+    outline: none;
+    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}}
+.cb-pwbtn:hover {{ color: {text}; background: {field_focus}; border-color: {line}; }}
+
+/* The primary. Same ink as before -- what was wrong was the shape, not the
+   hue: a flat rectangle of saturated coral with no radius, no padding and no
+   depth. Gradient, hairline and a 1px shadow are what make it read as a raised
+   control rather than a coloured div. */
+.cb-pwbtn-go {{
+    background: linear-gradient(to bottom, shade({accent}, 1.10), {accent});
+    border: 1px solid shade({accent}, 0.90);
+    color: {on_accent};
+    font-weight: 600;
+    box-shadow: 0 1px 2px alpha(#000000, 0.16);
+}}
+.cb-pwbtn-go:hover {{
+    background: linear-gradient(to bottom, shade({accent}, 1.17), shade({accent}, 1.06));
+    border-color: shade({accent}, 0.94);
+    color: {on_accent};
+}}
+.cb-pwbtn-go:active {{
+    background: shade({accent}, 0.95);
+    box-shadow: inset 0 1px 2px alpha(#000000, 0.20);
+}}
+
+/* ---- the menu ----
+   A card, not a list of system menu items: 10px radius, one soft shadow, and
+   sections separated by a quiet uppercase heading rather than a rule. Rows are
+   full-width targets so the whole strip lights up, which is what makes a menu
+   feel responsive rather than fiddly. */
+/* The card is painted on the popover node itself. GTK4 splits a popover into
+   `popover > contents` and styling that node is the modern advice; GTK3 has no
+   such node, so those rules match nothing and the menu renders as floating text
+   over the page with no surface behind it. */
+popover.cb-menu {{
+    background: {panel};
+    border: 1px solid {line};
+    border-radius: 11px;
+    padding: 0;
+    box-shadow: 0 10px 28px alpha(#000000, 0.22);
+}}
+popover.cb-menu > arrow {{
+    background: {panel};
+    border: 1px solid {line};
+}}
+.cb-menucard {{ padding: 7px; min-width: 258px; }}
+
+.cb-menuhead {{
+    color: {dim};
+    font-size: 0.72em;
+    font-weight: 700;
+    padding: 5px 10px 4px 10px;
+}}
+.cb-menuhead-gap {{ margin-top: 5px; border-top: 1px solid {line}; padding-top: 9px; }}
+
+.cb-menuitem {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 7px 10px;
+    min-height: 0;
+    color: {text};
+    outline: none;
+    transition: background 110ms ease, color 110ms ease;
+}}
+/* GTK gives the first row keyboard focus as soon as the popover opens, and the
+   default focus ring reads as "already selected" on a menu nobody has touched. */
+.cb-menuitem:focus {{ outline: none; border-color: transparent; }}
+.cb-menuitem:hover {{ background: {accent_soft}; color: {accent}; }}
+.cb-menuitem:active {{ background: shade({accent_soft}, 0.94); }}
+.cb-menuitem image {{ color: {dim}; }}
+.cb-menuitem:hover image {{ color: {accent}; }}
+
+/* The shortcut, set back so it reads as a footnote to the row and never
+   competes with the label for the eye. */
+.cb-accel {{
+    color: {dim};
+    font-size: 0.80em;
+    font-family: monospace;
+    padding-left: 14px;
+}}
+.cb-menuitem:hover .cb-accel {{ color: alpha({accent}, 0.85); }}
 
 /* ---- tabs ---- */
 notebook.cb-tabs > header {{
@@ -132,24 +251,28 @@ notebook.cb-tabs > header > tabs > tab {{
     border: none;
     border-bottom: 2px solid transparent;
     color: {dim};
-    padding: 5px 10px;
-    margin: 2px 1px 0 1px;
-    border-radius: 6px 6px 0 0;
+    padding: 6px 11px;
+    margin: 3px 1px 0 1px;
+    border-radius: 8px 8px 0 0;
     font-size: 0.88em;
     min-height: 0;
+    transition: background 120ms ease, color 120ms ease;
 }}
 notebook.cb-tabs > header > tabs > tab:checked {{
     background: {tab_active};
     border-bottom-color: {accent};
     color: {text};
 }}
-notebook.cb-tabs > header > tabs > tab:hover {{ color: {text}; }}
+notebook.cb-tabs > header > tabs > tab:hover {{ color: {text}; background: {field_focus}; }}
+notebook.cb-tabs > header > tabs > tab:checked:hover {{ background: {tab_active}; }}
 .cb-tabclose {{
     background: transparent; border: none; box-shadow: none;
-    padding: 0 2px; margin: 0; min-width: 14px; min-height: 14px;
+    padding: 0 3px; margin: 0; min-width: 16px; min-height: 16px;
+    border-radius: 5px;
     color: {dim};
+    transition: background 120ms ease, color 120ms ease;
 }}
-.cb-tabclose:hover {{ color: {warn}; }}
+.cb-tabclose:hover {{ color: {text}; background: alpha({text}, 0.10); }}
 
 /* ---- "Claude is driving this tab" ----
    GTK3 has no animation we can rely on here, so the tell is static and loud

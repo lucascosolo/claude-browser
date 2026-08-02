@@ -20,6 +20,7 @@ claudebrowser/
   ai.py        Anthropic Messages API over urllib; auth.py picks the credential
   tabnames.py  tab labelling (GTK-free so it is testable)
   urls.py      omnibox intent: navigate or search (GTK-free)
+  passwords.py saved logins in the system keyring + the injected form script
   store.py pages.py panel_html.py style.py perf.py envfile.py
 tests/         unittest, no display needed
 ```
@@ -30,7 +31,7 @@ tests/         unittest, no display needed
 ./cb                                        # run it
 ./cbctl health                              # is it up
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 149 tests, ~35s, no display
+python3 -m unittest discover -s tests       # 177 tests, ~20s, no display
 CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
 ```
 
@@ -53,6 +54,15 @@ syntax gate.
 - **Selectors and values are attacker-adjacent** — they can come from a page the
   agent is reading. They go through `extract._js_str`, which escapes `<`, `>`
   and U+2028/9 on top of `json.dumps`.
+- **A page is never asked what origin it is.** Autofill is driven from the native
+  side against `view.get_uri()`; the injected script only rings a doorbell and
+  the native side reads the credential back out of the *focused* view. The
+  content manager is shared by every tab, so a `script-message-received` signal
+  cannot say who sent it — trusting a page-supplied origin would hand a
+  background tab any saved password it cared to name.
+- **Secrets go to the Secret Service, never to a file this project invents.** A
+  password file of our own would need a master key, and the only place to put
+  one is another file beside it.
 - Named exports of intent in comments: explain *why*, especially where a choice
   looks arbitrary but encodes a real constraint.
 
@@ -90,6 +100,24 @@ syntax gate.
 - **Tests must not start a real browser.** `cb-mcp` autostarts one on a tool
   call; the stub in `test_offline.py` answers `/health` in the real shape so
   `client.is_running()` is satisfied, and `CB_AUTOSTART=0` is the belt.
+- **`popover > contents` does not exist in GTK3.** It is the GTK4 node, and it is
+  what every current styling answer tells you to use. In GTK3 those rules match
+  nothing, so the menu paints as bare text floating over the page with no card
+  behind it and no error anywhere. Style `popover.cb-menu` itself.
+- **Clearing `background` on a themed button is not enough.** The stock theme
+  draws its bevel with a `background-image` gradient *and* an inset `box-shadow`.
+  Set both to `none` or a "flat" text button keeps a ghost outline.
+- **Do not kill the browser from a Bash call that names it.** `pgrep -f` matches
+  the tool call's own command line, so `pkill -f claudebrowser` in a command that
+  mentions `claudebrowser` anywhere — even in a `cd` path — kills the shell
+  running it (exit 144). Put the kill in its own call, with the pattern broken up
+  (`[c]laudebrows`) and nothing else on the line that spells the name out.
+- **Screenshotting the chrome needs a cropped root grab.** `xwd -name` matches
+  the legacy `WM_NAME`, which GTK does not set (it sets `_NET_WM_NAME`), and
+  `xwd -id` on the toplevel misses popovers because a GTK popover is its own X
+  window at a different depth. Locate the window with `xwininfo -id`, then crop
+  the region out of a root-window pixbuf. Present from *inside* the process
+  before grabbing, or the window manager leaves whatever was focused on top.
 
 ## Conventions
 
