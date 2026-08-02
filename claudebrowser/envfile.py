@@ -87,7 +87,17 @@ def load(path=None, environ=None, warn=None):
     applied = []
     for key, value in parse(text).items():
         if key in environ:
-            continue  # an explicit environment variable outranks the file
+            # An explicit environment variable outranks the file -- but say so
+            # when the two disagree. A stale `export ANTHROPIC_API_KEY` left in
+            # ~/.bashrc silently beats the key the user just edited into this
+            # file, and the symptom is a browser that authenticates from the
+            # desktop menu (no shell environment) and 401s from a terminal.
+            # That is unguessable from the outside, so it must not be quiet.
+            if warn and environ[key] != value:
+                warn("%s from your environment overrides the one in %s%s"
+                     % (key, path, " (a stale export in ~/.bashrc will do this)"
+                        if key.endswith("_KEY") else ""))
+            continue
         environ[key] = value
         applied.append(key)
     return applied
@@ -102,7 +112,12 @@ TEMPLATE = """\
 # Keep this file private: chmod 600.
 
 # Enables Ask, TL;DR, Research and the Command bar.
+# NOTE: an ANTHROPIC_API_KEY exported in ~/.bashrc overrides this line. If Claude
+# says the key was rejected, check there first -- a stale export is the usual cause.
 #ANTHROPIC_API_KEY=sk-ant-...
+
+# auto (default: API key, then a Claude Code subscription token), api, subscription.
+#CB_AUTH=auto
 
 # Ad/tracker blocking. On by default; set to 0 if a site misbehaves.
 #CB_BLOCK=1

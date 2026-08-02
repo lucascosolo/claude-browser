@@ -231,9 +231,35 @@ it is readable by anyone else.
 **The real environment always wins**, so `CB_BLOCK=0 ./cb` still overrides the
 file for one run, and `--env-file` points at a different one.
 
+**One environment variable beats this file, and that is the usual bug.** The
+rule is "the real environment wins", which is right for `CB_BLOCK=0 ./cb` and a
+trap for secrets: a stale `export ANTHROPIC_API_KEY=` left in `~/.bashrc`
+silently overrides the key you just edited into the settings file. The symptom
+is a browser that authenticates fine from the desktop menu — which has no shell
+environment — and 401s from a terminal. The browser now prints
+`config: ANTHROPIC_API_KEY from your environment overrides the one in …` at
+startup when the two differ, and says so again in the 401 card.
+
+### Credentials
+
+Use an **API key**. That is the credential Anthropic issues for programmatic
+use, and it is what `auto` tries first.
+
+A Pro/Max subscription is *not* a general-purpose API credential — it entitles
+you to Anthropic's own apps (claude.ai, Claude Code, desktop, mobile). There is
+no public OAuth registration that would let this browser obtain its own
+subscription token, so there is deliberately **no "Log in with Claude" button**:
+building one would mean presenting Claude Code's client identity as ours, which
+is impersonation. What `CB_AUTH=subscription` does instead is reuse the token
+Claude Code already wrote to `~/.claude/.credentials.json`. It is your own
+credential on your own machine, it often works, and it may be declined or
+rate-limited at any time — that quota is shared with Claude Code, so a busy
+session eats it. It is a fallback, not a foundation.
+
 | Variable | |
 |---|---|
-| `ANTHROPIC_API_KEY` | enables Ask Claude |
+| `ANTHROPIC_API_KEY` | enables Ask, TL;DR, Research and Command |
+| `CB_AUTH` | `auto` (default: key, then subscription), `api`, `subscription` |
 | `CB_PORT` | control port (default 8765) |
 | `CB_TOKEN` | require this bearer token on control requests |
 | `CB_HOME` | start page |
@@ -249,7 +275,7 @@ file for one run, and `--env-file` points at a different one.
 python3 -m unittest discover -s tests
 ```
 
-67 tests, no display or GTK bindings needed.
+79 tests, no display or GTK bindings needed.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the

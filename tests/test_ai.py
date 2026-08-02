@@ -6,6 +6,7 @@ loop that stops making progress.
 """
 
 import io
+import json
 import os
 import sys
 import unittest
@@ -169,13 +170,65 @@ class AuthTest(unittest.TestCase):
         self.auth._read_subscription = (
             (lambda: ("tok", "max", expires)) if present else (lambda: None))
 
-    def test_subscription_preferred_over_api_key(self):
-        """The whole point: spend the subscription before metered credit."""
+    def test_api_key_preferred_over_subscription(self):
+        """The API key is the credential Anthropic issues for third-party use,
+        so it goes first. A subscription token is a fallback for someone who
+        has no key -- not the default path."""
         os.environ["CB_AUTH"] = "auto"
         os.environ["ANTHROPIC_API_KEY"] = "sk-ant-x"
         self.fake_subscription()
         labels = [label for _h, label in self.auth.candidates()]
-        self.assertEqual(labels, ["max subscription", "API key"])
+        self.assertEqual(labels, ["API key", "max subscription"])
+
+    def test_falls_back_to_next_credential_on_rate_limit(self):
+        """The bug that made every Claude feature look dead.
+
+        Fallback used to require e.auth_failure, which is only 401/403. A
+        rate-limited first credential returns 429, so the second -- a perfectly
+        good key -- was never tried and the panel just reported the 429.
+        """
+        os.environ["CB_AUTH"] = "auto"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-x"
+        self.fake_subscription()
+        seen = []
+
+        def fake(req, timeout=None):
+            seen.append(req.headers.get("X-api-key") or req.headers.get("Authorization"))
+            if len(seen) == 1:
+                raise http_error(429, "rate limited")
+            return FakeResponse(b'{"content":[{"type":"text","text":"hi"}]}')
+
+        original = ai.urllib.request.urlopen
+        ai.urllib.request.urlopen = fake
+        try:
+            resp = ai._open({"stream": False}, sleep=lambda _s: None)
+            self.assertEqual(json.loads(resp.read())["content"][0]["text"], "hi")
+        finally:
+            ai.urllib.request.urlopen = original
+        self.assertEqual(len(seen), 2, "should have tried the second credential")
+        self.assertEqual(ai.LAST_CREDENTIAL, "max subscription")
+
+    def test_non_final_credential_does_not_burn_the_retry_budget(self):
+        """Retrying a credential we are about to abandon is pure latency."""
+        os.environ["CB_AUTH"] = "auto"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-x"
+        self.fake_subscription()
+        calls = []
+
+        def fake(req, timeout=None):
+            calls.append(1)
+            raise http_error(429, "rate limited")
+
+        original = ai.urllib.request.urlopen
+        ai.urllib.request.urlopen = fake
+        try:
+            with self.assertRaises(ai.ApiError):
+                ai._open({"stream": False}, sleep=lambda _s: None)
+        finally:
+            ai.urllib.request.urlopen = original
+        # 1 attempt for the API key (no retries, it is not last) + 1 + MAX_RETRIES
+        # for the subscription, which is.
+        self.assertEqual(len(calls), 1 + 1 + ai.MAX_RETRIES)
 
     def test_subscription_uses_bearer_and_beta_header_not_x_api_key(self):
         """OAuth tokens go on Authorization, never x-api-key."""

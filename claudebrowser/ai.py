@@ -86,21 +86,31 @@ def _open(payload, timeout=600, sleep=time.sleep):
     except auth.NoCredential as e:
         raise NoKey(str(e))
 
-    last = None
+    first = None
     for index, (credential, label) in enumerate(options):
+        final = index == len(options) - 1
         try:
-            return _open_with(payload, credential, label, timeout, sleep)
+            # Only the last candidate gets the retry budget. Spending 7s of
+            # backoff on a credential we are about to abandon anyway is pure
+            # latency, and it is what made a rate-limited subscription feel
+            # like a browser that had frozen.
+            return _open_with(payload, credential, label, timeout, sleep,
+                              retries=MAX_RETRIES if final else 0)
         except ApiError as e:
-            # An auth rejection is the one case worth trying the next credential
-            # for -- notably a subscription token the API declines for this
-            # client. Anything else is the real answer; do not mask it.
-            if not e.auth_failure or index == len(options) - 1:
-                raise
-            last = e
-    raise last or ApiError("[error] no credential worked")
+            if final:
+                # Report the *first* credential's failure, not the last. If the
+                # preferred credential is the one the user configured, that is
+                # the error they need to read.
+                raise first or e
+            # Fall through to the next credential on ANY failure, not just an
+            # auth rejection. A 429 is the common case -- a subscription that
+            # has hit its window is exactly when the API key should take over --
+            # and gating this on 401/403 meant a working key was never tried.
+            first = first or e
+    raise first or ApiError("[error] no credential worked")
 
 
-def _open_with(payload, credential, label, timeout, sleep):
+def _open_with(payload, credential, label, timeout, sleep, retries=MAX_RETRIES):
     global LAST_CREDENTIAL
 
     body = json.dumps(payload).encode()
@@ -110,7 +120,7 @@ def _open_with(payload, credential, label, timeout, sleep):
     if payload.get("stream"):
         headers["accept"] = "text/event-stream"
 
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(retries + 1):
         req = urllib.request.Request(API_URL, data=body, headers=headers, method="POST")
         try:
             response = urllib.request.urlopen(req, timeout=timeout)
@@ -119,7 +129,7 @@ def _open_with(payload, credential, label, timeout, sleep):
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")[:800]
             detail, kind = _describe_error(e.code, raw, label)
-            if e.code in RETRY_STATUS and attempt < MAX_RETRIES:
+            if e.code in RETRY_STATUS and attempt < retries:
                 # Honour Retry-After when the server sends one; otherwise back
                 # off exponentially with jitter so several panels retrying at
                 # once do not sync up into a thundering herd.
@@ -136,16 +146,38 @@ def _open_with(payload, credential, label, timeout, sleep):
             error.kind = kind
             raise error
         except urllib.error.URLError as e:
-            if attempt < MAX_RETRIES:
+            if attempt < retries:
                 sleep(min((2 ** attempt) + random.random(), 30))
                 continue
             raise ApiError("[network error] %s" % (e.reason,))
         except OSError as e:
-            if attempt < MAX_RETRIES:
+            if attempt < retries:
                 sleep(min((2 ** attempt) + random.random(), 30))
                 continue
             raise ApiError("[connection error] %s" % (e,))
     raise ApiError("[error] exhausted retries")
+
+
+def _shadow_hint():
+    """If a *different* key is sitting in the settings file, the rejected one
+    almost certainly came from the shell. Name the conflict rather than making
+    the user diff two files to find it."""
+    try:
+        from . import envfile
+
+        path = envfile.config_path()
+        if not path.is_file():
+            return ""
+        stored = envfile.parse(path.read_text(encoding="utf-8", errors="replace"))
+        filed = stored.get("ANTHROPIC_API_KEY")
+        live = os.environ.get("ANTHROPIC_API_KEY")
+        if filed and live and filed != live:
+            return ("\n\nNote: a different ANTHROPIC_API_KEY is set in your shell "
+                    "environment, and it overrides the one in %s. Check for a stale "
+                    "`export ANTHROPIC_API_KEY=` in ~/.bashrc." % path)
+    except Exception:
+        pass  # a diagnostic hint must never become the failure it is explaining
+    return ""
 
 
 def _describe_error(status, raw, label):
@@ -179,7 +211,8 @@ def _describe_error(status, raw, label):
                     "Run /login in Claude Code to refresh it." % (message,), kind)
         return ("The API key was rejected: %s\n\n"
                 "Check the value of ANTHROPIC_API_KEY -- keys start with 'sk-ant-' "
-                "and can be revoked from the Anthropic console." % (message,), kind)
+                "and can be revoked from the Anthropic console.%s"
+                % (message, _shadow_hint()), kind)
 
     if status == 404:
         return ("The model was not found (%s). This build asks for %s."

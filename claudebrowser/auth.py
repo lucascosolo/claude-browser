@@ -1,24 +1,26 @@
 """Where the browser gets its credentials.
 
-Two ways to authenticate, and the subscription is preferred because most people
-who have one would rather spend it than metered API credit:
-
-  1. **Claude subscription (Pro/Max).** Claude Code stores an OAuth credential
+  1. **API key.** `ANTHROPIC_API_KEY`, from the environment or the settings
+     file. This is the default and the supported path.
+  2. **Claude subscription (Pro/Max).** Claude Code stores an OAuth credential
      in ~/.claude/.credentials.json when you log in. It is sent as
-     `Authorization: Bearer <token>` together with the `oauth-2025-04-20` beta
-     header -- OAuth tokens do not go in `x-api-key`, and converting between the
-     two is a header change, not a key swap.
-  2. **API key.** `ANTHROPIC_API_KEY`, from the environment or the settings file.
+     `Authorization: Bearer <token>` with the `oauth-2025-04-20` beta header --
+     OAuth tokens do not go in `x-api-key`.
 
-Order is controlled by CB_AUTH: `auto` (default -- subscription first, key as
-fallback), `subscription`, or `api`.
+Order is controlled by CB_AUTH: `auto` (default -- key first, subscription as a
+fallback), `api`, or `subscription`.
 
-An important caveat, stated plainly because it is the user's to weigh: the
-subscription token is issued for Claude Code. Whether Anthropic authorizes it
-for another client's API calls is their decision, not ours, and it may come back
-401/403. That is why `auto` silently falls back to the API key on an auth
-failure and reports which credential actually served the request -- the failure
-mode should be a working browser and an honest label, not a dead panel.
+**Why the subscription is not the default, and why there is no "Log in with
+Claude" button here.** A Pro/Max subscription entitles you to Anthropic's own
+apps -- claude.ai, Claude Code, the desktop and mobile clients. It is not a
+credential for arbitrary third-party software, and Anthropic publishes no OAuth
+client registration that would let this browser obtain its own subscription
+token. The only way to get one would be to present Claude Code's client identity
+as our own, which is impersonation; we do not do that. So the honest options are
+an API key (metered, sanctioned, works) or reusing the token already on disk,
+which is unsanctioned and may be declined or rate-limited at any time. The
+second is kept as a fallback because it is the user's own credential on the
+user's own machine, but it is not something to build a product on.
 
 Refreshing is deliberately not implemented: it needs Claude Code's OAuth client
 identity, which is not ours to reuse. An expired token says so and points at
@@ -101,7 +103,10 @@ def candidates():
     elif pref == "subscription":
         options = [subscription]
     else:
-        options = [subscription, api]
+        # API key first. It is the only credential Anthropic issues for
+        # third-party programmatic use, so it is the one that reliably works;
+        # the subscription token is a fallback for people who have no key.
+        options = [api, subscription]
 
     options = [o for o in options if o]
     if options:
