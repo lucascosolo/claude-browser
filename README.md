@@ -208,6 +208,28 @@ from a page the agent is reading.
 
 ## Configuration
 
+Settings live in **`~/.config/claude-browser/env`**, created with a commented
+example on first run:
+
+```ini
+ANTHROPIC_API_KEY=sk-ant-...
+CB_BLOCK=1
+```
+
+This file exists because a window launched from the desktop menu **does not get
+your shell environment** — `~/.bashrc` is never read, so an `export` there works
+for `./cb` in a terminal and silently does nothing for the menu entry. All three
+entry points (`claude-browser`, `cbctl`, `cb-mcp`) read it, so `CB_PORT` and
+`CB_TOKEN` stay consistent between them.
+
+Format is `KEY=VALUE`, one per line; `#` comments, optional quotes, and a
+tolerated `export ` prefix so a line pasted out of a shell profile works as-is.
+Keep it `chmod 600` — it holds an API key, and the browser warns on startup if
+it is readable by anyone else.
+
+**The real environment always wins**, so `CB_BLOCK=0 ./cb` still overrides the
+file for one run, and `--env-file` points at a different one.
+
 | Variable | |
 |---|---|
 | `ANTHROPIC_API_KEY` | enables Ask Claude |
@@ -226,7 +248,7 @@ from a page the agent is reading.
 python3 -m unittest discover -s tests
 ```
 
-51 tests, no display or GTK bindings needed.
+67 tests, no display or GTK bindings needed.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the
@@ -237,5 +259,8 @@ a user: retry and backoff (including `Retry-After`, and *not* retrying a 4xx),
 refusals, truncated turns, missing API key, and an agent loop that stops making
 progress — repeat detection, step budget, output budget, cancellation, and
 malformed tool blocks.
+
+`test_envfile.py` covers settings parsing and precedence, including the
+world-readable warning and that the shipped template sets nothing.
 
 The GTK layer itself is not covered; it needs a display.

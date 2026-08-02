@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import control
+from . import control, envfile
 
 
 def main(argv=None):
@@ -14,15 +14,38 @@ def main(argv=None):
         description="A minimal WebKit browser with a control API for Claude agents.",
     )
     parser.add_argument("urls", nargs="*", help="URLs or search terms to open at startup")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("CB_PORT", control.DEFAULT_PORT)),
-                        help="agent control port on 127.0.0.1 (default: %(default)s)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="agent control port on 127.0.0.1 (default: 8765 or $CB_PORT)")
     parser.add_argument("--no-control", action="store_true",
                         help="run as a plain browser with no agent API")
-    parser.add_argument("--token", default=os.environ.get("CB_TOKEN"),
+    parser.add_argument("--token", default=None,
                         help="require this token on control requests")
-    parser.add_argument("--theme", choices=("dark", "light"), default=os.environ.get("CB_THEME"),
+    parser.add_argument("--theme", choices=("dark", "light"), default=None,
                         help="override the system light/dark preference")
+    parser.add_argument("--env-file", help="settings file (default: "
+                                           "~/.config/claude-browser/env)")
     args = parser.parse_args(argv)
+
+    # Before anything reads os.environ. A desktop launcher gives us no shell
+    # environment, so this is where ANTHROPIC_API_KEY and the CB_* settings
+    # actually come from for a menu-launched window.
+    created = envfile.ensure_template() if not args.env_file else None
+    applied = envfile.load(args.env_file, warn=lambda m: print("config: %s" % m, flush=True))
+    if created:
+        print("config: wrote an example settings file at %s" % created, flush=True)
+    if applied:
+        print("config: loaded %s from %s"
+              % (", ".join(sorted(applied)), args.env_file or envfile.config_path()),
+              flush=True)
+
+    # Resolved here, not in the argparse defaults, so the settings file loaded
+    # above is visible to them. An explicit flag still wins.
+    if args.port is None:
+        args.port = int(os.environ.get("CB_PORT") or control.DEFAULT_PORT)
+    if args.token is None:
+        args.token = os.environ.get("CB_TOKEN") or None
+    if args.theme is None:
+        args.theme = os.environ.get("CB_THEME") or None
 
     try:
         import gi

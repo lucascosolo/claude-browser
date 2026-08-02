@@ -12,8 +12,20 @@ rather than silently returning nothing.
 import json
 import os
 import sys
+from pathlib import Path
 import urllib.error
 import urllib.request
+
+# Settings come from the same file the browser uses, so CB_PORT / CB_TOKEN stay
+# consistent no matter which of the three entry points you run. Resolve through
+# the symlink -- these are installed into ~/.local/bin as links.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from claudebrowser import envfile
+
+    envfile.load()
+except Exception:
+    pass  # a settings file is a convenience; never block the CLI on it
 
 BASE = os.environ.get("CB_URL", "http://127.0.0.1:%s" % os.environ.get("CB_PORT", "8765"))
 TOKEN = os.environ.get("CB_TOKEN")
