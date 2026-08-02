@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""cb-mcp -- expose the running browser to Claude Code as MCP tools.
+
+    claude mcp add browser -- /path/to/claude-browser/cb-mcp
+
+Stdio JSON-RPC, standard library only. This is a thin translation layer: every
+tool maps to one control-API route, and the browser is the thing that actually
+holds state. If the browser is not running, tools fail with a message saying so
+rather than silently returning nothing.
+"""
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("CB_URL", "http://127.0.0.1:%s" % os.environ.get("CB_PORT", "8765"))
+TOKEN = os.environ.get("CB_TOKEN")
+PROTOCOL = "2025-06-18"
+
+_STR = {"type": "string"}
+_INT = {"type": "integer", "description": "Tab id; omit for the focused tab."}
+
+
+def _schema(props=None, required=()):
+    props = dict(props or {})
+    props.setdefault("tab", _INT)
+    return {"type": "object", "properties": props, "required": list(required)}
+
+
+# (name, description, route, http method, schema)
+TOOLS = [
+    ("browser_tabs", "List the browser's open tabs with their ids, URLs and titles.",
+     "/tabs", "GET", {"type": "object", "properties": {}}),
+    ("browser_open", "Open a URL in a new tab and wait for it to finish loading.",
+     "/open", "POST", _schema({"url": _STR,
+                               "background": {"type": "boolean",
+                                              "description": "Open without focusing it."}},
+                              ["url"])),
+    ("browser_navigate", "Navigate an existing tab to a URL and wait for the load.",
+     "/navigate", "POST", _schema({"url": _STR}, ["url"])),
+    ("browser_text", "Read the page as clean text, with nav/script/footer chrome stripped. "
+                     "Use this first when verifying what a page says.",
+     "/text", "GET", _schema()),
+    ("browser_markdown", "Read the page as markdown, preserving headings, links and code blocks.",
+     "/markdown", "GET", _schema()),
+    ("browser_links", "List every link on the page as absolute URLs with their labels.",
+     "/links", "GET", _schema()),
+    ("browser_html", "Get the page's full outer HTML. Prefer browser_text unless you need markup.",
+     "/html", "GET", _schema()),
+    ("browser_find", "Search the rendered page text for a regex and return matches with context.",
+     "/find", "GET", _schema({"q": _STR}, ["q"])),
+    ("browser_click", "Click the first element matching a CSS selector.",
+     "/click", "POST", _schema({"selector": _STR}, ["selector"])),
+    ("browser_fill", "Set an input's value and dispatch input/change so frameworks notice.",
+     "/fill", "POST", _schema({"selector": _STR, "value": _STR}, ["selector", "value"])),
+    ("browser_eval", "Evaluate JavaScript in the page and return its value.",
+     "/eval", "POST", _schema({"js": _STR}, ["js"])),
+    ("browser_console", "Read console output and uncaught errors captured on the page. "
+                        "Call this when debugging why a page misbehaves.",
+     "/console", "GET", _schema({"pattern": {"type": "string",
+                                             "description": "Regex filter over message text."}})),
+    ("browser_screenshot", "Save a PNG of the visible viewport to a path on disk.",
+     "/screenshot", "GET", _schema({"path": {"type": "string",
+                                             "description": "Absolute file path to write."}},
+                                   ["path"])),
+    ("browser_back", "Go back one entry in the tab's history.", "/back", "POST", _schema()),
+    ("browser_reload", "Reload the tab and wait for the load.", "/reload", "POST", _schema()),
+    ("browser_close", "Close a tab.", "/close", "POST", _schema()),
+]
+
+BY_NAME = {name: (route, method) for name, _d, route, method, _s in TOOLS}
+
+
+def call(route, method, params):
+    headers = {"content-type": "application/json"}
+    if TOKEN:
+        headers["authorization"] = "Bearer " + TOKEN
+    url = BASE + route
+    data = None
+    if method == "POST":
+        data = json.dumps(params).encode()
+    elif params:
+        from urllib.parse import urlencode
+
+        url += "?" + urlencode({k: v for k, v in params.items() if v is not None})
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return json.loads(resp.read())
+    except urllib.error.URLError as e:
+        return {"ok": False,
+                "error": "claude-browser is not reachable at %s (%s). Start it with `cb`." % (BASE, e)}
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        method = request.get("method")
+        req_id = request.get("id")
+        if req_id is None:
+            continue  # a notification; nothing to answer
+
+        if method == "initialize":
+            asked = (request.get("params") or {}).get("protocolVersion")
+            send({"jsonrpc": "2.0", "id": req_id, "result": {
+                "protocolVersion": asked or PROTOCOL,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "claude-browser", "version": "0.1.0"},
+            }})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": [
+                {"name": n, "description": d, "inputSchema": s}
+                for n, d, _r, _m, s in TOOLS
+            ]}})
+        elif method == "tools/call":
+            params = request.get("params") or {}
+            name = params.get("name")
+            target = BY_NAME.get(name)
+            if not target:
+                send({"jsonrpc": "2.0", "id": req_id,
+                      "error": {"code": -32602, "message": "unknown tool %r" % name}})
+                continue
+            route, http_method = target
+            result = call(route, http_method, params.get("arguments") or {})
+            send({"jsonrpc": "2.0", "id": req_id, "result": {
+                "content": [{"type": "text",
+                             "text": json.dumps(result, indent=2, ensure_ascii=False)}],
+                "isError": not result.get("ok", True),
+            }})
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": req_id, "result": {}})
+        else:
+            send({"jsonrpc": "2.0", "id": req_id,
+                  "error": {"code": -32601, "message": "method not found: %s" % method}})
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Launch the browser from a checkout, without installing anything.
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+exec python3 -m claudebrowser "$@"
