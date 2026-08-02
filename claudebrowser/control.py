@@ -11,6 +11,10 @@ Two rules shape everything here:
   * Every browser touch is marshalled onto the GTK main loop and waited on.
     WebKit and GTK are not thread-safe, and calling into them from the HTTP
     thread crashes in ways that look like unrelated rendering bugs.
+
+The routes themselves are not written here -- they come from api.OPS, which is
+also what generates `cbctl`'s subcommands and `cb-mcp`'s tools. This file is
+just the server.
 """
 
 import json
@@ -20,7 +24,38 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from . import api
+
 DEFAULT_PORT = 8765
+
+
+def on_main_loop(browser, method, args, timeout=45):
+    """Run `browser.<method>(*args, done)` on the GTK main loop and block the
+    calling thread until `done` fires.
+
+    The one bridge between "a thread that may block" and "the only thread
+    allowed to touch WebKit". Both the HTTP server and the in-browser agent loop
+    go through here; they used to have a copy each.
+
+    Never call this *from* the GTK thread -- it would wait on a loop that cannot
+    run while it waits.
+    """
+    from gi.repository import GLib
+
+    box = queue.Queue(1)
+
+    def invoke():
+        try:
+            getattr(browser, method)(*args, box.put)
+        except Exception:
+            box.put({"ok": False, "error": traceback.format_exc(limit=3)})
+        return GLib.SOURCE_REMOVE
+
+    GLib.idle_add(invoke)
+    try:
+        return box.get(timeout=timeout)
+    except queue.Empty:
+        return {"ok": False, "error": "timed out after %ss" % timeout}
 
 
 class Control:
@@ -52,7 +87,8 @@ class Control:
                 except json.JSONDecodeError as e:
                     return control._send(self, 400, {"ok": False, "error": str(e)})
                 if not isinstance(body, dict):
-                    return control._send(self, 400, {"ok": False, "error": "body must be an object"})
+                    return control._send(
+                        self, 400, {"ok": False, "error": "body must be an object"})
                 control._handle(self, body)
 
         self._server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
@@ -77,181 +113,47 @@ class Control:
         handler.end_headers()
         handler.wfile.write(data)
 
-    def _call(self, method, *args, timeout=45):
-        """Run `browser.<method>(*args, callback)` on the GTK main loop and
-        block this HTTP thread until the callback fires."""
-        from gi.repository import GLib
-
-        box = queue.Queue(1)
-
-        def on_main():
-            try:
-                getattr(self.browser, method)(*args, box.put)
-            except Exception:
-                box.put({"ok": False, "error": traceback.format_exc(limit=3)})
-            return GLib.SOURCE_REMOVE
-
-        GLib.idle_add(on_main)
-        try:
-            return box.get(timeout=timeout)
-        except queue.Empty:
-            return {"ok": False, "error": "timed out after %ss" % timeout}
+    def _authorized(self, handler, args):
+        if not self.token:
+            return True
+        if args.pop("token", None) == self.token:
+            return True
+        supplied = (handler.headers.get("authorization") or "").removeprefix("Bearer ")
+        return supplied == self.token
 
     def _handle(self, handler, body):
         url = urlparse(handler.path)
-        query = {k: v[0] for k, v in parse_qs(url.query).items()}
-        args = dict(query)
+        args = {k: v[0] for k, v in parse_qs(url.query).items()}
         args.update(body)  # a POST body wins over a duplicated query param
 
-        if self.token and args.pop("token", None) != self.token:
-            supplied = (handler.headers.get("authorization") or "").removeprefix("Bearer ")
-            if supplied != self.token:
-                return self._send(handler, 401, {"ok": False, "error": "bad token"})
+        if not self._authorized(handler, args):
+            return self._send(handler, 401, {"ok": False, "error": "bad token"})
 
-        route = ROUTES.get(url.path)
-        if route is None:
-            return self._send(
-                handler, 404, {"ok": False, "error": "no such route", "routes": sorted(ROUTES)}
-            )
+        op = api.BY_ROUTE.get(url.path)
+        if op is None:
+            return self._send(handler, 404, {
+                "ok": False, "error": "no such route",
+                "routes": sorted(o.route for o in api.OPS)})
+
+        # /health answers without touching the browser, so it stays truthful
+        # even if the GTK loop is wedged -- which is exactly when something is
+        # asking whether the browser is alive.
+        if op.call is None:
+            return self._send(handler, 200, {
+                "ok": True, "browser": "claude-browser", "engine": "webkit2gtk",
+                "routes": sorted(o.route for o in api.OPS)})
+
         try:
-            status, payload = route(self, args)
+            method, call_args = op.call(self, args)
+            payload = on_main_loop(self.browser, method, call_args, timeout=op.timeout)
         except KeyError as e:
-            status, payload = 400, {"ok": False, "error": "missing parameter %s" % e}
+            return self._send(handler, 400,
+                              {"ok": False, "error": "missing parameter %s" % e})
         except Exception:
-            status, payload = 500, {"ok": False, "error": traceback.format_exc(limit=4)}
-        self._send(handler, status, payload)
+            return self._send(handler, 500,
+                              {"ok": False, "error": traceback.format_exc(limit=4)})
 
-
-# -- routes -----------------------------------------------------------------
-# Each takes (control, args) and returns (status, payload). `tab` is optional
-# everywhere; omitting it means "the tab the user is looking at".
-
-
-def _tab(args):
-    raw = args.get("tab")
-    return int(raw) if raw not in (None, "") else None
-
-
-def _truthy(value, default=True):
-    if value is None:
-        return default
-    return str(value).lower() not in ("0", "false", "no", "")
-
-
-def r_health(c, a):
-    return 200, {"ok": True, "browser": "claude-browser", "engine": "webkit2gtk"}
-
-
-def r_tabs(c, a):
-    return 200, c._call("api_tabs")
-
-
-def r_open(c, a):
-    return 200, c._call(
-        "api_open", a["url"], _truthy(a.get("background"), False),
-        _truthy(a.get("wait")), timeout=90,
-    )
-
-
-def r_navigate(c, a):
-    return 200, c._call("api_navigate", _tab(a), a["url"], _truthy(a.get("wait")), timeout=90)
-
-
-def r_back(c, a):
-    return 200, c._call("api_history", _tab(a), -1, _truthy(a.get("wait")), timeout=90)
-
-
-def r_forward(c, a):
-    return 200, c._call("api_history", _tab(a), 1, _truthy(a.get("wait")), timeout=90)
-
-
-def r_reload(c, a):
-    return 200, c._call("api_reload", _tab(a), _truthy(a.get("wait")), timeout=90)
-
-
-def r_close(c, a):
-    return 200, c._call("api_close", _tab(a))
-
-
-def r_wait(c, a):
-    return 200, c._call("api_wait", _tab(a), timeout=120)
-
-
-def r_text(c, a):
-    from . import extract
-
-    return 200, c._call("api_eval", _tab(a), extract.TEXT)
-
-
-def r_markdown(c, a):
-    from . import extract
-
-    return 200, c._call("api_eval", _tab(a), extract.MARKDOWN)
-
-
-def r_links(c, a):
-    from . import extract
-
-    return 200, c._call("api_eval", _tab(a), extract.LINKS)
-
-
-def r_html(c, a):
-    from . import extract
-
-    return 200, c._call("api_eval", _tab(a), extract.HTML)
-
-
-def r_find(c, a):
-    from . import extract
-
-    return 200, c._call("api_eval", _tab(a), extract.find(a["q"]))
-
-
-def r_click(c, a):
-    from . import extract
-
-    return 200, c._call("api_eval", _tab(a), extract.click(a["selector"]))
-
-
-def r_fill(c, a):
-    from . import extract
-
-    return 200, c._call("api_eval", _tab(a), extract.fill(a["selector"], a["value"]))
-
-
-def r_eval(c, a):
-    return 200, c._call("api_eval", _tab(a), a["js"])
-
-
-def r_console(c, a):
-    return 200, c._call("api_console", _tab(a), a.get("pattern"))
-
-
-def r_screenshot(c, a):
-    result = c._call("api_screenshot", _tab(a), a.get("path"), timeout=60)
-    if result.get("ok") and result.get("png"):
-        return 200, result.pop("png")  # raw bytes when no path was given
-    return 200, result
-
-
-ROUTES = {
-    "/health": r_health,
-    "/tabs": r_tabs,
-    "/open": r_open,
-    "/navigate": r_navigate,
-    "/back": r_back,
-    "/forward": r_forward,
-    "/reload": r_reload,
-    "/close": r_close,
-    "/wait": r_wait,
-    "/text": r_text,
-    "/markdown": r_markdown,
-    "/links": r_links,
-    "/html": r_html,
-    "/find": r_find,
-    "/click": r_click,
-    "/fill": r_fill,
-    "/eval": r_eval,
-    "/console": r_console,
-    "/screenshot": r_screenshot,
-}
+        # /screenshot with no path answers with the PNG itself rather than JSON.
+        if isinstance(payload, dict) and payload.get("ok") and payload.get("png"):
+            return self._send(handler, 200, payload.pop("png"))
+        self._send(handler, 200, payload)

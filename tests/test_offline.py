@@ -160,7 +160,10 @@ class StubBrowser:
                 args.update(body)
                 stub.calls.append((parsed.path, args))
 
-                if parsed.path == "/text":
+                if parsed.path == "/health":
+                    payload = {"ok": True, "browser": "claude-browser",
+                               "engine": "webkit2gtk"}
+                elif parsed.path == "/text":
                     payload = {"ok": True, "result": {"title": "Stub", "url": "http://stub/",
                                                       "text": "hello from the stub page"}}
                 elif parsed.path == "/click":
@@ -308,54 +311,110 @@ class TestMcp(unittest.TestCase):
         self.assertEqual(replies[0]["id"], 7)
 
 
-class TestControlRouting(unittest.TestCase):
-    """control.py's dispatch, with the GTK call replaced by a recorder."""
+class TestApiRegistry(unittest.TestCase):
+    """api.OPS is the single description of the browser's surface. control.py,
+    cbctl and cb-mcp are all generated from it, so the things worth asserting
+    are that it is internally consistent and that nothing has been dropped."""
 
     def setUp(self):
-        from claudebrowser import control
+        from claudebrowser import api
 
-        self.control = control.Control.__new__(control.Control)
-        self.control.token = None
+        self.api = api
         self.seen = []
 
-        def fake_call(method, *args, timeout=45):
-            self.seen.append((method, args))
-            return {"ok": True, "method": method, "args": [str(a)[:40] for a in args]}
+    def dispatch(self, route, args):
+        """Run an op's call builder without a browser behind it."""
+        op = self.api.BY_ROUTE[route]
+        method, call_args = op.call(None, dict(args))
+        self.seen.append((method, call_args))
+        return method, call_args
 
-        self.control._call = fake_call
-        self.routes = control.ROUTES
-
-    def test_every_route_dispatches(self):
+    def test_every_op_builds_a_call(self):
         cases = {
-            "/health": {}, "/tabs": {}, "/open": {"url": "x.com"},
+            "/tabs": {}, "/present": {}, "/open": {"url": "x.com"},
             "/navigate": {"url": "x.com"}, "/back": {}, "/forward": {}, "/reload": {},
             "/close": {}, "/wait": {}, "/text": {}, "/markdown": {}, "/links": {},
             "/html": {}, "/find": {"q": "a"}, "/click": {"selector": "a"},
             "/fill": {"selector": "a", "value": "b"}, "/eval": {"js": "1"},
             "/console": {}, "/screenshot": {},
         }
-        self.assertEqual(set(cases), set(self.routes), "a route is missing test coverage")
-        for path, args in cases.items():
-            status, payload = self.routes[path](self.control, dict(args))
-            self.assertEqual(status, 200, path)
-            self.assertTrue(payload.get("ok"), path)
+        # /health is served without touching the browser, so it has no builder.
+        callable_routes = {op.route for op in self.api.OPS if op.call}
+        self.assertEqual(set(cases), callable_routes,
+                         "an operation is missing test coverage")
+        for route, args in cases.items():
+            method, call_args = self.dispatch(route, args)
+            self.assertTrue(method.startswith("api_"), route)
+            self.assertIsInstance(call_args, tuple, route)
+
+    def test_health_needs_no_browser(self):
+        self.assertIsNone(self.api.BY_NAME["health"].call)
 
     def test_missing_parameter_is_reported_as_a_key_error(self):
         with self.assertRaises(KeyError):
-            self.routes["/click"](self.control, {})
+            self.dispatch("/click", {})
 
     def test_tab_defaults_to_focused(self):
-        self.routes["/text"](self.control, {})
-        self.assertEqual(self.seen[-1][1][0], None)
-        self.routes["/text"](self.control, {"tab": "3"})
-        self.assertEqual(self.seen[-1][1][0], 3)
+        self.assertIsNone(self.dispatch("/text", {})[1][0])
+        self.assertEqual(self.dispatch("/text", {"tab": "3"})[1][0], 3)
 
     def test_wait_defaults_on_for_navigation(self):
-        self.routes["/navigate"](self.control, {"url": "x.com"})
-        _method, args = self.seen[-1]
-        self.assertIs(args[2], True)
-        self.routes["/navigate"](self.control, {"url": "x.com", "wait": "false"})
-        self.assertIs(self.seen[-1][1][2], False)
+        self.assertIs(self.dispatch("/navigate", {"url": "x.com"})[1][2], True)
+        self.assertIs(
+            self.dispatch("/navigate", {"url": "x.com", "wait": "false"})[1][2], False)
+
+    def test_names_routes_and_schemas_are_unique_and_well_formed(self):
+        names = [op.name for op in self.api.OPS]
+        routes = [op.route for op in self.api.OPS]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(len(routes), len(set(routes)))
+        for op in self.api.OPS:
+            self.assertIn(op.method, ("GET", "POST"), op.name)
+            self.assertTrue(op.route.startswith("/"), op.name)
+            self.assertTrue(op.summary.strip(), op.name)
+            schema = op.schema()
+            for required in schema["required"]:
+                self.assertIn(required, schema["properties"], op.name)
+
+    def test_mcp_exposes_every_agent_facing_op(self):
+        """The three surfaces drifted before this test existed: cb-mcp was
+        missing forward, wait and health, so an agent could start a load it had
+        no way to wait for."""
+        tools = {t["name"] for t in self.api.mcp_tools()}
+        for name in ("browser_forward", "browser_wait", "browser_text",
+                     "browser_console", "browser_screenshot"):
+            self.assertIn(name, tools)
+        # Raising the window is a launcher action, not something an agent should
+        # be able to do to the user's focus mid-task.
+        self.assertNotIn("browser_present", tools)
+        self.assertNotIn("browser_health", tools)
+
+
+class TestCbctlSurface(unittest.TestCase):
+    """cbctl's subcommands are generated, so the test is that the generation
+    covers every op and keeps the two shell-friendly aliases."""
+
+    def parser(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_loader(
+            "cbctl_mod", loader=None, origin=str(ROOT / "cbctl"))
+        module = importlib.util.module_from_spec(spec)
+        module.__file__ = str(ROOT / "cbctl")
+        exec(compile((ROOT / "cbctl").read_text(), str(ROOT / "cbctl"), "exec"),
+             module.__dict__)
+        return module.build_parser()
+
+    def test_every_op_has_a_subcommand(self):
+        from claudebrowser import api
+
+        actions = [a for a in self.parser()._actions if hasattr(a, "choices") and a.choices]
+        commands = set(actions[0].choices)
+        expected = {next((alias for alias, target in api.CLI_ALIASES.items()
+                          if target == op.name), op.name) for op in api.OPS}
+        self.assertEqual(commands, expected)
+        self.assertIn("shot", commands)
+        self.assertIn("go", commands)
 
 
 if __name__ == "__main__":
