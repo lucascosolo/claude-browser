@@ -37,9 +37,16 @@ def main(argv=None):
             % (e,)
         )
 
-    from gi.repository import Gtk
+    from gi.repository import GLib, Gtk
 
     from .browser import Browser
+
+    # Without this the process is called "python3", so the XFCE taskbar groups
+    # our windows under a generic entry with no icon instead of matching the
+    # StartupWMClass in claude-browser.desktop.
+    GLib.set_prgname("claude-browser")
+    GLib.set_application_name("Claude Browser")
+    Gtk.Window.set_default_icon_name("claude-browser")
 
     dark = None if args.theme is None else (args.theme == "dark")
     browser = Browser(urls=args.urls or None, dark=dark)

@@ -47,6 +47,20 @@ Then just run it — there is nothing to build and nothing to `pip install`.
 Requires Python 3.9+, GTK 3, and WebKitGTK 4.1. Fedora: `python3-gobject
 webkit2gtk4.1`. Arch: `python-gobject webkit2gtk-4.1`.
 
+### Add it to the desktop menu
+
+```bash
+./install.sh            # XFCE / GNOME / KDE menu entry + icon, no sudo
+./install.sh --uninstall
+```
+
+It appears under **Applications ▸ Internet** as *Claude Browser*, registers as a
+browser choice for `http`/`https` links, and symlinks `claude-browser`, `cbctl` and
+`cb-mcp` into `~/.local/bin`. Everything installed lives under `$HOME`, and the app
+keeps running from this checkout — `git pull` updates the installed copy too.
+
+Right-clicking the menu entry offers **New Window** and **New Window (no agent API)**.
+
 ## Using it
 
 | Key | |

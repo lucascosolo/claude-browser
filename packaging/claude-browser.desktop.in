@@ -1,0 +1,30 @@
+[Desktop Entry]
+Type=Application
+Version=1.4
+Name=Claude Browser
+GenericName=Web Browser
+Comment=Lightweight WebKit browser that Claude agents can drive
+Exec=@CB@ %U
+TryExec=@CB@
+Icon=claude-browser
+Terminal=false
+# One main category only -- listing Development too puts it in the menu twice.
+Categories=Network;WebBrowser;
+Keywords=web;browser;internet;claude;ai;agent;webkit;
+# Registers it as a browser choice, so "Open Link" and xdg-open can target it.
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+# GTK reports this per-window; set_prgname() in __main__ makes it match, which is
+# what lets the XFCE taskbar group windows under this entry and its icon instead
+# of falling back to a generic "python3" entry.
+StartupWMClass=claude-browser
+StartupNotify=true
+
+Actions=NewTab;PlainBrowser;
+
+[Desktop Action NewTab]
+Name=New Window
+Exec=@CB@
+
+[Desktop Action PlainBrowser]
+Name=New Window (no agent API)
+Exec=@CB@ --no-control
