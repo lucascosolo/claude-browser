@@ -216,6 +216,76 @@ def clean_name(name):
 
 # -- capture ----------------------------------------------------------------
 
+class TabPrivacy:
+    """Which tabs are private, and which one is in front -- without GTK.
+
+    The recorder runs on the control server's HTTP thread, and the answer it
+    needs ("is the tab this operation acts on private?") lives in GtkNotebook,
+    which that thread may not touch. So the browser mirrors the two facts here
+    from the main loop as tabs open, close and are switched to, and the
+    recorder reads the mirror.
+
+    Unknown ids answer *private*. A tab id the mirror has never heard of is
+    either a stale one or a bug in the bookkeeping, and the cost of the two
+    answers is not symmetric: refusing to record a step is a line the user
+    re-adds by hand, while recording one writes a private URL to disk.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._private = set()
+        self._known = set()
+        self._focused = None
+
+    def opened(self, tab_id, private):
+        with self._lock:
+            self._known.add(tab_id)
+            if private:
+                self._private.add(tab_id)
+            else:
+                self._private.discard(tab_id)
+
+    def closed(self, tab_id):
+        with self._lock:
+            self._known.discard(tab_id)
+            self._private.discard(tab_id)
+            if self._focused == tab_id:
+                self._focused = None
+
+    def focused(self, tab_id):
+        with self._lock:
+            self._focused = tab_id
+
+    def is_private(self, tab_id=None):
+        """Is that tab private? `None` means the tab in front.
+
+        With no tab in front at all -- a window mid-teardown -- the answer is
+        private, on the same reasoning as an unknown id.
+        """
+        with self._lock:
+            if tab_id is None:
+                tab_id = self._focused
+            if tab_id is None or tab_id not in self._known:
+                return True
+            return tab_id in self._private
+
+
+def target_tab(args):
+    """The tab id an operation's arguments name, or None for "the one in front".
+
+    `tab` is optional everywhere in the registry precisely so a caller can mean
+    the focused tab, which is why the recorder cannot read privacy off the
+    parameters alone -- it has to ask the browser what the focused tab is.
+    """
+    raw = (args or {}).get("tab")
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class Recorder:
     """What the browser is currently capturing, if anything.
 
@@ -226,11 +296,16 @@ class Recorder:
     new op to a recording later.
     """
 
-    def __init__(self):
+    def __init__(self, privacy=None):
         self._lock = threading.Lock()
+        # The browser's privacy mirror, or None in a test that has no browser.
+        # Without one nothing is private, which is the pre-existing behaviour
+        # and the only sane answer when there are no tabs to ask about.
+        self.privacy = privacy
         self.name = None
         self.steps = []
         self.skipped = 0
+        self.skipped_private = 0
         self.started = None
 
     @property
@@ -243,6 +318,7 @@ class Recorder:
             self.name = name
             self.steps = []
             self.skipped = 0
+            self.skipped_private = 0
             self.started = time.time()
         return name
 
@@ -258,11 +334,23 @@ class Recorder:
         happens to hold that id. Omitting it means every step targets the
         focused tab, which is what the registry already treats as the default
         and what a recorded sequence actually did.
+
+        That same omission is why privacy has to be resolved here from the
+        browser rather than from `args`: a step carrying no tab id is a step
+        aimed at whatever is in front, and a navigate in a private tab writes
+        its URL to disk verbatim -- `is_secret_step` never looks at a URL, so
+        a magic link or an `?access_token=` would land in the file intact.
         """
         if not ok:
             return False
         op = replayable(op_name)
         if op is None:
+            return False
+        if self.privacy is not None and self.privacy.is_private(target_tab(args)):
+            with self._lock:
+                if self.name is None:
+                    return False
+                self.skipped_private += 1
             return False
         declared = {p.name for p in op.params}
         params = {k: v for k, v in (args or {}).items()
@@ -284,16 +372,28 @@ class Recorder:
         with self._lock:
             state = (self.name, list(self.steps), self.skipped)
             self.name, self.steps, self.skipped, self.started = None, [], 0, None
+            self.skipped_private = 0
         return state
 
     def cancel(self):
         return self.stop()[0]
 
     def status(self):
+        """What is being captured, including what is being refused.
+
+        `skipped_private` and `private_now` are here because a recorder that
+        silently declines every step in a private tab is indistinguishable from
+        a broken one: the page and the API both render this, so "nothing was
+        recorded" comes with the reason attached.
+        """
         with self._lock:
-            return {"recording": self.name is not None, "name": self.name,
-                    "steps": len(self.steps), "skipped_secrets": self.skipped,
-                    "since": int(self.started) if self.started else None}
+            state = {"recording": self.name is not None, "name": self.name,
+                     "steps": len(self.steps), "skipped_secrets": self.skipped,
+                     "skipped_private": self.skipped_private,
+                     "since": int(self.started) if self.started else None}
+        state["private_now"] = bool(self.privacy is not None
+                                    and self.privacy.is_private())
+        return state
 
 
 # -- storage ----------------------------------------------------------------
@@ -331,6 +431,11 @@ class Playbooks:
                              indent=2, sort_keys=True, ensure_ascii=False)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(payload + "\n", encoding="utf-8")
+        # Before the rename, not after, and on the temporary file: a playbook
+        # holds the URLs and selectors of the user's own logged-in workflows,
+        # and the default umask would leave both this file and a crash-orphaned
+        # `.tmp` world-readable. Same order as every atomic write in envfile.py.
+        tmp.chmod(0o600)
         os.replace(tmp, self.path)
 
     def get(self, name):

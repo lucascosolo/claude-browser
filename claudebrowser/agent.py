@@ -22,6 +22,15 @@ import time
 from . import ai, extract, scrub
 
 MAX_STEPS = 14
+
+#: The tools that touch the tab the user is looking at -- and so the ones that
+#: would put a private page's address, title or text into a message to
+#: Anthropic. `list_tabs` is not among them because `api_tabs` drops private
+#: tabs from its answer outright: the model is not told they exist, so there is
+#: nothing here to refuse.
+TAB_TOOLS = frozenset({
+    "navigate", "read_page", "find_in_page", "page_links", "click", "type_text",
+})
 PAGE_CHARS = 15_000     # per read_page result fed back to the model
 RESULT_CHARS = 20_000   # hard ceiling on any single tool result
 TOTAL_RESULT_CHARS = 120_000  # ceiling across the whole run
@@ -210,11 +219,24 @@ class Agent:
         return result.get("result")
 
     def dispatch(self, name, args):
+        if name in TAB_TOOLS:
+            # Asked once per tool call rather than cached for the run: the user
+            # can switch to a private tab between two steps, and a decision
+            # taken at the start of the run would still be answering about the
+            # tab that was in front then.
+            gate = self.call("private_gate")
+            if not gate.get("ok"):
+                # Emitted as well as returned: the model is told why it cannot
+                # read the page, and so is the person watching the panel.
+                self.emit("  → refused: this tab is private\n")
+                return {"error": gate.get("error") or ai.PRIVATE_REFUSAL}
         if name == "navigate":
             r = self.call("api_navigate", None, args["url"], True, timeout=120)
             return {k: r.get(k) for k in ("ok", "url", "title", "error") if k in r}
         if name == "open_tab":
-            r = self.call("api_open", args["url"], True, True, timeout=120)
+            # `private=False` asks for nothing; a tab opened while a private one
+            # is in front still comes out private. See Browser.api_open.
+            r = self.call("api_open", args["url"], True, True, False, timeout=120)
             return {k: r.get(k) for k in ("ok", "id", "url", "title", "error") if k in r}
         if name == "list_tabs":
             return self.call("api_tabs")

@@ -1,0 +1,13 @@
+{
+  "app": "cb-vpn",
+  "strategy": "compose-systemd",
+  "target": "/srv/cb-vpn",
+  "source": "backend",
+  "branch": "main",
+  "unit": "cb-vpn",
+  "hostPorts": [8888],
+  "bindAddress": "100.91.16.6",
+  "postDeploy": "chmod 0755 /srv/cb-vpn/firewall.sh /srv/cb-vpn/entrypoint.sh && install -m 0644 /srv/cb-vpn/cb-vpn.service /etc/systemd/system/cb-vpn.service && systemctl daemon-reload && systemctl enable cb-vpn && systemctl restart cb-vpn",
+  "healthcheck": "curl -fsS --max-time 20 --proxy http://$CB_VPN_USER:$CB_VPN_PASS@100.91.16.6:8888 https://api.ipify.org | grep -qx 162.35.172.112",
+  "notes": "Proxy is published on the tailnet address only; the healthcheck must be run from a tailnet member (the laptop), not from the VPS. Credentials live in /srv/cb-vpn/.env (mode 600) on the server and are not in the repo."
+}

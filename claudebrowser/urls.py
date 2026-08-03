@@ -88,6 +88,25 @@ def prefetch_host(text: str):
     return host
 
 
+def omnibox_allows(private: bool) -> dict:
+    """What the omnibox may do for the tab currently in front.
+
+    There is one omnibox for the whole window, so "am I typing in a private
+    tab?" is a question the entry itself cannot answer -- which is how all
+    three of these ran in a private session. Stated once, here, rather than as
+    three `if` statements in the changed handler, because they are one policy
+    and a fourth helper hung off that signal has to be added to it:
+
+      * `prefetch` -- a DNS lookup leaves the machine for a host you have only
+        typed, from the shared non-ephemeral context at that.
+      * `history` -- the persistent history and bookmark rows the dropdown
+        renders are exactly what a private session is not supposed to surface.
+      * `recall` -- worse still: those rows carry snippets of the *body* of
+        pages read earlier.
+    """
+    return {"prefetch": not private, "history": not private, "recall": not private}
+
+
 class HostWarmer:
     """Calls `warm(host)` at most once per host, for the life of the window.
 

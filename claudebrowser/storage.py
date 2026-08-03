@@ -107,19 +107,7 @@ def make_context():
         context = WebKit2.WebContext.get_default()
         manager = context.get_website_data_manager()
 
-    notes.extend(attach_cookies(manager))
-
-    # ITP keeps a cross-site tracker from carrying state between the sites it is
-    # embedded on. It costs a small database and a little bookkeeping per load,
-    # which is a fair trade for a browser whose whole premise is that an agent
-    # drives the session you are personally signed into.
-    if os.environ.get("CB_ITP", "1") != "0" and hasattr(manager, "set_itp_enabled"):
-        try:
-            manager.set_itp_enabled(True)
-            notes.append("tracking prevention on")
-        except Exception:
-            pass
-
+    notes.extend(apply_policy(manager))
     return context, notes
 
 
@@ -142,8 +130,80 @@ def make_context_once():
     return _CONTEXT
 
 
-def attach_cookies(manager):
-    """Give the cookie manager a file to write to, and a policy to apply."""
+def itp_enabled():
+    """Is tracking prevention on? Read with a literal `!= "0"`, which is why
+    `CB_ITP=off` leaves it on -- settings.py mirrors that spelling."""
+    return os.environ.get("CB_ITP", "1") != "0"
+
+
+def private_downloads_enabled(raw=None, path=None):
+    """May a private tab write a download to disk? Off unless explicitly on.
+
+    The opposite default from every other knob here, and deliberately so: a
+    download is a permanent file, named by the remote server, produced by a tab
+    whose whole promise is that nothing is left behind. Only the words that
+    unambiguously mean "yes" count, so a typo keeps the safe answer.
+
+    Read from the settings file on every download, like `perf.light_enabled`
+    is, so a change applies to the next one rather than to the next launch.
+    """
+    from . import envfile
+
+    if raw is None:
+        raw = envfile.setting("CB_PRIVATE_DOWNLOADS", "", path=path)
+    return (raw or "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def child_is_private(opener_private, requested=False):
+    """Is a tab opened from another tab a private one?
+
+    One line, in the file that owns "which storage does this view get", because
+    the answer was previously written nowhere and so came out as `False` twice:
+    a `window.open` from a private tab, and a tab an agent opened while one was
+    in front. Privacy is inherited and can only be *added* -- there is no
+    argument to this function that turns it off, which is what makes "a popup
+    cannot de-privatise a session" a property rather than a habit.
+    """
+    return bool(opener_private or requested)
+
+
+def apply_policy(manager, persist=True):
+    """Everything this browser decides about one WebsiteDataManager.
+
+    Both managers come through here -- the persistent one built above, and the
+    ephemeral one a private view creates for itself -- because the two decisions
+    that are pure *policy* (which cookies to accept, whether to run tracking
+    prevention) have nothing to do with whether anything is written down. Left
+    to `make_context` alone they applied to the persistent manager only, and a
+    private tab ended up with `CB_COOKIES` ignored and ITP *off*: weaker
+    tracking protection than an ordinary tab, which is the reverse of what the
+    badge promises.
+
+    `persist=False` is what keeps that split honest: the policy is applied, the
+    cookie jar file is not, so the ephemeral manager stays ephemeral.
+    """
+    notes = attach_cookies(manager, persist=persist)
+    # ITP keeps a cross-site tracker from carrying state between the sites it is
+    # embedded on. It costs a small database and a little bookkeeping per load,
+    # which is a fair trade for a browser whose whole premise is that an agent
+    # drives the session you are personally signed into.
+    if itp_enabled() and hasattr(manager, "set_itp_enabled"):
+        try:
+            manager.set_itp_enabled(True)
+            notes.append("tracking prevention on")
+        except Exception:
+            pass
+    return notes
+
+
+def attach_cookies(manager, persist=True):
+    """Give the cookie manager a policy to apply, and a file to write to.
+
+    `persist=False` applies the policy and stops there -- an ephemeral manager
+    must not be handed a jar on disk, and the accept policy is the half of
+    `CB_COOKIES` that is about what the browser accepts rather than what it
+    keeps.
+    """
     notes = []
     try:
         cookies = manager.get_cookie_manager()
@@ -162,6 +222,8 @@ def attach_cookies(manager):
         # Persisting a jar we refuse to fill would only leave a stale file
         # behind, and the promise of CB_COOKIES=none is that nothing is kept.
         return notes + ["cookies off"]
+    if not persist:
+        return notes
 
     try:
         COOKIE_JAR.parent.mkdir(parents=True, exist_ok=True)

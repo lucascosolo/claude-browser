@@ -148,9 +148,16 @@ OPS = [
        "finish loading.",
        params=[Param("url", required=True, help="URL or search term."),
                Param("background", "boolean", "Open without focusing it.",
-                     cli="opt", default=False)],
+                     cli="opt", default=False),
+               # Asking for privacy is possible; giving it up is not. A tab
+               # opened from a private one is private whatever this says --
+               # see api_open -- so the flag can only ever add the property.
+               Param("private", "boolean", "Open it as a private tab: its own "
+                     "ephemeral session, nothing written down, and no page "
+                     "data sent to Claude.", cli="opt", default=False)],
        call=lambda c, a: ("api_open", (a["url"], _truthy(a.get("background"), False),
-                                       _truthy(a.get("wait")))),
+                                       _truthy(a.get("wait")),
+                                       _truthy(a.get("private"), False))),
        tab=False, timeout=LOAD_TIMEOUT),
 
     Op("navigate", "/navigate", "POST", "Navigate an existing tab to a URL and "

@@ -1,0 +1,84 @@
+# cb-vpn — the forward proxy claude-browser routes private-mode traffic through.
+#
+# Run by cb-vpn.service, not by hand. `docker compose up -d` here works but skips
+# the firewall rules the service applies first, which is the half of the SSRF
+# defence that actually holds.
+
+services:
+  proxy:
+    build: .
+    image: cb-vpn:local
+    container_name: cb-vpn
+
+    # THE security boundary. Bound to the VPS's tailnet address, so the proxy is
+    # reachable only by machines on the user's tailnet — never from the public
+    # internet, and never from 0.0.0.0 by accident. Changing this to 0.0.0.0 or
+    # dropping the address turns this into an open proxy the moment BasicAuth is
+    # guessed or misconfigured.
+    ports:
+      - "100.91.16.6:8888:8888"
+
+    # Credentials come from /srv/cb-vpn/.env (mode 600, generated at first
+    # deploy). The entrypoint refuses to start if they are missing.
+    env_file:
+      - .env
+
+    # Explicit public resolvers. The host's /etc/resolv.conf points at Tailscale
+    # MagicDNS (100.100.100.100), which the egress filter blocks as part of
+    # 100.64.0.0/10 — inheriting it would leave the proxy with no DNS at all.
+    # Independently worth doing: the user's browsing lookups have no business
+    # going through the tailnet's resolver.
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
+
+    networks:
+      cbvpn:
+        # Fixed so the host firewall rules can name the source subnet. A
+        # Docker-assigned subnet would drift on recreate and silently unhook the
+        # egress filter.
+        ipv4_address: 172.31.250.2
+
+    # `no`, on purpose: cb-vpn.service runs `compose up` attached with
+    # Restart=always, so systemd is the supervisor. A Compose restart policy on
+    # top of that gives two supervisors racing to bring the same container back.
+    restart: "no"
+
+    # Nothing here needs to write to disk or gain privileges. The proxy parses
+    # attacker-influenced HTTP for a living, so the blast radius of a bug in it
+    # is worth shrinking.
+    read_only: true
+    tmpfs:
+      - /run:mode=0755,size=8m
+      # The entrypoint renders the config (with the password) at start, so /etc
+      # cannot be fully read-only; give it RAM instead of the image layer.
+      - /etc/tinyproxy:mode=0755,size=1m
+    cap_drop:
+      - ALL
+    cap_add:
+      # tinyproxy starts as root to bind and read config, then setuid()s to the
+      # tinyproxy user. That is the only privilege it needs.
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+
+    # Logs are already URL-free at LogLevel Warning; this caps what a noisy error
+    # loop can accumulate on the box.
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+
+networks:
+  cbvpn:
+    name: cb-vpn
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.250.0/28
+    driver_opts:
+      com.docker.network.bridge.name: br-cbvpn

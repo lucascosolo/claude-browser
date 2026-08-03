@@ -199,7 +199,7 @@ def home(palette, nonce, bookmarks, recent, counts):
             ("claude:tldr", "TL;DR", "Summarize a page"),
             ("claude:agent", "Command", "Let Claude drive"),
             ("claude:research", "Research", "Across all tabs"),
-            ("private", "Private tab", "Nothing recorded"),
+            ("private", "Private tab", "Nothing written down"),
         ))
 
     saved = ("".join(_tile(r["url"], r["title"], starred=True, nonce=nonce)
@@ -229,6 +229,71 @@ def home(palette, nonce, bookmarks, recent, counts):
     """ % {"actions": actions, "saved": saved, "seen": seen,
            "nmarks": n_marks or "", "nhist": n_history or ""}
     return shell("Home", palette, nonce, "cb:home", body)
+
+
+#: What a private tab actually changes, and what it does not. Two lists rather
+#: than a paragraph of reassurance: every browser's private mode is misread as
+#: anonymity, and the second list is the whole reason this page exists. Each
+#: line names a mechanism that can be checked, not a promise.
+PRIVATE_KEPT = (
+    ("Nothing goes in your history", "or in the page-text cache that "
+     "cb:history and recall search."),
+    ("Its own session", "a separate cookie jar and cache, held in memory and "
+     "dropped when the tab closes."),
+    ("Claude is not given this page", "Ask, TL;DR, Research and the Ctrl+G "
+     "agent refuse a private tab, and it is left out of the tab list the agent "
+     "is shown. CB_PRIVATE_AI turns that off."),
+    ("The address bar stays quiet", "no DNS is warmed for what you type, and "
+     "no history, bookmark or page-text suggestions are offered."),
+    ("Playbooks stop recording", "an operation aimed at a private tab is "
+     "refused rather than written to disk."),
+    ("Downloads are cancelled", "a downloaded file would outlive the tab. "
+     "CB_PRIVATE_DOWNLOADS allows them."),
+)
+
+PRIVATE_NOT = (
+    ("It is not a VPN", "the sites you visit, your network, your employer and "
+     "your ISP see exactly what they always did."),
+    ("It hides nothing from the page itself", "if you sign in, that site knows "
+     "who you are for as long as the tab is open."),
+    ("Saved logins still fill in", "reading the keyring is deliberate; nothing "
+     "new is ever saved from a private tab."),
+    ("Anything you ask for is kept", "a bookmark you add or a setting you "
+     "change here is a normal write to disk."),
+    ("Other tabs are unaffected", "this window's ordinary tabs go on recording "
+     "history as usual."),
+)
+
+
+def private_page(palette, nonce):
+    """The start page of a private tab: what it does, and what it does not.
+
+    A private tab deliberately does not open cb:home -- that page is a
+    dashboard of history and bookmarks, which is the one thing this session is
+    not supposed to be showing you.
+    """
+    def rows(items):
+        # Paragraphs rather than `.row`s: a row is one ellipsized line built for
+        # a URL, and every line here is a sentence that has to be readable in
+        # full or it is not guidance.
+        return "".join('<p class="note"><b>%s</b> &mdash; %s</p>'
+                       % (_e(head), _e(rest)) for head, rest in items)
+
+    body = """
+      <section>
+        <h2>What this tab does not keep</h2>
+        %(kept)s
+      </section>
+      <section>
+        <h2>What it does not do</h2>
+        %(not)s
+      </section>
+      <p class="note">%(note)s</p>
+    """ % {"kept": rows(PRIVATE_KEPT), "not": rows(PRIVATE_NOT),
+           "note": _e("Everything this tab holds lives in memory. Closing it "
+                      "is what discards the session — the browser does not "
+                      "wait for you to quit.")}
+    return shell("Private tab", palette, nonce, "cb:private", body)
 
 
 def _snippet_html(text):
@@ -408,6 +473,7 @@ def _recorder_bar(status):
     if status.get("recording"):
         steps = int(status.get("steps") or 0)
         skipped = int(status.get("skipped_secrets") or 0)
+        private = int(status.get("skipped_private") or 0)
         return """
     <div class="rec">
       <span class="dot"></span>
@@ -422,12 +488,19 @@ def _recorder_bar(status):
             "name": "&ldquo;%s&rdquo;" % _e(status.get("name") or ""),
             "steps": steps,
             "plural": "" if steps == 1 else "s",
-            "skipped": (" &middot; %d credential field%s skipped"
-                        % (skipped, "" if skipped == 1 else "s")) if skipped else "",
+            "skipped": ((" &middot; %d credential field%s skipped"
+                         % (skipped, "" if skipped == 1 else "s")) if skipped else "")
+                       + ((" &middot; %d private-tab step%s refused"
+                           % (private, "" if private == 1 else "s"))
+                          if private else ""),
             "note": _e(
                 "The count is from when this page was drawn; reload to see it "
                 "again. Credential fields are never written to the file — the "
-                "browser's own autofill supplies those on replay."),
+                "browser's own autofill supplies those on replay. Operations on "
+                "a private tab are refused outright, so a recording made there "
+                "stays empty.")
+            + ("<br>Nothing is being recorded right now: the tab in front is "
+               "private." if status.get("private_now") else ""),
         }
 
     return """

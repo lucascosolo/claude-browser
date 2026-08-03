@@ -1,0 +1,49 @@
+# cb-vpn destination deny-list (tinyproxy Filter, FilterExtended On).
+#
+# One POSIX extended regex per line, matched case-insensitively against the
+# destination host of every request and CONNECT.
+#
+# This is the *first* of two layers. It catches the literal cases and gives a
+# clean 403 instead of a hang, but it cannot see where a hostname resolves — a
+# name that answers 169.254.169.254 sails straight through. The DOCKER-USER
+# iptables rules (firewall.sh) are the layer that actually holds, because they
+# filter on the resolved destination address. Neither layer alone is sufficient.
+
+# Loopback: 127.0.0.0/8 in dotted form, plus the name.
+^127\.
+^localhost$
+\.localdomain$
+
+# 0.0.0.0/8 — "this network". 0.0.0.0 is a routable alias for loopback on Linux,
+# and leading-zero octets (0177.0.0.1) are parsed as octal by some resolvers.
+^0\.
+^0+$
+
+# Bare integers: http://2130706433/ is 127.0.0.1 to inet_addr(). Any host that is
+# all digits is an encoded address, never a real name.
+^[0-9]+$
+
+# RFC1918.
+^10\.
+^172\.(1[6-9]|2[0-9]|3[01])\.
+^192\.168\.
+
+# Link-local, including 169.254.169.254 cloud metadata.
+^169\.254\.
+
+# Cloud metadata by name — the addresses above are the real target, but the
+# hostnames are what an SSRF payload usually carries.
+^metadata\.google\.internal$
+^metadata\.goog$
+^instance-data(\.|$)
+
+# Tailnet (CGNAT 100.64.0.0/10). This is how the proxy would reach the VPS itself
+# and every other machine on the user's tailnet.
+^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.
+
+# IPv6 loopback and unique-local (fc00::/7 = fc.. and fd..), with or without the
+# brackets a URL authority puts around them. Link-local fe80::/10 too.
+^\[?::1\]?$
+^\[?::\]?$
+^\[?f[cd][0-9a-f]{2}:
+^\[?fe[89ab][0-9a-f]:

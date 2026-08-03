@@ -86,6 +86,34 @@ SYNTHESIS_SYSTEM = (
 # Which credential served the last successful request, for the UI to report.
 LAST_CREDENTIAL = None
 
+#: What a private tab is told when a Claude feature is asked to read it.
+#: One sentence for what happened, one for how to change it -- a refusal the
+#: user cannot act on reads as a bug.
+PRIVATE_REFUSAL = (
+    "This tab is private, so its address, title and text are not sent to "
+    "Claude. Ask again in an ordinary tab, or set CB_PRIVATE_AI on in "
+    "cb:settings to allow it."
+)
+
+
+def private_ai_enabled(raw=None, path=None):
+    """May the Claude features read a private tab? No, unless explicitly told.
+
+    Refusing is the default because every other privacy knob here decides what
+    is written to *this* machine, and this one decides what leaves it: a
+    private tab's URL is the thing most likely to be a magic link or a
+    one-time token, and `scrub.py` deliberately never touches a URL. Only the
+    words that unambiguously mean "yes" count, so a typo keeps the refusal.
+
+    Read at the moment a feature is handed a tab, so turning it on takes
+    effect on the next question rather than the next launch.
+    """
+    from . import envfile
+
+    if raw is None:
+        raw = envfile.setting("CB_PRIVATE_AI", "", path=path)
+    return (raw or "").strip().lower() in ("1", "on", "true", "yes")
+
 
 class NoKey(Exception):
     """No credential available. Raised before any network call is attempted."""

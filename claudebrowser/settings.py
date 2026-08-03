@@ -83,6 +83,14 @@ def _only_one_is_on(raw):
     return (raw or "").strip() == "1"
 
 
+def _only_on_words(raw):
+    """ai.private_ai_enabled / storage.private_downloads_enabled: off unless a
+    word that unambiguously means on. The inverse list from `_off_words`, and
+    the inversion is the point -- for these two a typo has to fall back to the
+    private behaviour, not out of it."""
+    return (raw or "").strip().lower() in ("1", "on", "true", "yes")
+
+
 def _choice_canon(values, aliases=None):
     """Canonicaliser for an enumerated setting: exact keys plus the spellings
     the consuming code also accepts (perf.tune_view takes CB_GPU=none)."""
@@ -310,6 +318,27 @@ SETTINGS = (
         "Next question",
         "Read fresh every time a page is prepared for a question, so the next "
         "one you ask uses the new setting."),
+    Setting(
+        "CB_PRIVATE_AI", "Privacy", "Let Claude read private tabs",
+        "Off by default: Ask, TL;DR, Research and the Ctrl+G agent refuse a "
+        "private tab rather than send its address, title and text to "
+        "Anthropic. Turn it on if you want those features in a private tab "
+        "anyway.",
+        "bool", "0",
+        "Next question",
+        "Read at the moment a Claude feature is asked to read a tab, so the "
+        "next thing you ask uses the new setting.",
+        truth=_only_on_words),
+    Setting(
+        "CB_PRIVATE_DOWNLOADS", "Privacy", "Allow downloads from private tabs",
+        "Off by default: a download is a permanent file named by the remote "
+        "server, which is the one thing a private tab promises not to leave "
+        "behind. Downloads from ordinary tabs are unaffected.",
+        "bool", "0",
+        "Next download",
+        "Read when a download starts, so a change applies to the next one "
+        "without a restart.",
+        truth=_only_on_words),
 
     # -- Performance --------------------------------------------------------
     Setting(

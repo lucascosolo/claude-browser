@@ -1,0 +1,3 @@
+# The proxy credential is generated on the server and lives only in
+# /srv/cb-vpn/.env (mode 600). If one ever appears here it is an accident.
+.env

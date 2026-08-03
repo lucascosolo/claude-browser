@@ -52,6 +52,7 @@ def _every_page(palette):
         "data": pages.data_page(
             palette, "N", {"total_mb": 100, "available_mb": 40, "cores": 2},
             {"policy": "all"}, _human),
+        "private": pages.private_page(palette, "N"),
         "settings": pages.settings_page(palette, "N", {
             "path": "/tmp/settings",
             "sections": [{"title": "Section", "note": "note", "settings": [
@@ -82,6 +83,39 @@ class Renders(unittest.TestCase):
         del crippled["edge"]
         with self.assertRaises(KeyError):
             pages.home(crippled, "N", [], [], (0, 0))
+
+
+class PrivateGuidance(unittest.TestCase):
+    """cb:private is what a private tab opens with, so it is the one place the
+    user finds out what private mode does -- and, more importantly, what it does
+    not. A page that only listed the reassurances would be the lie this browser
+    is otherwise careful not to tell."""
+
+    def html(self):
+        return pages.private_page(style.palette("phosphor"), "N")
+
+    def test_it_says_what_is_not_kept(self):
+        html = self.html()
+        for claim in ("history", "cookie", "Claude", "Playbook", "Download"):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, html)
+
+    def test_it_says_what_it_does_not_do(self):
+        html = self.html()
+        self.assertIn("not a VPN", html)
+        self.assertIn("network", html)
+
+    def test_both_halves_are_present_and_neither_is_empty(self):
+        self.assertTrue(pages.PRIVATE_KEPT)
+        self.assertTrue(pages.PRIVATE_NOT)
+        for head, rest in pages.PRIVATE_KEPT + pages.PRIVATE_NOT:
+            self.assertTrue(head.strip())
+            self.assertTrue(rest.strip())
+
+    def test_it_does_not_open_the_history_dashboard(self):
+        """The default start page is a grid of history and bookmarks, which is
+        the one thing a private session must not open with."""
+        self.assertNotIn("Recent", self.html())
 
 
 class PanelTokens(unittest.TestCase):

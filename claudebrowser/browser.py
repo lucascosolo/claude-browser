@@ -25,6 +25,11 @@ from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
+# Where a private tab starts, and not CB_HOME: the default start page is a
+# dashboard of history and bookmarks, which is the one thing a private
+# session should not open with. cb:private says what the tab does and does
+# not do instead.
+PRIVATE_HOME = "cb:private"
 
 # How long the omnibox must sit still before its host is worth resolving.
 # Firing on the keystroke itself would resolve every prefix of a hostname --
@@ -222,6 +227,18 @@ class Tab:
                 user_content_manager=manager,
                 is_ephemeral=True,
             )
+            # `is_ephemeral` decides what is *written*; it decides nothing about
+            # policy, and the manager it builds starts from WebKit's defaults --
+            # which on this build means ITP off and the accept policy left where
+            # WebKit put it. So a private tab came out with weaker tracking
+            # protection than an ordinary one and ignored CB_COOKIES entirely.
+            # `persist=False` applies both without handing it a cookie file.
+            try:
+                storage.apply_policy(self.view.get_website_data_manager(),
+                                     persist=False)
+            except Exception as e:
+                print("storage: private tab kept WebKit's defaults (%s)" % e,
+                      flush=True)
         elif related is not None:
         # Creating a view "related" to an existing one puts both in the same web
         # process. This is the only mechanism that still works for that in
@@ -356,7 +373,11 @@ class Browser(Gtk.Window):
         # the browser. The recorder itself holds no disk state, so it exists
         # even when the collection does not -- `stop` is the only step that
         # needs a file.
-        self.recorder = playbooks.Recorder()
+        # The privacy mirror is what lets the recorder -- which runs on the
+        # control server's HTTP thread -- know whether the tab an operation
+        # aims at is private, without reading GtkNotebook off the main loop.
+        self.privacy = playbooks.TabPrivacy()
+        self.recorder = playbooks.Recorder(self.privacy)
         try:
             self.playbooks = playbooks.Playbooks()
         except Exception as e:
@@ -389,6 +410,7 @@ class Browser(Gtk.Window):
         for note in perf.tune_context(context):
             print("perf: %s" % note, flush=True)
 
+        context.connect("download-started", self._on_download)
         context.register_uri_scheme("cb", self._serve_internal)
         security = context.get_security_manager()
         if security:
@@ -878,9 +900,9 @@ class Browser(Gtk.Window):
             ("a", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
                 lambda: self._open_internal("cb:deck"),
             ("p", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
-                lambda: self.new_tab(HOME, private=True),
+                lambda: self.new_tab(PRIVATE_HOME, private=True),
             ("n", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
-                lambda: self.new_tab(HOME, private=True),
+                lambda: self.new_tab(PRIVATE_HOME, private=True),
             ("Home", Gdk.ModifierType.MOD1_MASK): self._go_home,
             ("q", Gdk.ModifierType.CONTROL_MASK): Gtk.main_quit,
             ("equal", Gdk.ModifierType.CONTROL_MASK): lambda: self._zoom(0.1),
@@ -962,6 +984,24 @@ class Browser(Gtk.Window):
         except (AttributeError, TypeError, GLib.Error):
             pass
 
+    def _cancel_prefetch(self):
+        if self._prefetch_id is not None:
+            GLib.source_remove(self._prefetch_id)
+            self._prefetch_id = None
+
+    def _cancel_recall(self):
+        """Drop a pending recall, and disown one already on its way back.
+
+        Bumping the serial matters as much as removing the timer: a worker
+        started one keystroke ago is a disk read whose rows are already being
+        carried back to the main loop, and switching into a private tab must
+        not be beaten to the popup by it.
+        """
+        if self._recall_id is not None:
+            GLib.source_remove(self._recall_id)
+            self._recall_id = None
+        self._recall_serial += 1
+
     def _schedule_prefetch(self, entry):
         """Warm the typed host's DNS a beat after typing stops.
 
@@ -969,28 +1009,47 @@ class Browser(Gtk.Window):
         tell "example.c" from "example.com", so without the pause a single
         domain still costs a lookup for each of its prefixes.
         """
-        if self._prefetch_id is not None:
-            GLib.source_remove(self._prefetch_id)
-            self._prefetch_id = None
+        self._cancel_prefetch()
         if not entry.has_focus():
             return
         text = entry.get_text()
 
         def fire():
             self._prefetch_id = None
+            # Re-checked at the moment of firing, not only when scheduled: the
+            # debounce is a third of a second, which is long enough to switch
+            # into a private tab and have the lookup leave anyway.
+            if self._private_now():
+                return GLib.SOURCE_REMOVE
             self._warmer.consider(text)
             return GLib.SOURCE_REMOVE
 
         self._prefetch_id = GLib.timeout_add(PREFETCH_DELAY_MS, fire)
 
+    def _private_now(self):
+        """Is the tab in front a private one? The omnibox's only privacy input.
+
+        There is one omnibox for the window, so every helper hanging off it has
+        to ask this rather than carry a tab of its own.
+        """
+        tab = self.current()
+        return bool(tab and tab.private)
+
     def _on_omnibox_changed(self, entry):
-        self._schedule_prefetch(entry)
+        allows = urls.omnibox_allows(self._private_now())
+        if allows["prefetch"]:
+            self._schedule_prefetch(entry)
+        else:
+            self._cancel_prefetch()
         if not entry.has_focus():
             return
         text = entry.get_text().strip()
         self._suggest_model.clear()
-        self._schedule_recall(text)
-        if self.store is None or len(text) < 1:
+        if allows["recall"]:
+            self._schedule_recall(text)
+        else:
+            self._cancel_recall()
+        if self.store is None or len(text) < 1 or not allows["history"]:
             return
         for row in self.store.suggest(text, limit=8):
             title = GLib.markup_escape_text(row["title"] or "")
@@ -1008,10 +1067,7 @@ class Browser(Gtk.Window):
         answering a question nobody is asking any more, and appending it would
         put rows in the popup that do not match the box.
         """
-        if self._recall_id is not None:
-            GLib.source_remove(self._recall_id)
-            self._recall_id = None
-        self._recall_serial += 1
+        self._cancel_recall()
         if not self.pagetext or not self.pagetext.available:
             return
         if len(text) < RECALL_MIN_CHARS:
@@ -1042,6 +1098,8 @@ class Browser(Gtk.Window):
     def _show_recall(self, text, serial, hits):
         """Append page-text hits below the history matches already in the model."""
         if serial != self._recall_serial or self.omnibox.get_text().strip() != text:
+            return GLib.SOURCE_REMOVE
+        if self._private_now():
             return GLib.SOURCE_REMOVE
         seen = {row[1] for row in self._suggest_model}
         for hit in hits:
@@ -1153,6 +1211,12 @@ class Browser(Gtk.Window):
             notice, self._settings_notice = self._settings_notice, None
             return pages.settings_page(palette, self.nonce, settings.describe(),
                                        notice=notice)
+
+        # Answered before the store check for a reason of its own: this page is
+        # what a private tab opens with, and reaching into the history database
+        # to render it would be the wrong instinct made structural.
+        if name == "private":
+            return pages.private_page(palette, self.nonce)
 
         if name == "passwords":
             if self.vault is None:
@@ -1292,7 +1356,7 @@ class Browser(Gtk.Window):
         elif action == "newtab":
             self.new_tab(HOME)
         elif action == "private":
-            self.new_tab(HOME, private=True)
+            self.new_tab(PRIVATE_HOME, private=True)
         elif action.startswith("claude:"):
             mode = action.split(":", 1)[1]
             if mode == "tldr":
@@ -1392,6 +1456,7 @@ class Browser(Gtk.Window):
         # inherits the very storage it exists to avoid.
         related = self.tabs[0].view if (self.tabs and not private) else None
         tab = Tab(self.content, self.context, related=related, private=private)
+        self.privacy.opened(tab.id, tab.private)
         view = tab.view
 
         perf.tune_view(view)
@@ -1414,6 +1479,10 @@ class Browser(Gtk.Window):
         self.notebook.set_show_tabs(len(self.tabs) > 1)
         if not background:
             self.notebook.set_current_page(index)
+            # `switch-page` does not fire when the page being selected is
+            # already current -- the first tab of the window, in particular --
+            # so the mirror is told here as well as from _on_switch.
+            self.privacy.focused(tab.id)
         if url:
             perf.load_url(view, normalize(url))
         else:
@@ -1427,6 +1496,14 @@ class Browser(Gtk.Window):
         if tab.private:
             badge = Gtk.Label(label="private")
             badge.get_style_context().add_class("cb-priv-badge")
+            # The badge is the only thing on screen saying this tab behaves
+            # differently, so it carries the honest summary rather than a
+            # restatement of its own label. cb:private has the full version.
+            badge.set_tooltip_text(
+                "Nothing from this tab is written down: no history, no page "
+                "cache, its own session, no downloads, and nothing sent to "
+                "Claude. It is not a VPN — the sites you visit and your "
+                "network still see you. Open cb:private for the detail.")
             box.pack_start(badge, False, False, 0)
         tab.label = Gtk.Label(label="New tab")
         tab.label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
@@ -1450,12 +1527,45 @@ class Browser(Gtk.Window):
         box.show_all()
         return box
 
-    def _on_popup(self, _view, action):
-        """Target=_blank and window.open() become tabs, never new windows."""
+    def _on_popup(self, view, action):
+        """Target=_blank and window.open() become tabs, never new windows.
+
+        The originating view decides whether the child is private. Defaulting
+        to False is how an OAuth popup or any `window.open` out of a private
+        tab silently became an ordinary one -- persistent cookie jar, disk
+        cache, and a row in history -- with no badge to show it had happened.
+        """
+        origin = next((t for t in self.tabs if t.view is view), None)
         uri = action.get_request().get_uri()
         if uri:
-            self.new_tab(uri, background=True)
+            self.new_tab(uri, background=True,
+                         private=storage.child_is_private(
+                             origin is not None and origin.private))
         return None
+
+    def _on_download(self, _context, download):
+        """Refuse a download started by a private tab; leave the rest alone.
+
+        With no handler at all WebKitGTK writes into the user's Downloads
+        directory under the *server-suggested* filename, with no UI anywhere --
+        so a private tab was able to produce a permanent, remotely-named file.
+        This is deliberately not the start of a download manager: ordinary
+        downloads keep the default behaviour they have always had, and the only
+        decision made here is whether this one is allowed to happen.
+        """
+        try:
+            view = download.get_web_view()
+        except Exception:
+            return
+        tab = next((t for t in self.tabs if t.view is view), None)
+        if tab is None or not tab.private or storage.private_downloads_enabled():
+            return
+        try:
+            download.cancel()
+        except Exception:
+            pass
+        self._flash("Download cancelled — this tab is private. "
+                    "Allow it in cb:settings.")
 
     def close_tab(self, tab):
         if tab is None:
@@ -1466,6 +1576,12 @@ class Browser(Gtk.Window):
         self._settle(tab, {"ok": True, "closed": True})
         self.notebook.remove_page(index)
         self.tabs.remove(tab)
+        self.privacy.closed(tab.id)
+        # Destroyed rather than left to the garbage collector. A private view
+        # owns an ephemeral session, and "it is wiped when the tab closes" has
+        # to mean at the moment of closing, not whenever Python happens to drop
+        # the last reference to the widget.
+        tab.view.destroy()
         if not self.tabs:
             Gtk.main_quit()
             return
@@ -1985,6 +2101,7 @@ class Browser(Gtk.Window):
         tab = next((t for t in self.tabs if t.view is view), None)
         if tab:
             tab.touch()
+            self.privacy.focused(tab.id)
             GLib.idle_add(self._refresh, tab)
             GLib.idle_add(self._paint_agent_frame)
             # Selecting a discarded tab is the moment it comes back. Deferred to
@@ -2092,7 +2209,7 @@ class Browser(Gtk.Window):
             "research": self.research,
             "agent": lambda: self.open_panel("agent"),
             "newtab": lambda: self.new_tab(HOME),
-            "private": lambda: self.new_tab(HOME, private=True),
+            "private": lambda: self.new_tab(PRIVATE_HOME, private=True),
             "find": self.findbar.open,
             "reader": self.toggle_reader,
         }[key]()
@@ -2432,8 +2549,45 @@ class Browser(Gtk.Window):
         return GLib.SOURCE_REMOVE
 
 
+    def _private_refusal(self, tab_id=None):
+        """Why this tab may not be read for Claude, or None if it may.
+
+        The single gate in front of every path that puts page data in a request
+        to Anthropic -- Ask, TL;DR, Research and the Ctrl+G agent all resolve a
+        tab through here. Default is refuse: `scrub.py` redacts page *text* and
+        deliberately never touches a URL, and a private tab's URL is the thing
+        most likely to be a magic link or a one-time token.
+        """
+        tab = self.find(tab_id)
+        if tab is None or not tab.private or ai.private_ai_enabled():
+            return None
+        return ai.PRIVATE_REFUSAL
+
+    def private_gate(self, done):
+        """The agent's version of `_private_refusal`, over `call_sync`.
+
+        Not an entry in `api.OPS`: it is not an operation anyone can ask the
+        browser to perform, it is the agent loop asking whether it is allowed
+        to look at the tab in front. It still follows the `done`-once contract,
+        because `control.on_main_loop` is what carries it.
+        """
+        refusal = self._private_refusal()
+        if refusal:
+            return done({"ok": False, "error": refusal})
+        done({"ok": True})
+
     def _with_page(self, then, tab_id=None):
-        """Fetch the readable text of a tab, then hand it to `then`."""
+        """Fetch the readable text of a tab, then hand it to `then`.
+
+        A refusal answers in the panel and never calls `then`, so no caller can
+        accidentally proceed with an empty page dict as if the read had merely
+        come back blank.
+        """
+        refusal = self._private_refusal(tab_id)
+        if refusal:
+            self._panel_write(refusal, replace=True, tag="error")
+            return self._set_status("private tab", "warn")
+
         def got(result):
             page = result.get("result") if isinstance(result, dict) else None
             then(page if isinstance(page, dict) else {"url": "", "title": "", "text": ""})
@@ -2471,10 +2625,19 @@ class Browser(Gtk.Window):
         self.open_panel("research")
         if not self._require_key():
             return
-        tabs = list(self.tabs)
+        # Private tabs are filtered out here rather than refused per tab: this
+        # is a read across everything open, and one private tab in the strip
+        # must neither stop the other five being synthesized nor be quietly
+        # included in the synthesis.
+        allow_private = ai.private_ai_enabled()
+        tabs = [t for t in self.tabs if allow_private or not t.private]
+        held_back = len(self.tabs) - len(tabs)
         if not tabs:
-            self._panel_write("No tabs are open to research.", replace=True, tag="error")
+            self._panel_write(ai.PRIVATE_REFUSAL if held_back
+                              else "No tabs are open to research.",
+                              replace=True, tag="error")
             return self._set_status("nothing to read", "warn")
+        held_note = (", %d private left out" % held_back) if held_back else ""
         self._set_status("reading %d tab%s…" % (len(tabs), "" if len(tabs) == 1 else "s"),
                          "busy")
 
@@ -2490,7 +2653,14 @@ class Browser(Gtk.Window):
                 return self._run_stream(
                     lambda: ai.synthesize(pages, question, tally=tally),
                     title="Research",
-                    subtitle="%d tab%s" % (len(pages), "" if len(pages) == 1 else "s"),
+                    # The card's subtitle carries the exclusion rather than a
+                    # line in the body: `_run_stream` clears the panel before
+                    # the answer, so anything written ahead of it is wiped, and
+                    # a synthesis silently missing a tab the user can see reads
+                    # as the model having ignored it.
+                    subtitle="%d tab%s%s" % (len(pages),
+                                             "" if len(pages) == 1 else "s",
+                                             held_note),
                     tally=tally)
 
             def got(page):
@@ -2583,11 +2753,29 @@ class Browser(Gtk.Window):
     # Every method here takes a trailing `done` callback and calls it once.
 
     def api_tabs(self, done):
-        current = self.current()
-        done({"ok": True, "current": current.id if current else None,
-              "tabs": [t.info() for t in self.tabs]})
+        """The open tabs -- minus the private ones, whose existence is not the
+        caller's business.
 
-    def api_open(self, url, background, wait, done):
+        Redacting the URL and title would not be enough: this answer is read by
+        the Ctrl+G agent and shipped to Anthropic, `Tab.info()` marks each tab
+        `"private": True`, and "there is a private tab, here is its id" is
+        itself a fact about the user's session. Omitted entirely, so nothing
+        downstream can be tempted to act on one. `private_count` says how many
+        were held back, because a caller that sees ids 1 and 4 will otherwise
+        conclude the browser lost tab 2.
+        """
+        current = self.current()
+        allow_private = ai.private_ai_enabled()
+        shown = [t for t in self.tabs if allow_private or not t.private]
+        hidden = len(self.tabs) - len(shown)
+        if current is not None and current not in shown:
+            current = None
+        done({"ok": True, "current": current.id if current else None,
+              "tabs": [t.info() for t in shown],
+              **({"private_count": hidden,
+                  "note": ai.PRIVATE_REFUSAL} if hidden else {})})
+
+    def api_open(self, url, background, wait, private, done):
         """Open a tab -- if the machine can take one.
 
         Two gates, in this order, because they fail for different reasons and
@@ -2595,7 +2783,16 @@ class Browser(Gtk.Window):
         waiting makes an eleventh tab a good idea, and the agent needs to hear
         "close one" rather than sit in a retry loop. Pressure is a wait: it
         passes on its own.
+
+        `private` can only ever add the property. A tab opened while a private
+        one is in front inherits privacy whatever the caller asked for: an
+        agent following a link out of a private tab, or a `window.open` from
+        it, would otherwise land the page in the persistent jar and in history
+        -- de-privatising a session by opening a tab in it.
         """
+        current = self.current()
+        private = storage.child_is_private(
+            current is not None and current.private, private)
         ceiling = resources.tab_ceiling(self.machine, MAX_AGENT_TABS)
         if len(self.tabs) >= ceiling:
             return done({
@@ -2603,10 +2800,14 @@ class Browser(Gtk.Window):
                 "error": "refused: %d tabs already open (limit %d on this machine). "
                          "Close one with browser_close, or reuse a tab with "
                          "browser_navigate." % (len(self.tabs), ceiling),
-                "tabs": [t.info() for t in self.tabs]})
+                # Same omission as api_tabs: the ceiling is a count of every
+                # tab, but the listing behind it is not a place to disclose the
+                # private ones.
+                "tabs": [t.info() for t in self.tabs
+                         if ai.private_ai_enabled() or not t.private]})
 
         def go():
-            tab = self.new_tab(url, background=background)
+            tab = self.new_tab(url, background=background, private=private)
             self.note_agent_activity(tab)
             self._begin_load(tab)
             self._await_load(tab, wait, done)
@@ -2775,6 +2976,17 @@ class Browser(Gtk.Window):
 
     @needs_tab
     def api_screenshot(self, tab, path, done):
+        # A path is a file that outlives the tab, which is the one thing a
+        # private session promises not to leave behind -- and the path itself
+        # was landing in the playbook alongside it. Streaming the PNG back to
+        # the caller is untouched: that is the same page the caller is already
+        # driving, and it is written nowhere.
+        if path and tab.private:
+            return done({"ok": False, "error":
+                         "this tab is private, so a screenshot of it is not "
+                         "written to disk. Omit the path to receive the PNG "
+                         "instead."})
+
         def on_snapshot(view, result, _data=None):
             try:
                 surface = view.get_snapshot_finish(result)
@@ -3079,7 +3291,12 @@ class Browser(Gtk.Window):
             return done({"ok": True, "recording": started,
                          "note": "every operation from here until "
                                  "`playbook-record stop` is captured; "
-                                 "credential fields are skipped"})
+                                 "credential fields are skipped, and so is "
+                                 "anything aimed at a private tab",
+                         **({"warning": "the tab in front is private, so "
+                                        "nothing will be recorded until you "
+                                        "switch to an ordinary one"}
+                            if self.privacy.is_private() else {})})
 
         if action == "cancel":
             dropped = self.recorder.cancel()
@@ -3088,13 +3305,23 @@ class Browser(Gtk.Window):
         if action == "stop":
             if not self.recorder.active:
                 return done({"ok": False, "error": "not recording"})
+            # Read before stop(), which resets it: a recording that captured
+            # nothing because every step was aimed at a private tab must say so
+            # rather than look like a recorder that failed.
+            private_skips = self.recorder.skipped_private
             book, steps, skipped = self.recorder.stop()
             if self._no_playbooks(done):
                 return None
             if not steps:
                 return done({"ok": False, "skipped_secrets": skipped,
+                             "skipped_private": private_skips,
                              "error": "nothing replayable was recorded, so %r "
-                                      "was not saved" % book})
+                                      "was not saved%s"
+                                      % (book,
+                                         " -- %d operation(s) were refused "
+                                         "because they targeted a private tab"
+                                         % private_skips if private_skips
+                                         else "")})
             try:
                 self.playbooks.save(book, steps, skipped)
             except (playbooks.PlaybookError, OSError) as e:
@@ -3102,6 +3329,7 @@ class Browser(Gtk.Window):
             return done({"ok": True, "saved": book, "steps": len(steps),
                          "ops": [s["op"] for s in steps],
                          "skipped_secrets": skipped,
+                         "skipped_private": private_skips,
                          # Said plainly rather than left to be discovered: a
                          # login playbook that silently dropped its password
                          # step would look broken on the first replay.

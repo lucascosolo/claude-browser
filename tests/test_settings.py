@@ -29,8 +29,8 @@ from claudebrowser import envfile, pages, personas, settings, style  # noqa: E40
 EVERY_KEY = (
     "CB_AUTH", "CB_AUTOSTART", "CB_BLOCK", "CB_COOKIES", "CB_GPU", "CB_HOME",
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
-    "CB_PERSONA", "CB_PORT", "CB_SCRUB", "CB_SEARCH", "CB_THEME", "CB_TOKEN",
-    "CB_URL", "CB_WEBGL",
+    "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
+    "CB_SCRUB", "CB_SEARCH", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_WEBGL",
 )
 
 
@@ -89,7 +89,11 @@ class TestTable(Isolated):
         which CB_THEME does). Adding a setting copies an existing row, so the
         badge is exactly the field most likely to be copied unexamined."""
         live = {"CB_THEME", "CB_LIGHT", "CB_SCRUB", "CB_PERSONA", "CB_AUTH",
-                "CB_PACE", "CB_URL", "CB_AUTOSTART"}
+                "CB_PACE", "CB_URL", "CB_AUTOSTART",
+                # Both read at the moment they are consulted -- ai.private_ai_-
+                # enabled when a Claude feature is handed a tab, and
+                # storage.private_downloads_enabled when a download starts.
+                "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS"}
         for knob in settings.SETTINGS:
             immediate = "restart" not in knob.effect.lower()
             self.assertEqual(immediate, knob.key in live,
@@ -171,6 +175,40 @@ class TestValidation(Isolated):
     def test_a_boolean_only_takes_the_words_it_understands(self):
         self.bad("CB_BLOCK", "maybe")
         self.assertEqual(self.apply("CB_BLOCK", "no"), "0")
+
+    def test_the_private_knobs_default_to_the_private_answer(self):
+        """Both are the inverse of every other boolean here: off is the safe
+        reading, so an unrecognised value has to land on off rather than on."""
+        for key in ("CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS"):
+            knob = settings.get(key)
+            self.assertEqual(knob.default, "0", key)
+            self.assertFalse(knob.truth(""), key)
+            self.assertFalse(knob.truth("yeah"), key)
+            self.assertFalse(knob.truth(None), key)
+            self.assertTrue(knob.truth("1"), key)
+            self.assertTrue(knob.truth("on"), key)
+
+    def test_the_private_knobs_are_written_as_ones_and_zeroes(self):
+        for key in ("CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS"):
+            self.assertEqual(self.apply(key, "yes"), "1")
+            self.assertEqual(self.apply(key, "off"), "0")
+            with self.assertRaises(ValueError, msg=key):
+                self.apply(key, "sometimes")
+            self.assertEqual(envfile.values(self.path)[key], "0")
+
+    def test_the_private_knobs_are_what_their_consumers_read(self):
+        """The table restates a spelling that lives in ai.py and storage.py;
+        this is the string that ties the two together."""
+        from claudebrowser import ai, storage
+
+        for word in ("1", "on", "true", "YES"):
+            self.assertTrue(ai.private_ai_enabled(word), word)
+            self.assertTrue(storage.private_downloads_enabled(word), word)
+            self.assertTrue(settings.get("CB_PRIVATE_AI").truth(word), word)
+        for word in ("", "0", "off", "maybe"):
+            self.assertFalse(ai.private_ai_enabled(word), word)
+            self.assertFalse(storage.private_downloads_enabled(word), word)
+            self.assertFalse(settings.get("CB_PRIVATE_AI").truth(word), word)
 
     def test_an_unknown_setting_is_refused(self):
         with self.assertRaises(ValueError):
