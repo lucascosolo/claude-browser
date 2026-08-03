@@ -95,21 +95,26 @@ Right-clicking the menu entry offers **New Window** and **New Window (no agent A
 | `F12` | web inspector |
 
 Everything above also lives in the **hamburger menu** at the right of the
-toolbar, grouped as *Claude* / *New* / *Library*, with each shortcut printed
-beside its row. The four Claude actions used to be four separate icons in the
-toolbar; unlabelled, they were four chances to misread a wrench or a bulleted
-list. The toolbar now holds only what acts on the page in front of you — the
-bookmark star and a new tab.
+toolbar, grouped as *Claude* / *New* / *Library* / *This page* / *Machine*, with
+each shortcut printed beside its row. Reader mode and Find live under *This
+page*; saved logins, playbooks, cookies & cache and settings are reachable there
+too, since they have no shortcut of their own. The four Claude actions used to be
+four separate icons in the toolbar; unlabelled, they were four chances to misread
+a wrench or a bulleted list. The toolbar now holds only what acts on the page in
+front of you — the bookmark star and a new tab.
 
 The address bar navigates when the input looks like an address and searches
 otherwise, and suggests as you type from your history and bookmarks —
 bookmarks first, then by visit count with a recency bonus, and a match on the
-start of a hostname outranks one buried in a title. Tabs appear only once there
+start of a hostname outranks one buried in a title. Below those it offers
+**matches in the text of pages you have already read**, marked `¶` so a
+full-text hit is never mistaken for a bookmark. Tabs appear only once there
 is more than one.
 
 ### Reader mode
 
-`Ctrl+Alt+R` — Firefox's binding for the same thing — finds the article on the
+`Ctrl+Alt+R` — Firefox's binding for the same thing, and menu → This page →
+Reader mode for anyone who has not learned it — finds the article on the
 page and re-renders it for reading: one column at a comfortable measure, reading
 typography, no sidebars or floating newsletter boxes. It reports the word count
 and an estimated reading time as it opens. Pressing it again puts you back.
@@ -140,7 +145,16 @@ Every page that finishes loading has its text kept in
 ./cbctl recall 'webkit process model' --limit 3
 ```
 
-You get ranked matches with a snippet around the hit. This is not a web search:
+You get ranked matches with a snippet around the hit. The same index is in front
+of you as you type: from four characters on, the **address bar** offers page-text
+hits under the history and bookmark matches, marked `¶`, and `cb:history`'s
+search box grows a **Found in page text** section under the titles it matched.
+Neither runs on the keystroke — the omnibox waits for a pause in typing and then
+searches on a worker thread, because this is a disk read through an index on a
+machine picked for being slow, and a late answer is discarded rather than
+appended to a box that has moved on.
+
+This is not a web search:
 it only ever sees pages this browser actually loaded, which is the whole point —
 *"the page about X I had open yesterday"* is a question no search engine can
 answer, and it is one of the more common things to ask an agent.
@@ -160,7 +174,7 @@ by the same check that keeps them out of history.
 
 ### Its own pages
 
-Six internal pages on the `cb:` scheme, laid out as cards and sharing the
+Eight internal pages on the `cb:` scheme, laid out as cards and sharing the
 Claude panel's visual language. A slim icon rail moves between them.
 
 | | |
@@ -168,10 +182,11 @@ Claude panel's visual language. A slim icon rail moves between them.
 | `cb:home` | Start page: one input that both searches and navigates, four quick actions, then bookmarks and recent pages as tiles. This is the default new tab (`CB_HOME` overrides it). |
 | `cb:deck` | **Every open tab as a card.** A tab strip stops being navigation somewhere around the eighth tab, however well the tabs are named. The deck is the same set laid out with room for full titles. |
 | `cb:bookmarks` | Everything saved, filterable. |
-| `cb:history` | Grouped by day, filterable, with per-entry delete and a two-step clear. |
+| `cb:history` | Grouped by day, filterable, with per-entry delete and a two-step clear. A query also searches the *text* of the pages, listed separately as **Found in page text**. |
 | `cb:passwords` | **Saved logins**, plus the sites you told it never to ask about. |
 | `cb:playbooks` | **Recorded sequences**, what each one does, and a Run and a two-step Delete for every one. Starting and stopping a recording lives here too, so a capture left running is visible rather than invisible. |
-| `cb:data` | **Memory, swap, CPU and disk** — what the resource guard is seeing, how many tabs it has freed, how much page text is cached for `recall`, and two-step buttons to clear the cache, the cookies, the cached page text, or everything. |
+| `cb:data` | **Memory, swap, CPU and disk** — what the resource guard is seeing, how many tabs it has freed, how much page text is cached for `recall`, an on/off switch for the lighter-page request (`CB_LIGHT`), and two-step buttons to clear the cache, the cookies, the cached page text, or everything. |
+| `cb:settings` | **Every setting in the browser**, editable. See below. |
 
 Tiles carry a **site mark** — a letter on a colour hashed from the hostname —
 rather than a favicon. Favicons would mean a network request per tile on the
@@ -181,6 +196,82 @@ and offline.
 
 Filtering inside these pages is done in the page, not by re-rendering from
 Python: a full page load per keystroke is not a search box.
+
+**The buttons on these pages are authenticated.** Bookmarking, deleting,
+clearing storage and writing a setting all travel back to Python over a WebKit
+script-message handler — and that handler is registered on the *shared*
+UserContentManager, so any page in the browser could post to it. Each `cb:`
+document is therefore rendered with a per-session random token that it attaches
+to every message (`msg.t`) and the handler checks. It is a **script-message auth
+token, not a CSP nonce** — there is no Content-Security-Policy anywhere in this
+project, and reading it as one leads straight to the wrong conclusions about
+what it protects. Navigation does not use messages at all: those are ordinary
+`<a href>` links, so middle-click and Back behave normally.
+
+### Themes
+
+Chosen by name in `CB_THEME`, never by a light/dark boolean. `--theme` takes
+the same three names for one run (`system` is a settings-file value only):
+
+| | |
+|---|---|
+| `phosphor` | **The default.** A near-black, blue-cast HUD: square corners, hairline rules, an omnibox held between two accent brackets that light up on focus, monospaced and letterspaced chrome labels, and one static scanline gradient. Nothing in it animates and nothing repaints on a timer — a decorative frame budget is not something a two-core laptop has. |
+| `dark` / `light` | Claude's warm neutrals and coral accent, exactly as they were. |
+| `system` | Follow the desktop's dark/light preference. |
+
+An **unset** `CB_THEME` now means "nobody has chosen", and the answer to that is
+phosphor. Following the desktop is the explicit value `system` rather than the
+absence of a value. So the old look is one line — `CB_THEME=dark`,
+`CB_THEME=light` or `CB_THEME=system` in the settings file, or the Theme
+drop-down on `cb:settings`, which re-colours the window and the `cb:` pages
+without a restart.
+
+The theme covers the GTK chrome, the `cb:` pages and the Claude panel from one
+palette, and colour is spent on two separate axes: **`accent`** is *chrome*
+state (focus, the active tab, load progress) and **`agent`** is *Claude* state
+(the AI buttons, "Claude is driving this tab"). They are the same coral in
+dark and light, and deliberately different in phosphor — cyan for the chrome,
+amber for Claude — because the cursor Claude moves across a page is drawn into
+the page and cannot be re-themed, so the one signal that must never be missed
+keeps its own ink.
+
+### Settings
+
+`cb:settings` (menu → Machine → Settings) lists all 19 `CB_*` settings, grouped
+as *Appearance*, *Privacy*, *Performance*, *Claude* and *Control API*, each with
+what it does and — the part a settings page usually gets wrong — a label saying
+whether a change **applies now**, on the **next page load**, or only **after a
+restart**. `CB_HOME` is read once at import; `CB_PERSONA` is re-read on every
+use; saying "restart to apply" over all of them would be wrong in both
+directions at once. Every value is validated in Python before it is written, by
+the same table the HTTP route and the CLI use, because `CB_PORT` and
+`CB_MAX_TABS` are `int()`-ed at startup and a settings page that can write
+`CB_PORT=banana` is a settings page that can stop the next launch. Each row that
+has a line in the file also gets a **Default** button, which removes the line
+rather than writing the default back.
+
+Your API key is *not* editable here — it lives in the same file, and a setter
+that could write it would be a route from an API call to your credential.
+
+The same thing from a shell:
+
+```bash
+./cbctl settings                        # every setting, its value and where it came from
+./cbctl settings CB_THEME dark          # change one
+./cbctl settings CB_THEME --reset       # drop the line, back to the built-in default
+```
+
+Every reply carries the full table back, so a write shows you the state it
+landed in, along with a note about when it takes effect. Naming a key with no
+value is a *write* of the empty value, not a read of that key — read them all
+and pick the row out.
+
+It is deliberately **not** an MCP tool, for a stronger version of the reason
+`clear` and `persona` are not: these are your preferences about your own
+browser, several of them decide what is sent to Anthropic and what is stripped
+first, and one of them is the token guarding the control API. An agent driving
+the browser has no business rewriting the rules it is being driven under. (A
+read never returns the token's value either — only whether one is set.)
 
 ### Private tabs
 
@@ -332,6 +423,7 @@ the first tool call and waits for it to come up (`CB_AUTOSTART=0` opts out).
 ./cbctl recall 'rate limit'                   # search pages already read
 ./cbctl console --pattern 'MyApp'             # console output + uncaught errors
 ./cbctl shot /tmp/page.png
+./cbctl settings                              # read them all; add KEY VALUE to change one
 ```
 
 `cbctl` exits non-zero when the browser reports a failure, so `cbctl click .go &&
@@ -393,7 +485,7 @@ curl -s 127.0.0.1:8765/open -d '{"url":"https://example.com"}'
 | `/console` `/screenshot` | GET | debug the page |
 | `/playbook/record` `/playbook/run` `/playbook/delete` | POST | record and replay a sequence |
 | `/playbook/list` | GET | what is saved |
-| `/persona` | POST | report or switch the panel's persona |
+| `/persona` `/settings` | POST | report or change the user's own preferences — neither is an MCP tool |
 
 Navigation routes block until the load finishes, so an agent can `open` then `text`
 without polling. Pass `wait=false` to return immediately. Every route takes an
@@ -528,18 +620,22 @@ ANTHROPIC_API_KEY=sk-ant-...
 CB_BLOCK=1
 ```
 
+Every one of them is editable from **`cb:settings`** or `cbctl settings` — the
+table below is what they mean; that page is where you change them.
+
 | Setting | |
 |---|---|
 | `CB_BLOCK` | `0` turns the ad/tracker blocker off for a session. |
 | `CB_COOKIES` | `nothird` (default), `all`, or `none`. Third-party cookies are rejected by default; the ones this drops are mostly attached to loads the blocker already refuses. |
 | `CB_ITP` | `0` turns off tracking prevention. |
-| `CB_LIGHT` | On by default: asks sites for a cheaper page. Sends `Save-Data: on` with every page the browser loads for you, and asks for reduced motion so pages skip animations. `0`/`off` (then restart) if a site serves you a stripped-down version you did not want. |
+| `CB_LIGHT` | On by default: asks sites for a cheaper page. Sends `Save-Data: on` with every page the browser loads for you, and asks for reduced motion so pages skip animations. `0`/`off` if a site serves you a stripped-down version you did not want; there is a switch for it on `cb:data`. The header follows on the next page load, but reduced motion cannot — WebKit reads that once, before the first tab exists, so that half waits for a restart. |
 | `CB_MAX_TABS` | The ceiling on tabs an *agent* may open, default 10. Never applies to you. |
 | `CB_MEM_LIMIT` | MB per web process before WebKit starts shedding caches, default 512. |
 | `CB_PERSONA` | How the Claude panel answers: `off` (default), `developer`, `researcher`, `critic`, `translator`. The panel's own selector writes this line. |
 | `CB_PACE` | How slowly the agent moves so you can follow it. `1` (default), `0`/`off` for no pauses, up to `5` to slow it down. |
 | `CB_SCRUB` | `0`/`off` sends page text to Claude exactly as it appears. On by default: email addresses, phone numbers, card and IBAN numbers, SSNs and account numbers are replaced with `[email]`, `[card]` and friends before anything leaves the machine, and the panel says how many of each it removed. |
-| `CB_HOME`, `CB_PORT`, `CB_TOKEN`, `CB_THEME`, `CB_GPU`, `CB_WEBGL` | as before. |
+| `CB_THEME` | `phosphor` (the default when nothing is set), `dark`, `light`, or `system` to follow the desktop. |
+| `CB_HOME`, `CB_SEARCH`, `CB_PORT`, `CB_TOKEN`, `CB_GPU`, `CB_WEBGL`, `CB_URL`, `CB_AUTOSTART` | as before. |
 
 Cookies, the disk cache and per-site storage live in
 `~/.local/share/claude-browser` and `~/.cache/claude-browser`, and **persist
@@ -600,7 +696,7 @@ session eats it. It is a fallback, not a foundation.
 | `CB_TOKEN` | require this bearer token on control requests |
 | `CB_HOME` | start page |
 | `CB_SEARCH` | search URL template, `%s` for the query |
-| `CB_THEME` | `dark` or `light`, overriding the system preference |
+| `CB_THEME` | `phosphor` (default), `dark`, `light`, or `system` to follow the desktop |
 | `CB_GPU=off` | software rendering — often faster on old integrated GPUs |
 
 `./cb --no-control` runs it as a plain browser with no API at all.
@@ -611,14 +707,16 @@ session eats it. It is a fallback, not a foundation.
 CB_AUTOSTART=0 python3 -m unittest discover -s tests
 ```
 
-542 tests, about 8 seconds, no display needed. `CB_AUTOSTART=0` matters:
+576 tests, about 9 seconds, no display needed. `CB_AUTOSTART=0` matters:
 `test_offline.py` runs `cbctl` and `cb-mcp` as real subprocesses, and those
 launch the browser on demand unless told not to.
 
 Nothing here needs a screen, a network, or your real `~/.config/claude-browser`.
-One file is the exception to "no GTK bindings": `test_light.py` builds a real
-`WebKitURIRequest` to check the client hints ride on it, because a stand-in
-could drift from the type WebKit actually gets handed.
+Two files use the real GTK/WebKit bindings anyway, because a stand-in could
+drift from the type the library actually gets handed: `test_light.py` builds a
+real `WebKitURIRequest` to check the client hints ride on it, and
+`test_style.py` runs every theme's sheet through a real `Gtk.CssProvider`. Both
+work headless — neither is a widget and neither touches the screen.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the
@@ -666,5 +764,24 @@ the agent moves is inert and unreadable as page content.
 `test_tabnames.py` covers tab labelling, which is mostly a question about
 collisions: same title on different hosts, same title on the same host, and a
 suffix that would only repeat the name.
+
+`test_style.py` and `test_pages_style.py` cover the themes: that every token
+exists in all three palettes, that text, rules and each of accent/agent/ok/warn
+clear their contrast floor on every surface they are painted on (computed, not
+eyeballed), that phosphor's texture is a static gradient with no animation and
+no keyframes, that the phosphor sheet is purely additive so dark and light come
+out exactly as they did before it existed, and — the reason the file exists — that the
+GTK sheet parses without a single error, since GTK3 drops what it cannot
+understand and says so only as a startup warning on stderr.
+
+`test_settings.py` covers the settings table: that every value it lets through
+is one the code reading that variable understands, that the values it refuses
+are refused with a sentence a person can act on, that "Default" removes the
+line rather than writing the default back, and that a setting's "when does this
+land" label matches what the code actually does with it.
+
+The suite is clean under `-W error::ResourceWarning`, which is worth keeping:
+that is what caught `store` and `pagetext` shutting their writer threads down
+without closing a single sqlite connection.
 
 The GTK layer itself is not covered; it needs a display.

@@ -2957,6 +2957,13 @@ class Browser(Gtk.Window):
 
         try:
             knob = settings.get(name)
+            # A key with neither a value nor --reset is a read of that one
+            # setting. Treating it as "set this to nothing" would make
+            # `cbctl settings CB_THEME` -- the obvious way to ask what the
+            # theme is -- silently blank the theme instead of answering.
+            if value is None and not reset:
+                return done({"ok": True,
+                             "setting": settings.describe_one(knob)})
             if reset:
                 settings.reset(name)
             else:

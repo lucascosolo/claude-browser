@@ -311,7 +311,8 @@ TEMPLATE = """\
 # The panel's own selector writes this line; setting it here works too.
 #CB_PERSONA=off
 
-# dark, light or phosphor (a near-black HUD), overriding the system preference.
+# dark, light, or phosphor -- the near-black HUD you get when this is unset.
+# "system" is the one that follows the desktop's own dark/light preference.
 #CB_THEME=
 
 # Force software rendering (off) or GPU compositing (on).
