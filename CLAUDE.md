@@ -24,6 +24,7 @@ claudebrowser/
   tabnames.py  tab labelling (GTK-free so it is testable)
   urls.py      omnibox intent: navigate or search (GTK-free)
   reader.py    reader mode: article extraction + reading typography (GTK-free)
+  pagetext.py  on-disk page-text cache + FTS5 `recall` search (GTK-free)
   passwords.py saved logins in the system keyring + the injected form script
   store.py pages.py panel_html.py style.py perf.py envfile.py
 tests/         unittest, no display needed
@@ -36,7 +37,7 @@ tests/         unittest, no display needed
 ./cbctl health                              # is it up
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 250 tests, ~25s, no display
+python3 -m unittest discover -s tests       # 291 tests, ~20s, no display
 CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
 ```
 
@@ -88,6 +89,23 @@ syntax gate.
   one persists nothing. Never call `WebKit2.WebContext.get_default()` —
   `WebView.new_with_user_content_manager()` does so internally, which is why
   `Tab` uses the property constructor instead.
+- **Reader mode overlays the page, it never rewrites it.** `reader.toggle()`
+  paints the extracted article into a fixed overlay and toggling off removes
+  that overlay and nothing else. Deleting half a single-page app's tree is a
+  one-way trip — reloading to undo it loses scroll, form state, and any load an
+  agent is waiting on. Scoring runs on the live tree, cleaning on a clone, so
+  pages with no article never pay for the copy.
+- **`store.recordable(url)` is the privacy boundary for everything written to
+  disk.** History and the page-text cache are written from the same point in
+  `Browser._record`, so a private tab or a `cb:` page is excluded from both by
+  one check. A new on-disk sink hangs off that same point or it is a leak.
+- **The page-text cache is keyed by content hash, not by URL.** `pagetext`
+  stores one body per hash with a row per URL pointing at it, so the canonical,
+  AMP and tracking-parameter spellings of an article cost one copy of the prose
+  and one search hit. Eviction is LRU over a byte cap (`MAX_BYTES`), not a row
+  count, and only drops a body once the last URL referencing it is gone.
+  Known gap: `clear()` and `forget()` exist and nothing calls them — the cache
+  is not yet wired into `cb:data` or the `clear` op.
 - Named exports of intent in comments: explain *why*, especially where a choice
   looks arbitrary but encodes a real constraint.
 
@@ -163,12 +181,55 @@ syntax gate.
 - **A `Gtk.Window` key handler sees keys before the focused widget does.** The
   find bar's own Escape binding never fires while `Browser._on_key` is
   connected, so Escape for the find bar is handled there, ahead of the panel's.
+- **FTS5 is compiled into most sqlite3 builds, not all of them.** `pagetext`
+  creates the virtual table inside a `try` and degrades to a plain text cache
+  when it cannot: `available` is False, `reason` says why, and `search()`
+  returns nothing. A browser that refuses to start over a search index it never
+  needed is a worse browser. The index is external-content (`content='bodies'`),
+  so it reads its text back out of the table instead of keeping a second copy —
+  which is also why the sync triggers live in SQL, where eviction cannot forget
+  to maintain them, and why a first run that *gains* FTS5 must `'rebuild'` or it
+  is silently blind to everything cached before the upgrade.
+- **Raw text is never an FTS5 MATCH expression.** A stray `"`, a bare `NEAR` or
+  an unbalanced paren raises instead of searching. `pagetext.match_query` quotes
+  every token, ANDs them, and prefixes only the last one with `*` for
+  search-as-you-type. Bypassing it turns user input into query syntax.
 - **Screenshotting the chrome needs a cropped root grab.** `xwd -name` matches
   the legacy `WM_NAME`, which GTK does not set (it sets `_NET_WM_NAME`), and
   `xwd -id` on the toplevel misses popovers because a GTK popover is its own X
   window at a different depth. Locate the window with `xwininfo -id`, then crop
   the region out of a root-window pixbuf. Present from *inside* the process
   before grabbing, or the window manager leaves whatever was focused on top.
+
+## Architectures already rejected
+
+Each of these was proposed for this project, examined, and refused on evidence.
+They are recorded so the next session does not spend a day re-deriving the same
+answer. Reopening one needs a new fact, not a new preference.
+
+- **Tauri + React/Next.js for the UI.** On Linux, Tauri's webview *is*
+  WebKitGTK — the same engine already embedded here. It would add a Rust
+  toolchain and a node build step and buy zero memory, because Tauri's RAM win
+  is measured against Electron, which this is not.
+- **A Python service framework (FastAPI + uvicorn + uvloop) for the control
+  API.** The traffic is a handful of loopback requests per session. Async
+  machinery and three pip dependencies buy nothing measurable against
+  `http.server` on a thread, and the no-pip rule is load-bearing: the install
+  instruction is one `apt` line.
+- **Embeddings, a vector store, and HNSW in WASM or Rust for search.** Replaced
+  by SQLite FTS5 (`pagetext.py`), which ships inside the sqlite3 already in the
+  standard library. An embedding model means a pip dependency and hundreds of
+  megabytes of weights in a browser whose premise is the standard library, to
+  rank a few thousand pages one person has actually read. BM25 over full text is
+  the honest answer at this scale.
+- **An opt-in VPS backend** — gateway, Redis, Postgres+pgvector or Qdrant, a
+  Playwright container, device pairing and JWTs. Remote infrastructure is a
+  separate project, and it contradicts the local-only posture the rest of this
+  browser is built on: the point is that the agent uses *your* session on *your*
+  machine.
+- **Canvas-grade UI toys** — an animated knowledge graph, a session time-lapse,
+  physics-y tab folders, a tray widget cycling summaries. They need a frontend
+  this GTK chrome does not have and would not gain cheaply.
 
 ## Conventions
 
