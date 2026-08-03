@@ -334,7 +334,7 @@ class TestApiRegistry(unittest.TestCase):
             "/tabs": {}, "/present": {}, "/open": {"url": "x.com"},
             "/navigate": {"url": "x.com"}, "/back": {}, "/forward": {}, "/reload": {},
             "/close": {}, "/wait": {}, "/text": {}, "/markdown": {}, "/links": {},
-            "/html": {}, "/find": {"q": "a"}, "/click": {"selector": "a"},
+            "/html": {}, "/reader": {}, "/find": {"q": "a"}, "/click": {"selector": "a"},
             "/fill": {"selector": "a", "value": "b"}, "/eval": {"js": "1"},
             "/console": {}, "/screenshot": {},
             "/machine": {}, "/discard": {}, "/storage": {}, "/clear": {},

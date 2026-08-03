@@ -204,6 +204,16 @@ OPS = [
        "you need the markup.",
        call=_js("HTML")),
 
+    # Reader mode is a *display* change, not a read: it answers with a summary
+    # of what it found, not the article. An agent that wants the prose still
+    # calls text or markdown, which read the overlay like any other DOM.
+    Op("reader", "/reader", "POST", "Toggle reader mode on the tab: strip the "
+       "page to its article and re-render it for reading. Reports the resulting "
+       "state.",
+       params=[Param("font", "integer", "Body text size in px (12-34).", cli="opt"),
+               Param("width", "integer", "Line measure in px (360-1100).", cli="opt")],
+       call=lambda c, a: ("api_reader", (_tab(a), a.get("font"), a.get("width")))),
+
     Op("find", "/find", "GET", "Search the rendered page text for a regex and "
        "return matches with context.",
        params=[Param("q", required=True, help="Regex to search for.")],

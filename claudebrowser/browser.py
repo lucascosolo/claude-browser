@@ -20,7 +20,7 @@ gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (agent, ai, auth, extract, findbar, pages, panel_html, passwords,  # noqa: E402
-               perf, resources, storage, store, style, tabnames)
+               perf, reader, resources, storage, store, style, tabnames)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -736,6 +736,11 @@ class Browser(Gtk.Window):
             ("g", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
                 lambda: self.findbar.step(-1),
             ("d", Gdk.ModifierType.CONTROL_MASK): self.toggle_bookmark,
+            # Firefox's binding for reader view. Ctrl+Shift+R is already the
+            # research panel here, so the Alt variant is the free one that
+            # anyone's fingers already know.
+            ("r", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK):
+                self.toggle_reader,
             ("h", Gdk.ModifierType.CONTROL_MASK):
                 lambda: self._open_internal("cb:history"),
             ("o", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
@@ -2341,6 +2346,41 @@ class Browser(Gtk.Window):
             done({"ok": True, "count": len(entries), "entries": entries})
 
         self.api_eval(tab_id, READ_CONSOLE, filter_entries)
+
+    def api_reader(self, tab_id, font_px, width_px, done):
+        """Toggle reader mode and report the state it ended in.
+
+        Undecorated for the same reason api_console is: the tab is resolved by
+        api_eval, and resolving it twice would light the "Claude is driving"
+        indicator twice for one operation.
+        """
+        def summarize(payload):
+            if not payload.get("ok"):
+                return done(payload)
+            result = payload.get("result") or {}
+            if not isinstance(result, dict):
+                return done({"ok": False, "error": "reader script returned no state"})
+            state = dict(result)
+            if state.get("words"):
+                state["minutes"] = reader.minutes(state["words"])
+            done(state)
+
+        self.api_eval(tab_id, reader.toggle(font_px, width_px), summarize)
+
+    def toggle_reader(self):
+        """Ctrl+Alt+R, the binding Firefox uses for the same thing."""
+        def announce(state):
+            if not state.get("ok"):
+                return self._flash(state.get("error") or "Reader mode unavailable")
+            if state.get("reader"):
+                minutes = state.get("minutes")
+                self._flash("Reader · %d words%s"
+                            % (state.get("words", 0),
+                               " · %d min" % minutes if minutes else ""))
+            else:
+                self._flash("Reader off")
+
+        self.api_reader(None, None, None, announce)
 
     @needs_tab
     def api_screenshot(self, tab, path, done):

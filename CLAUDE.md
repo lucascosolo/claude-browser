@@ -23,6 +23,7 @@ claudebrowser/
   findbar.py   Ctrl+F, driving WebKit's per-view FindController
   tabnames.py  tab labelling (GTK-free so it is testable)
   urls.py      omnibox intent: navigate or search (GTK-free)
+  reader.py    reader mode: article extraction + reading typography (GTK-free)
   passwords.py saved logins in the system keyring + the injected form script
   store.py pages.py panel_html.py style.py perf.py envfile.py
 tests/         unittest, no display needed
@@ -35,7 +36,7 @@ tests/         unittest, no display needed
 ./cbctl health                              # is it up
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 231 tests, ~27s, no display
+python3 -m unittest discover -s tests       # 250 tests, ~25s, no display
 CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
 ```
 
