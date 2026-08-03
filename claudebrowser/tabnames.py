@@ -23,6 +23,18 @@ INTERNAL = {"home": "Start", "deck": "Deck", "bookmarks": "Bookmarks",
 
 MAX_SUFFIX = 20
 
+#: Longest standing summary kept for a discarded tab. Long enough to say what
+#: the page was about, short enough to sit in a tooltip and to be repeated once
+#: per tab in a `tabs` listing an agent reads.
+SUMMARY_CHARS = 180
+
+#: A line shorter than this is furniture -- a nav item, a byline, a cookie
+#: banner button -- not the start of the prose. Picking the first *paragraph*
+#: sized line is what keeps the lead extract from reading "Skip to content".
+MIN_LEAD_CHARS = 40
+
+DISCARD_NOTE = "Discarded to free memory — click to reload"
+
 
 def host_of(url):
     try:
@@ -58,6 +70,62 @@ def base_name(url, title="", loading=False):
     if loading:
         return "Loading…"
     return "New tab"
+
+
+def clamp(text, limit=SUMMARY_CHARS):
+    """Collapse whitespace and cut to `limit` characters at a word boundary.
+
+    The ellipsis is counted *inside* the limit: a caller sizing a tooltip means
+    the whole string it will have to render, not the string plus one more
+    character. The word boundary is only used when it does not throw away more
+    than half of what was asked for -- a single very long token would otherwise
+    clamp to nothing at all.
+    """
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return "…"[:max(0, limit)]
+    cut = text[:limit - 1]
+    space = cut.rfind(" ")
+    if space >= limit // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:.-—") + "…"
+
+
+def lead_extract(text, limit=SUMMARY_CHARS):
+    """The opening prose of a page, as a one-line standing summary.
+
+    Deliberately not a model call. This is produced on the discard path, which
+    runs *because* the machine is short of memory; a paid network round trip
+    there, for a tab the user may never come back to, would be the wrong answer
+    on exactly the machine that can least afford it. A lead extract is free and
+    honest about being the start of the page rather than a reading of all of it.
+
+    Returns "" when there is nothing cached, which is the ordinary case for a
+    page that never finished loading or was never recordable.
+    """
+    if not text:
+        return ""
+    for line in text.splitlines():
+        line = " ".join(line.split())
+        if len(line) >= MIN_LEAD_CHARS:
+            return clamp(line, limit)
+    # No paragraph-length line anywhere: a link list, a stub, or text extracted
+    # as one short line per element. Its words still say more than nothing, so
+    # run them together rather than reporting an empty summary.
+    return clamp(text, limit)
+
+
+def tab_tooltip(url, discarded=False, summary=""):
+    """The tooltip for one tab: where it is, what it held, and why it is dim."""
+    lines = [url or ""]
+    if discarded:
+        summary = " ".join((summary or "").split())
+        if summary:
+            lines.append(summary)
+        lines.append(DISCARD_NOTE)
+    return "\n".join(line for line in lines if line)
 
 
 def label_tabs(tabs):

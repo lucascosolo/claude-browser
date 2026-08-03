@@ -18,7 +18,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from claudebrowser import ai, extract  # noqa: E402
-from claudebrowser.urls import looks_like_url, normalize  # noqa: E402
+from claudebrowser.urls import (HostWarmer, looks_like_url,  # noqa: E402
+                                normalize, prefetch_host)
 
 
 class TestUrlIntent(unittest.TestCase):
@@ -46,6 +47,67 @@ class TestUrlIntent(unittest.TestCase):
 
     def test_empty_input_is_harmless(self):
         self.assertEqual(normalize("   "), "about:blank")
+
+
+class TestPrefetchHost(unittest.TestCase):
+    """DNS preconnect must agree with the navigate-vs-search decision. Warming
+    a name for something that is about to be a search query is a lookup for a
+    host nobody visits -- and, on a shared resolver, a leak of what was typed."""
+
+    def test_navigable_hosts_are_extracted(self):
+        cases = {
+            "example.com": "example.com",
+            "https://example.com/a/b?c=d#e": "example.com",
+            "http://sub.domain.co.uk:8443/x": "sub.domain.co.uk",
+            "EXAMPLE.COM/Path": "example.com",
+            "https://user:pw@example.com/x": "example.com",
+            "  example.com  ": "example.com",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(prefetch_host(text), expected, text)
+
+    def test_search_queries_are_never_prefetched(self):
+        for text in ["webkit gtk python", "what is a typelib", "rust", "",
+                     "install gir1.2-webkit2-4.1", "   "]:
+            self.assertIsNone(prefetch_host(text), text)
+
+    def test_nothing_with_a_name_to_resolve_is_prefetched(self):
+        # Internal pages, the filesystem, inline data, literal addresses and
+        # loopback all resolve nothing; a lookup for them is pure waste.
+        for text in ["cb:home", "about:blank", "file:///tmp/a.html",
+                     "data:text/html,hi", "localhost:5173",
+                     "127.0.0.1:8788/api/health", "[::1]:8080/x",
+                     "ftp://files.example.com/x"]:
+            self.assertIsNone(prefetch_host(text), text)
+
+
+class TestHostWarmer(unittest.TestCase):
+    def setUp(self):
+        self.warmed = []
+        self.warmer = HostWarmer(self.warmed.append)
+
+    def test_a_host_is_warmed_once_however_often_it_is_typed(self):
+        for text in ["example.com", "example.com/a", "https://example.com/b",
+                     "example.com"]:
+            self.warmer.consider(text)
+        self.assertEqual(self.warmed, ["example.com"])
+
+    def test_distinct_hosts_each_get_one_lookup(self):
+        self.warmer.consider("example.com")
+        self.warmer.consider("other.example.org/x")
+        self.assertEqual(self.warmed, ["example.com", "other.example.org"])
+
+    def test_a_search_query_warms_nothing(self):
+        self.assertIsNone(self.warmer.consider("how do i center a div"))
+        self.assertEqual(self.warmed, [])
+
+    def test_the_seen_set_is_bounded(self):
+        """A window open for days must not accumulate every host ever typed."""
+        warmer = HostWarmer(self.warmed.append, limit=3)
+        for i in range(7):
+            warmer.consider("host%d.example" % i)
+        self.assertEqual(len(self.warmed), 7)
+        self.assertLessEqual(len(warmer._seen), 3)
 
 
 class TestJsConstruction(unittest.TestCase):
@@ -334,10 +396,14 @@ class TestApiRegistry(unittest.TestCase):
             "/tabs": {}, "/present": {}, "/open": {"url": "x.com"},
             "/navigate": {"url": "x.com"}, "/back": {}, "/forward": {}, "/reload": {},
             "/close": {}, "/wait": {}, "/text": {}, "/markdown": {}, "/links": {},
-            "/html": {}, "/find": {"q": "a"}, "/click": {"selector": "a"},
+            "/html": {}, "/reader": {}, "/find": {"q": "a"}, "/click": {"selector": "a"},
             "/fill": {"selector": "a", "value": "b"}, "/eval": {"js": "1"},
-            "/console": {}, "/screenshot": {},
-            "/machine": {}, "/discard": {}, "/storage": {}, "/clear": {},
+            "/console": {}, "/screenshot": {}, "/recall": {"q": "a"},
+            "/machine": {}, "/discard": {}, "/storage": {},
+            "/clear": {"kind": "pagetext"},
+            "/playbook/record": {"action": "status"}, "/playbook/list": {},
+            "/playbook/run": {"name": "login"}, "/playbook/delete": {"name": "login"},
+            "/persona": {},
         }
         # /health is served without touching the browser, so it has no builder.
         callable_routes = {op.route for op in self.api.OPS if op.call}
@@ -347,6 +413,16 @@ class TestApiRegistry(unittest.TestCase):
             method, call_args = self.dispatch(route, args)
             self.assertTrue(method.startswith("api_"), route)
             self.assertIsInstance(call_args, tuple, route)
+
+    def test_clear_carries_its_kind_through_and_documents_pagetext(self):
+        """The page-text cache is the most personal thing on disk, so it is
+        clearable from the same op as the cookies -- and api.py is the only
+        place that says so."""
+        self.assertEqual(self.dispatch("/clear", {"kind": "pagetext"})[1],
+                         ("pagetext",))
+        self.assertEqual(self.dispatch("/clear", {})[1], ("cache",))
+        kind = next(p for p in self.api.BY_NAME["clear"].params if p.name == "kind")
+        self.assertIn("pagetext", kind.help)
 
     def test_health_needs_no_browser(self):
         self.assertIsNone(self.api.BY_NAME["health"].call)

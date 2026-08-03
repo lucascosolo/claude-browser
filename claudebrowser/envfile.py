@@ -106,6 +106,66 @@ def setting(name, default=None, path=None, environ=None):
     return environ.get(name) or default
 
 
+def put(key, value, path=None, environ=None):
+    """Write one setting into the file, leaving everything else as it was.
+
+    The file is the user's -- comments, ordering and the commented-out examples
+    from the template are all things they may have edited -- so this is a
+    surgical rewrite rather than a dump of a parsed dict: the first uncommented
+    assignment of `key` is replaced in place, and if there is none, one line is
+    appended. A commented `#CB_PERSONA=` example is deliberately left alone, so
+    the documentation of what the key means survives being set.
+
+    Secrets are refused. Nothing in this browser should ever be able to write
+    the API key from a UI control or an API call: the key goes into this file by
+    the user's own hand, and a setter here would be a way for a page-driven
+    operation to overwrite it.
+    """
+    if key in SECRET_KEYS:
+        raise ValueError("%s is not settable from inside the browser" % key)
+    if "\n" in str(value) or "\n" in key:
+        raise ValueError("a setting is one line")
+
+    path = Path(path) if path else config_path()
+    environ = os.environ if environ is None else environ
+    try:
+        existing = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        existing = []
+
+    line = "%s=%s" % (key, value)
+    out, written = [], False
+    for raw in existing:
+        stripped = raw.strip()
+        candidate = (stripped[len("export "):].lstrip()
+                     if stripped.startswith("export ") else stripped)
+        name, sep, _rest = candidate.partition("=")
+        if sep and not stripped.startswith("#") and name.strip() == key:
+            if not written:
+                out.append(line)
+                written = True
+            continue           # a duplicate assignment collapses into the one
+        out.append(raw)
+    if not written:
+        out.append(line)
+
+    # Replaced atomically: a half-written settings file is one that parses to
+    # fewer settings than it had, which reads as the browser forgetting them.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    try:
+        tmp.chmod(0o600)       # it may come to hold the API key
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+    # Keep the process in step, for the module-level constants that read
+    # os.environ once at import. values() is uncached, so this is belt only.
+    environ[key] = str(value)
+    return path
+
+
 def load(path=None, environ=None, warn=None):
     """Apply the config file to `environ`, overriding what is already set.
 
@@ -173,6 +233,11 @@ TEMPLATE = """\
 # Ad/tracker blocking. On by default; set to 0 if a site misbehaves.
 #CB_BLOCK=1
 
+# Ask sites for a lighter page: sends Save-Data: on with each page this browser
+# loads, and asks for reduced motion. On by default; set to 0 and restart if a
+# site serves you a degraded page you did not want.
+#CB_LIGHT=1
+
 # Start page and search engine (%s is the query).
 #CB_HOME=about:blank
 #CB_SEARCH=https://duckduckgo.com/?q=%s
@@ -180,6 +245,10 @@ TEMPLATE = """\
 # Agent control API.
 #CB_PORT=8765
 #CB_TOKEN=
+
+# How the Claude panel answers: off, developer, researcher, critic, translator.
+# The panel's own selector writes this line; setting it here works too.
+#CB_PERSONA=off
 
 # dark or light, overriding the system preference.
 #CB_THEME=

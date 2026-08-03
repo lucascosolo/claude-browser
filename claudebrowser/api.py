@@ -135,7 +135,8 @@ OPS = [
        call=None, tab=False, mcp=False),
 
     Op("tabs", "/tabs", "GET", "List the browser's open tabs with their ids, "
-       "URLs and titles.",
+       "URLs and titles. A tab dropped to free memory is marked discarded and "
+       "carries a short summary of what it held.",
        call=lambda c, a: ("api_tabs", ()), tab=False),
 
     # Not an MCP tool: raising a window is a launcher's job, and an agent that
@@ -204,6 +205,16 @@ OPS = [
        "you need the markup.",
        call=_js("HTML")),
 
+    # Reader mode is a *display* change, not a read: it answers with a summary
+    # of what it found, not the article. An agent that wants the prose still
+    # calls text or markdown, which read the overlay like any other DOM.
+    Op("reader", "/reader", "POST", "Toggle reader mode on the tab: strip the "
+       "page to its article and re-render it for reading. Reports the resulting "
+       "state.",
+       params=[Param("font", "integer", "Body text size in px (12-34).", cli="opt"),
+               Param("width", "integer", "Line measure in px (360-1100).", cli="opt")],
+       call=lambda c, a: ("api_reader", (_tab(a), a.get("font"), a.get("width")))),
+
     Op("find", "/find", "GET", "Search the rendered page text for a regex and "
        "return matches with context.",
        params=[Param("q", required=True, help="Regex to search for.")],
@@ -236,10 +247,22 @@ OPS = [
        call=lambda c, a: ("api_storage", ()), tab=False),
 
     Op("clear", "/clear", "POST", "Delete stored browsing data.",
-       params=[Param("kind", help="cache, cookies, storage, or all.",
+       params=[Param("kind", help="cache, cookies, storage, pagetext, or all.",
                      cli="optarg")],
        call=lambda c, a: ("api_clear", (a.get("kind") or "cache",)),
        tab=False, mcp=False, timeout=90),
+
+    # Search over what has already been read. Not a web search: it only sees
+    # pages this browser loaded, which is exactly why it is useful -- "the page
+    # about X I had open yesterday" is a question no search engine can answer.
+    Op("recall", "/recall", "GET", "Search the full text of pages already visited "
+       "in this browser and return ranked matches with snippets. Use this to find "
+       "a page seen earlier instead of re-opening tabs to look for it.",
+       params=[Param("q", required=True, help="Words to look for."),
+               Param("limit", "integer", "Maximum matches (default 10).",
+                     cli="opt")],
+       call=lambda c, a: ("api_recall", (a["q"], a.get("limit"))),
+       tab=False),
 
     Op("screenshot", "/screenshot", "GET", "Save a PNG of the visible viewport to a "
        "path on disk.",
@@ -247,6 +270,52 @@ OPS = [
                      cli="optarg")],
        call=lambda c, a: ("api_screenshot", (_tab(a), a.get("path"))),
        timeout=60),
+
+    # Playbooks: a saved, ordered list of the operations above. Nothing new is
+    # described here -- a playbook's steps are entries from this same table,
+    # which is why recording needs no per-op support and replay needs no
+    # interpreter. See playbooks.py.
+    Op("playbook-record", "/playbook/record", "POST",
+       "Start or stop recording the operations you perform into a named "
+       "playbook. Credential fields are never captured.",
+       params=[Param("action", required=True,
+                     help="start, stop, cancel or status."),
+               Param("name", cli="optarg",
+                     help="Playbook name; required for start.")],
+       call=lambda c, a: ("api_playbook_record", (a["action"], a.get("name"))),
+       tab=False),
+
+    Op("playbook-list", "/playbook/list", "GET",
+       "List saved playbooks with their step counts, and say whether a "
+       "recording is in progress.",
+       call=lambda c, a: ("api_playbook_list", ()), tab=False),
+
+    # Generous timeout: a playbook is several operations in series, and any of
+    # them may be a page load that queues behind others (see Browser._admit).
+    Op("playbook-run", "/playbook/run", "POST",
+       "Replay a saved playbook against the live browser, one step at a time.",
+       params=[Param("name", required=True, help="Playbook to replay.")],
+       call=lambda c, a: ("api_playbook_run", (a["name"],)),
+       tab=False, timeout=600),
+
+    # Not an MCP tool, for the same reason `clear` is not: deleting something
+    # the user recorded is not a step an agent should take in pursuit of some
+    # other goal.
+    Op("playbook-delete", "/playbook/delete", "POST", "Delete a saved playbook.",
+       params=[Param("name", required=True, help="Playbook to delete.")],
+       call=lambda c, a: ("api_playbook_delete", (a["name"],)),
+       tab=False, mcp=False),
+
+    # Not an MCP tool: the persona is the user's own preference about how the
+    # panel answers *them*, it is written to their settings file, and an agent
+    # driving the browser has no answer of its own coming out of that panel.
+    Op("persona", "/persona", "POST",
+       "Report the Claude panel's persona, or switch to another one.",
+       params=[Param("name", cli="optarg",
+                     help="off, developer, researcher, critic or translator; "
+                          "omit to report the current one.")],
+       call=lambda c, a: ("api_persona", (a.get("name"),)),
+       tab=False, mcp=False),
 ]
 
 BY_NAME = {op.name: op for op in OPS}

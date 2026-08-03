@@ -2,22 +2,51 @@
 
 No SDK, on purpose: this browser is meant to run on a machine with no pip, and
 the whole point is that `./cb` works against a bare Debian install. The tradeoff
-is that we own the SSE parsing and the retry policy below.
+is that we own the SSE parsing, the retry policy, and -- since the switch off
+urllib -- the connection pool below.
 
 One request path (`_open`) with retries, and everything else built on it.
+
+**Why not urllib.** `urlopen` opens a fresh TLS connection for every call and
+throws it away, so a full handshake was being paid for every panel question,
+every TL;DR, and every single step of the agent loop -- a round trip that is
+pure latency on a conversation that is otherwise one long exchange with one
+host. `http.client` lets the socket be kept, at the cost of owning the two
+hazards that come with keep-alive: a connection that went stale while idle, and
+a response body that was not finished before the socket was handed to someone
+else. `_Pool` and `_Response` exist for exactly those two.
 """
 
+import http.client
 import json
 import os
 import random
+import socket
+import ssl
+import threading
 import time
-import urllib.error
+import urllib.parse
 import urllib.request
 
-from . import auth
+from . import auth, personas, scrub
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
+
+_SPLIT = urllib.parse.urlsplit(API_URL)
+API_HOST = _SPLIT.hostname
+API_PORT = _SPLIT.port or 443
+API_PATH = _SPLIT.path
+
+# How long a connection may sit unused before we stop trusting it. Servers and
+# the load balancers in front of them close idle keep-alive sockets on their own
+# schedule and never tell the client, so this is a guess -- the real defence is
+# the stale retry in `_request`, which catches the cases this misses (a laptop
+# suspended mid-idle, for one: CLOCK_MONOTONIC does not tick while suspended,
+# so a connection that is hours dead can still look seconds young).
+IDLE_TIMEOUT = 50.0
+# Two is plenty: the agent worker and the UI are the only concurrent callers.
+MAX_IDLE = 2
 
 MODEL = "claude-opus-5"
 MAX_TOKENS = 64000
@@ -66,6 +95,9 @@ class ApiError(Exception):
     """A request failed in a way retrying did not fix."""
 
     auth_failure = False
+    # Set when the request was fully delivered before the failure, so no layer
+    # above may send it again. See `_Delivered`.
+    delivered = False
 
 
 def api_key():
@@ -74,6 +106,303 @@ def api_key():
     if not key:
         raise NoKey(auth._explain(auth.preference()))
     return key
+
+
+# -- keep-alive transport ---------------------------------------------------
+
+def _shut(conn):
+    """Close a connection and never let that be the thing that fails."""
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _ssl_context():
+    global _SSL
+    if _SSL is None:
+        # Built once: create_default_context() parses the system CA bundle, and
+        # doing that per request is most of what we just saved.
+        _SSL = ssl.create_default_context()
+    return _SSL
+
+
+_SSL = None
+
+
+def _proxy_for(host):
+    """(host, port) of the HTTPS proxy to tunnel through, or None.
+
+    urllib honoured `https_proxy` for free; going to http.client means honouring
+    it by hand or silently breaking every machine behind one.
+    """
+    try:
+        proxy = urllib.request.getproxies().get("https")
+        if not proxy or urllib.request.proxy_bypass(host):
+            return None
+        parts = urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy)
+        if not parts.hostname:
+            return None
+        return parts.hostname, parts.port or 8080
+    except Exception:
+        return None  # a proxy we cannot parse is not worth failing the request over
+
+
+def _new_connection(timeout):
+    proxy = _proxy_for(API_HOST)
+    if proxy:
+        # HTTPSConnection sends CONNECT in the clear and *then* wraps TLS, so
+        # the certificate is still checked against the real host, not the proxy.
+        conn = http.client.HTTPSConnection(proxy[0], proxy[1], timeout=timeout,
+                                           context=_ssl_context())
+        conn.set_tunnel(API_HOST, API_PORT)
+        return conn
+    return http.client.HTTPSConnection(API_HOST, API_PORT, timeout=timeout,
+                                       context=_ssl_context())
+
+
+class _Pool:
+    """A tiny free-list of live connections to one host.
+
+    **Why a pool and not one connection per thread.** Calls arrive from the
+    agent's worker thread and from the UI, and a streaming response holds its
+    connection for as long as the answer takes to arrive -- tens of seconds. A
+    single shared connection under a lock would therefore serialize a tool_turn
+    behind a panel that is still streaming, which is worse than the handshake we
+    set out to remove. Thread-locals would avoid that but leak a socket per
+    agent run, because `Browser.run_agent` starts a fresh thread each time. A
+    checked-out free list gives exclusive use without either problem: the lock
+    is held only for the list operations, never across the network.
+    """
+
+    def __init__(self, connect=_new_connection, max_idle=MAX_IDLE,
+                 idle_timeout=IDLE_TIMEOUT, clock=time.monotonic):
+        self._connect = connect
+        self._max_idle = max_idle
+        self._idle_timeout = idle_timeout
+        self._clock = clock
+        self._idle = []          # (connection, parked_at), oldest first
+        self._lock = threading.Lock()
+
+    def take(self, timeout, fresh=False):
+        """Check out a connection. Returns (connection, was_reused).
+
+        Every connection handed out here must come back through `give_back` or
+        `discard`, or it is a leaked socket.
+        """
+        while not fresh:
+            with self._lock:
+                if not self._idle:
+                    break
+                conn, parked = self._idle.pop()   # newest first: most likely alive
+            if self._clock() - parked <= self._idle_timeout:
+                return conn, True
+            _shut(conn)
+        return self._connect(timeout), False
+
+    def give_back(self, conn):
+        """Return a connection whose response was fully consumed."""
+        evicted = []
+        with self._lock:
+            self._idle.append((conn, self._clock()))
+            while len(self._idle) > self._max_idle:
+                evicted.append(self._idle.pop(0))
+        for old, _parked in evicted:
+            _shut(old)
+
+    def discard(self, conn):
+        _shut(conn)
+
+    def close_all(self):
+        with self._lock:
+            idle, self._idle = self._idle, []
+        for conn, _parked in idle:
+            _shut(conn)
+
+    def idle_count(self):
+        with self._lock:
+            return len(self._idle)
+
+
+_POOL = _Pool()
+
+
+class _Response:
+    """A response that owns its connection until the body is gone.
+
+    The connection is only recycled if the body was read to the end. A response
+    abandoned half-read leaves unsent-for bytes sitting in the socket, and the
+    *next* request on that socket parses them as its own reply -- the classic
+    keep-alive corruption, and the reason `close()` discards by default and
+    recycles only on proof of a clean finish.
+    """
+
+    def __init__(self, raw, conn, pool):
+        self._raw = raw
+        self._conn = conn
+        self._pool = pool
+        self._drained = False
+        self._released = False
+        self.status = raw.status
+        self.headers = raw.headers
+
+    def read(self, amt=None):
+        data = self._raw.read(amt)
+        if amt is None:
+            self._drained = True
+        return data
+
+    def __iter__(self):
+        for line in self._raw:
+            yield line
+        # Only reaching EOF proves the body ended where its framing said it
+        # would. A caller that breaks out of this loop leaves _drained False,
+        # and the connection is dropped rather than poisoning the next request.
+        self._drained = True
+
+    def close(self):
+        if self._released:
+            return
+        self._released = True
+        # `will_close` is the server saying "Connection: close", or HTTP/1.0,
+        # or a body with no length -- reuse is not ours to decide there.
+        reusable = self._drained and not self._raw.will_close
+        try:
+            self._raw.close()
+        except Exception:
+            reusable = False
+        if reusable:
+            self._pool.give_back(self._conn)
+        else:
+            self._pool.discard(self._conn)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        self.close()
+        return False
+
+    def __del__(self):
+        # A response nobody closed would otherwise strand its socket forever.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+# Ways a kept-alive socket announces that the far end hung up while we were not
+# looking. RemoteDisconnected is the common one; BadStatusLine is the same event
+# seen a moment later, when the close arrives where a status line should be.
+_STALE_ERRORS = (
+    http.client.RemoteDisconnected,
+    http.client.BadStatusLine,
+    http.client.ImproperConnectionState,   # CannotSendRequest et al
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+)
+
+
+class _Delivered(OSError, http.client.HTTPException):
+    """The request was fully sent, and *then* the connection died.
+
+    This is the phase that must never be retried, at any layer. The whole body
+    already reached Anthropic, which may have received, run and **billed** the
+    inference before the socket broke -- so a second attempt buys a second paid
+    call and no better chance of an answer. The write phase raises the *same*
+    exception types (a keep-alive socket closed while idle looks identical), so
+    the type cannot carry this distinction and a separate class has to.
+
+    It inherits from both OSError and HTTPException so it still satisfies every
+    `except` clause the old flat failure did: any caller that does not know
+    about the distinction degrades to the previous behaviour rather than
+    letting an unhandled exception escape.
+    """
+
+    def __init__(self, cause):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+def _is_stale(exc, reused):
+    """Did a *reused* connection die before the server could answer?
+
+    `reused` is the whole point. The identical exception on a freshly opened
+    socket is a real network failure -- the host is unreachable, TLS was refused
+    -- and opening one more socket to hear it again only delays the message the
+    user needs. A timeout is excluded for a different reason: the server may
+    well still be working on the request, so a second copy is a second bill.
+
+    Phase is *not* checked here: `_request` raises `_Delivered` before it ever
+    consults this function, so by construction only pre-send failures reach it.
+    """
+    if not reused:
+        return False
+    if isinstance(exc, socket.timeout):
+        return False
+    return isinstance(exc, _STALE_ERRORS)
+
+
+def _send(conn, body, headers, pool, sent=None):
+    """POST and take the response.
+
+    `sent` is an optional one-element list used as an out-parameter recording
+    which phase we reached: it is set True once the request body is fully
+    written, so a caller catching an exception can tell a write-phase failure
+    (safe to retry) from a getresponse-phase one (not safe -- `_Delivered`).
+    """
+    conn.request("POST", API_PATH, body=body, headers=headers)
+    if sent is not None:
+        sent[0] = True
+    return _Response(conn.getresponse(), conn, pool)
+
+
+def _request(body, headers, timeout, pool=None):
+    """POST once over a pooled connection, retrying a stale socket exactly once.
+
+    Retrying is only sound here because *nothing of the response has been handed
+    to anyone yet* -- the retry sits between sending the request and returning
+    the response, so a stream that has already yielded text can never be
+    silently restarted -- and because it is scoped to failures that happened
+    before the body was fully written, where the server cannot have processed
+    anything.
+    """
+    pool = pool or _POOL
+    conn, reused = pool.take(timeout)
+    sent = [False]
+    try:
+        return _send(conn, body, headers, pool, sent)
+    except Exception as e:
+        pool.discard(conn)
+        # Phase first, and before any other judgement: once the body is out,
+        # no layer above may try again. Re-raising as _Delivered is what stops
+        # _open_with's backoff loop from doing exactly what this guard just
+        # prevented one level down.
+        if sent[0]:
+            raise _Delivered(e) from e
+        if not _is_stale(e, reused):
+            raise
+
+    conn, _reused = pool.take(timeout, fresh=True)
+    sent = [False]
+    try:
+        return _send(conn, body, headers, pool, sent)
+    except Exception as e:
+        pool.discard(conn)
+        if sent[0]:
+            raise _Delivered(e) from e
+        raise      # a fresh connection failing is a real failure; no third try
+
+
+def _error_body(resp):
+    """Read and release an error response. Its socket is still perfectly good."""
+    try:
+        return resp.read().decode("utf-8", "replace")[:800]
+    except Exception:
+        return ""
+    finally:
+        resp.close()
 
 
 def _open(payload, timeout=600, sleep=time.sleep):
@@ -97,6 +426,11 @@ def _open(payload, timeout=600, sleep=time.sleep):
             return _open_with(payload, credential, label, timeout, sleep,
                               retries=MAX_RETRIES if final else 0)
         except ApiError as e:
+            if e.delivered:
+                # Falling through to the next credential would re-send a
+                # request that may already have been billed on this one. The
+                # cheapest correct answer is to stop.
+                raise first or e
             if final:
                 # Report the *first* credential's failure, not the last. If the
                 # preferred credential is the one the user configured, that is
@@ -121,40 +455,58 @@ def _open_with(payload, credential, label, timeout, sleep, retries=MAX_RETRIES):
         headers["accept"] = "text/event-stream"
 
     for attempt in range(retries + 1):
-        req = urllib.request.Request(API_URL, data=body, headers=headers, method="POST")
         try:
-            response = urllib.request.urlopen(req, timeout=timeout)
-            LAST_CREDENTIAL = label
-            return response
-        except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", "replace")[:800]
-            detail, kind = _describe_error(e.code, raw, label)
-            if e.code in RETRY_STATUS and attempt < retries:
-                # Honour Retry-After when the server sends one; otherwise back
-                # off exponentially with jitter so several panels retrying at
-                # once do not sync up into a thundering herd.
-                after = e.headers.get("retry-after") if e.headers else None
-                try:
-                    delay = float(after)
-                except (TypeError, ValueError):
-                    delay = (2 ** attempt) + random.random()
-                sleep(min(delay, 30))
-                continue
-            error = ApiError(detail)
-            error.auth_failure = e.code in (401, 403)
-            error.status = e.code
-            error.kind = kind
+            response = _request(body, headers, timeout)
+        except _Delivered as e:
+            # Ordered before the two clauses below, both of which would
+            # otherwise catch this: the request reached Anthropic and may have
+            # been processed and billed, so the retry budget must not be spent
+            # on a duplicate. Fail now, and say why in terms the panel can show.
+            error = ApiError(
+                "[connection lost] The request reached Anthropic but the reply "
+                "never arrived (%s).\n\nIt was not retried automatically, "
+                "because the request may already have been processed and "
+                "charged for. Ask again if you want another attempt."
+                % (e.cause,))
+            error.delivered = True
             raise error
-        except urllib.error.URLError as e:
-            if attempt < retries:
-                sleep(min((2 ** attempt) + random.random(), 30))
-                continue
-            raise ApiError("[network error] %s" % (e.reason,))
-        except OSError as e:
+        except http.client.HTTPException as e:
             if attempt < retries:
                 sleep(min((2 ** attempt) + random.random(), 30))
                 continue
             raise ApiError("[connection error] %s" % (e,))
+        except OSError as e:
+            # Everything socket- and DNS-shaped lands here; urllib used to wrap
+            # it in URLError, which is itself an OSError, so the message the
+            # panel shows is unchanged.
+            if attempt < retries:
+                sleep(min((2 ** attempt) + random.random(), 30))
+                continue
+            raise ApiError("[network error] %s" % (getattr(e, "reason", None) or e,))
+
+        if 200 <= response.status < 300:
+            LAST_CREDENTIAL = label
+            return response
+
+        status = response.status
+        after = response.headers.get("retry-after") if response.headers else None
+        raw = _error_body(response)
+        detail, kind = _describe_error(status, raw, label)
+        if status in RETRY_STATUS and attempt < retries:
+            # Honour Retry-After when the server sends one; otherwise back
+            # off exponentially with jitter so several panels retrying at
+            # once do not sync up into a thundering herd.
+            try:
+                delay = float(after)
+            except (TypeError, ValueError):
+                delay = (2 ** attempt) + random.random()
+            sleep(min(delay, 30))
+            continue
+        error = ApiError(detail)
+        error.auth_failure = status in (401, 403)
+        error.status = status
+        error.kind = kind
+        raise error
     raise ApiError("[error] exhausted retries")
 
 
@@ -236,20 +588,52 @@ def _describe_error(status, raw, label):
 
 # -- one-shot text features -------------------------------------------------
 
-def _page_block(page, limit=120_000):
+def _redact(text, tally=None):
+    """Run the outbound scrubber over one piece of page text.
+
+    Every path that puts page content into a request goes through here, so
+    `CB_SCRUB` has one place to be honoured and the counts have one place to be
+    collected. `tally` is a dict the caller owns: it is updated in place because
+    the request is built inside a generator the UI does not otherwise get a
+    return value from, and the UI has to be able to say what was removed.
+    """
+    result = scrub.scrub(text)
+    if tally is not None:
+        for kind, n in result.counts.items():
+            tally[kind] = tally.get(kind, 0) + n
+    return result.text
+
+
+def _page_block(page, limit=120_000, tally=None):
+    # Truncate first, then scrub: scrubbing the tail we are about to throw away
+    # is wasted work on a 400KB page, and a placeholder is never longer than
+    # what it replaced so the budget still holds afterwards.
     body = page.get("text") or ""
     if len(body) > limit:
         body = body[:limit] + "\n\n[page truncated for length]"
+    # The URL is left alone on purpose: the model is asked to cite it back, and
+    # a redacted URL is one the user cannot click. The title is not -- a webmail
+    # tab puts the correspondent's address straight into it.
     return "<page url=%r title=%r>\n%s\n</page>" % (
-        page.get("url", ""), page.get("title", ""), body)
+        page.get("url", ""), _redact(page.get("title", ""), tally),
+        _redact(body, tally))
 
 
 def _stream(system, prompt):
-    """Shared streaming path. Yields text; never raises past NoKey."""
+    """Shared streaming path. Yields text; never raises past NoKey.
+
+    The active persona is composed in *here*, at the one point Ask, TL;DR and
+    Research all pass through, so a new text feature cannot forget it and no
+    caller can pass a system prompt the persona replaces: `personas.compose`
+    only ever appends to what it is given. The agent loop deliberately does not
+    come through here -- `agent.SYSTEM` is instructions for driving a browser
+    with tools, not an answering style, and layering "read this adversarially"
+    over it would change what the agent *does* rather than how it writes.
+    """
     payload = {
         "model": MODEL,
         "max_tokens": MAX_TOKENS,
-        "system": system,
+        "system": personas.compose(system),
         "stream": True,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -260,23 +644,32 @@ def _stream(system, prompt):
         with resp:
             for text in _sse_text(resp):
                 yield text
-    except (urllib.error.URLError, OSError) as e:
-        # The stream can die mid-flight; the user keeps whatever arrived.
+    except (OSError, http.client.HTTPException) as e:
+        # The stream can die mid-flight; the user keeps whatever arrived. This
+        # is also the one place a half-read body is expected: `with resp` has
+        # already run by the time we get here, so the connection was dropped
+        # rather than pooled.
         yield "\n[stream interrupted: %s]" % (e,)
 
 
-def ask(question, page, page_chars=120_000):
-    """Answer a question about one page."""
-    return _stream(SYSTEM, _page_block(page, page_chars) + "\n\n" + question)
+def ask(question, page, page_chars=120_000, tally=None):
+    """Answer a question about one page.
+
+    `tally` is an optional dict; personal data found in the page is counted into
+    it by category before the request is built, so the panel can say what left
+    the machine. It is filled by the time this returns -- the prompt is
+    assembled here, not lazily inside the generator.
+    """
+    return _stream(SYSTEM, _page_block(page, page_chars, tally) + "\n\n" + question)
 
 
-def summarize(page):
+def summarize(page, tally=None):
     """TL;DR for one page. Invoked by a button, never on load -- a request per
     page view would be both slow and expensive."""
-    return _stream(TLDR_SYSTEM, _page_block(page) + "\n\nSummarize this page.")
+    return _stream(TLDR_SYSTEM, _page_block(page, tally=tally) + "\n\nSummarize this page.")
 
 
-def synthesize(pages, question=None):
+def synthesize(pages, question=None, tally=None):
     """Read every open tab together and answer across them."""
     if not pages:
         def empty():
@@ -288,7 +681,8 @@ def synthesize(pages, question=None):
     per_page = max(4_000, 100_000 // max(len(pages), 1))
     body = "\n\n".join(
         "<page number=%d url=%r title=%r>\n%s\n</page>"
-        % (i + 1, p.get("url", ""), p.get("title", ""), (p.get("text") or "")[:per_page])
+        % (i + 1, p.get("url", ""), _redact(p.get("title", ""), tally),
+           _redact((p.get("text") or "")[:per_page], tally))
         for i, p in enumerate(pages)
     )
     return _stream(SYNTHESIS_SYSTEM, body + "\n\n" + (question or "Synthesize these pages."))
@@ -296,7 +690,37 @@ def synthesize(pages, question=None):
 
 # -- tool use ---------------------------------------------------------------
 
-def tool_turn(messages, tools, system, max_tokens=16000):
+def _scrubbed_messages(messages, tally=None):
+    """A copy of `messages` with page content redacted out of tool results.
+
+    The agent's page reads come back as `tool_result` blocks, which is the only
+    place in this conversation a web page's text appears -- the goal is the
+    user's own words and the assistant blocks (including thinking, which must be
+    echoed back byte-identical) are the model's. Rewriting anything else would
+    either edit what the user typed or invalidate a thinking signature, so the
+    walk is deliberately narrow and copies rather than mutating the caller's
+    list, which the agent loop keeps appending to across steps.
+    """
+    out = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+        blocks, changed = [], False
+        for block in content:
+            if (isinstance(block, dict) and block.get("type") == "tool_result"
+                    and isinstance(block.get("content"), str)):
+                text = _redact(block["content"], tally)
+                if text != block["content"]:
+                    changed = True
+                    block = dict(block, content=text)
+            blocks.append(block)
+        out.append(dict(message, content=blocks) if changed else message)
+    return out
+
+
+def tool_turn(messages, tools, system, max_tokens=16000, tally=None):
     """One non-streaming turn that may request tools.
 
     Non-streaming on purpose: the agent loop needs the whole message -- every
@@ -309,7 +733,7 @@ def tool_turn(messages, tools, system, max_tokens=16000):
         "max_tokens": max_tokens,
         "system": system,
         "tools": tools,
-        "messages": messages,
+        "messages": _scrubbed_messages(messages, tally),
     }
     with _open(payload) as resp:
         return json.loads(resp.read())

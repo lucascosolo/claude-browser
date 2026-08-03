@@ -90,6 +90,21 @@ EOF
     else
         echo "WebBrowser=claude-browser" >> "$XFCE_RC"
     fi
+
+    # Picking "Other..." in XFCE's Preferred Applications dialog and typing
+    # `claude-browser` writes custom-WebBrowser.desktop with that bare word as
+    # the command, and repoints helpers.rc at it -- silently overriding the
+    # helper above. XFCE then execs it through the *session* environment, whose
+    # PATH is fixed at login and generally has no ~/.local/bin, so opening a
+    # link fails with "Failed to execute child process". Absolutise the command
+    # in place: the user's choice is honoured, it just resolves now.
+    local custom="$XFCE_HELPERS/custom-WebBrowser.desktop"
+    if [[ -f "$custom" ]] && grep -q '^X-XFCE-Commands\(WithParameter\)\?=claude-browser\b' "$custom"; then
+        sed -i "s|^X-XFCE-Commands=claude-browser\b|X-XFCE-Commands=$BIN/claude-browser|; \
+                s|^X-XFCE-CommandsWithParameter=claude-browser\b|X-XFCE-CommandsWithParameter=$BIN/claude-browser|" \
+            "$custom"
+        echo "  xfce4 custom   $custom (absolutised)"
+    fi
     echo "  xfce4          $XFCE_RC"
 
     if command -v gio >/dev/null; then

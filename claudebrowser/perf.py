@@ -10,7 +10,12 @@ already in use. Three things dominate on hardware like that, in order:
   2. Process count. WebKit's default is one web process per view, so a fourth
      tab means a fourth few-hundred-megabyte process. On a box that is already
      swapping, that is what makes everything -- not just the browser -- drag.
-  3. Per-frame work. Smooth scrolling and WebGL are pure cost here.
+  3. Per-frame work. Smooth scrolling, WebGL and CSS animation are pure cost
+     here -- see `tune_gtk`.
+
+Those are all things done to a response after it arrives. `load_url` is the one
+lever pointed the other way: `Save-Data` asks the server for a cheaper response
+in the first place.
 
 Everything is probed with hasattr before use: this file has to survive a
 WebKitGTK upgrade deprecating something out from under it, and a browser that
@@ -84,6 +89,136 @@ def blocking_enabled():
     """On by default -- it is the single biggest win on slow hardware. Set
     CB_BLOCK=0 to turn it off for a session when a site misbehaves."""
     return os.environ.get("CB_BLOCK", "1").lower() not in ("0", "off", "false", "no")
+
+
+# -- asking the server for a cheaper page -----------------------------------
+#
+# Blocking third-party scripts is us refusing bytes after the server has already
+# decided to send them. The other half is telling the server up front that we
+# would rather have less, which is what the `Save-Data` client hint is for:
+# Cloudflare's Polish, Google's transcoders, Akamai and a number of CMSes read
+# it and answer with smaller images, fewer web fonts and sometimes a lighter
+# template. It is the only lever in this file that reduces work on the *network*
+# rather than after it.
+#
+# Two hints were considered and deliberately left out:
+#
+#   * `Device-Memory` is a high-entropy client hint. Servers are supposed to ask
+#     for it with `Accept-CH` before it is sent, almost nothing acts on it for
+#     the HTML document, and sending it unsolicited on every navigation adds a
+#     stable fingerprinting bit about this machine to every site. That is a bad
+#     trade in a browser that turns on ITP and rejects third-party cookies by
+#     default.
+#   * `Downlink` would have to be a number we do not have. There is no bandwidth
+#     estimate anywhere in this process, and inventing one is asking the server
+#     to adapt to a measurement we made up.
+#
+# `Save-Data` is different on both counts: it is a low-entropy hint defined to
+# be sent unsolicited, and it carries a preference rather than a measurement.
+LIGHT_ENV = "CB_LIGHT"
+
+#: What goes out on a navigation when light mode is on. A dict rather than a
+#: literal so the assembly can be tested without a display -- the signal wiring
+#: around it cannot be.
+HINTS = {"Save-Data": "on"}
+
+
+def light_enabled(raw=None):
+    """Is light mode on? Default yes.
+
+    On by default for the same reason the ad blocker is: this browser exists for
+    a two-core laptop, and a hint that asks for fewer bytes costs a page nothing
+    it can notice. `CB_LIGHT=0` turns it off for a session when a site serves a
+    degraded page you did not want.
+
+    Anything unrecognised means on, matching CB_BLOCK: a typo should not
+    silently remove a default the user never asked to lose.
+    """
+    if raw is None:
+        raw = os.environ.get(LIGHT_ENV, "")
+    return (raw or "").strip().lower() not in ("0", "off", "false", "no")
+
+
+def hint_headers():
+    """The client hints to attach to a navigation, or `{}` when light is off."""
+    return dict(HINTS) if light_enabled() else {}
+
+
+def make_request(url):
+    """A `WebKitURIRequest` for `url` carrying the client hints, or None.
+
+    None means "nothing to add, use load_uri" -- either light mode is off or
+    this WebKitGTK cannot give us the header list.
+
+    This is a per-navigation request rather than a per-resource one, and that is
+    a limit of the installed API, not a choice. Modifying an outgoing request in
+    WebKitGTK 4.1 needs `WebKitWebPage::send-request`, which lives in the *web
+    process extension* API -- a C shared library, which this project cannot have.
+    The UI process only gets `WebKitWebResource::sent-request`, past tense: it
+    reports a request that has already gone out and has no return value. So the
+    hint rides on loads the browser itself starts (the omnibox, the API, the
+    home page, a restored tab), which is where a lighter *document* is decided,
+    and subresources fetched by the page do not carry it.
+    """
+    if not light_enabled():
+        return None
+    try:
+        request = WebKit2.URIRequest.new(url)
+        headers = request.get_http_headers()
+    except Exception:
+        return None
+    if headers is None:
+        return None
+    for name, value in HINTS.items():
+        headers.replace(name, value)
+    return request
+
+
+def load_url(view, url):
+    """`view.load_uri(url)` plus the client hints, when there are any.
+
+    Every navigation this browser initiates goes through here so the hint has
+    one place to be attached and one place to be turned off. A link the user
+    clicks inside a page is WebKit's own load and cannot be reached from here;
+    re-issuing it as a `load_request` would drop the `Referer` WebKit sets and
+    turn a form POST into a GET, which is a correctness bug traded for a hint.
+    """
+    request = make_request(url)
+    if request is None:
+        return view.load_uri(url)
+    return view.load_request(request)
+
+
+def tune_gtk(settings):
+    """Ask for the reduced-cost rendering path via the GTK settings WebKit reads.
+
+    `gtk-enable-animations` is the only input WebKitGTK 2.52 has for the CSS
+    `prefers-reduced-motion` media feature: there is no WebKitSettings property
+    and no runtime feature flag for it (the whole 489-entry feature list has
+    nothing matching "reduced" or "motion"), and `prefers-reduced-data` is not
+    implemented in this engine at all -- the string does not appear in
+    libwebkit2gtk-4.1 next to the other `prefers-*` features it does support.
+    The library *does* watch `notify::gtk-enable-animations`, in the same list
+    as `gtk-theme-name` and `gtk-application-prefer-dark-theme`, which is the
+    UI-process settings block it forwards to the web process.
+
+    Honest caveat, because it cannot be checked here: this is verified by what
+    the installed library contains, not by observing a page. The page-side
+    effect needs a display to confirm. What is certain either way is the local
+    half -- GTK stops animating this browser's own chrome, which is per-frame
+    work on the two cores the page is being laid out on.
+
+    Deliberately not done with injected CSS. An `animation: none !important`
+    sheet fights the page's own styles, breaks anything waiting on an
+    `animationend`, and produces bug reports that read as rendering faults.
+    """
+    if settings is None or not light_enabled():
+        return []
+    try:
+        settings.set_property("gtk-enable-animations", False)
+    except Exception as e:
+        return ["reduced motion unavailable (%s)" % e]
+    return ["reduced motion requested (animations off)"]
 
 
 def load_content_filter(manager, on_ready=None):

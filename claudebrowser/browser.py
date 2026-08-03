@@ -19,11 +19,17 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import (agent, ai, auth, extract, findbar, pages, panel_html, passwords,  # noqa: E402
-               perf, resources, storage, store, style, tabnames)
+from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  # noqa: E402
+               passwords, perf, personas, playbooks, reader, resources, scrub,
+               storage, store, style, tabnames, urls)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
+
+# How long the omnibox must sit still before its host is worth resolving.
+# Firing on the keystroke itself would resolve every prefix of a hostname --
+# "e", "exa", "exampl.c" -- names that do not exist, several per navigation.
+PREFETCH_DELAY_MS = 300
 
 # What the hamburger holds: (heading, ((icon, label, accelerator, action), ...)).
 # Claude comes first because it is the reason this browser exists; everything
@@ -243,7 +249,7 @@ class Tab:
         self.used = time.monotonic()
 
     def info(self):
-        return {
+        out = {
             "id": self.id,
             "url": (self.discarded or {}).get("url") or self.view.get_uri() or "",
             "title": (self.discarded or {}).get("title") or self.view.get_title() or "",
@@ -251,6 +257,11 @@ class Tab:
             "private": self.private,
             "discarded": bool(self.discarded),
         }
+        if self.discarded:
+            # Only on a discarded tab: a live tab's content can be read, so a
+            # summary of it would be a stale copy of something already available.
+            out["summary"] = self.discarded.get("summary") or ""
+        return out
 
 
 class Browser(Gtk.Window):
@@ -264,6 +275,12 @@ class Browser(Gtk.Window):
             dark = bool(settings and settings.get_property("gtk-application-prefer-dark-theme"))
         self.dark = dark
         self._apply_css(dark)
+
+        # Before any WebView exists: WebKit reads the GTK settings block once at
+        # web-process start as well as watching it, so flipping this after the
+        # first page is already laid out would be a re-layout for nothing.
+        for note in perf.tune_gtk(settings):
+            print("perf: %s" % note, flush=True)
 
         # One shared content manager. The console shim runs at document-start,
         # before page scripts, so it catches errors thrown during startup.
@@ -292,6 +309,30 @@ class Browser(Gtk.Window):
         except Exception as e:
             print("store: disabled (%s)" % e, flush=True)
             self.store = None
+
+        # The page-text cache is optional in the same way, and one step more so:
+        # an sqlite3 built without FTS5 costs the recall search, not the cache
+        # and certainly not the browser.
+        try:
+            self.pagetext = pagetext.PageText()
+            if not self.pagetext.available:
+                print("pagetext: search disabled (%s)" % self.pagetext.reason,
+                      flush=True)
+        except Exception as e:
+            print("pagetext: disabled (%s)" % e, flush=True)
+            self.pagetext = None
+
+        # Playbooks. Optional in the same way, and for the same reason: a home
+        # directory the browser cannot write to costs you saved sequences, not
+        # the browser. The recorder itself holds no disk state, so it exists
+        # even when the collection does not -- `stop` is the only step that
+        # needs a file.
+        self.recorder = playbooks.Recorder()
+        try:
+            self.playbooks = playbooks.Playbooks()
+        except Exception as e:
+            print("playbooks: disabled (%s)" % e, flush=True)
+            self.playbooks = None
 
         # Proves a script message came from one of our own pages. See pages.py:
         # the handler is on the shared content manager, so every page in the
@@ -345,12 +386,13 @@ class Browser(Gtk.Window):
         """Let queued history writes land before the process goes away. The
         last page you visited before quitting is exactly the one most likely to
         be sitting in the queue."""
-        if self.store:
-            try:
-                self.store.flush()
-                self.store.close()
-            except Exception:
-                pass
+        for sink in (self.store, getattr(self, "pagetext", None)):
+            if sink:
+                try:
+                    sink.flush()
+                    sink.close()
+                except Exception:
+                    pass
         Gtk.main_quit()
 
     # -- construction -------------------------------------------------------
@@ -493,6 +535,21 @@ class Browser(Gtk.Window):
             head.pack_start(btn, False, False, 0)
             self.mode_buttons[key] = btn
 
+        # How Claude answers, next to what it is being asked. A combo rather
+        # than more pills: five options would double the width of the mode row,
+        # and unlike the modes this is a setting you pick once.
+        self.persona_combo = Gtk.ComboBoxText()
+        self.persona_combo.get_style_context().add_class("cb-persona")
+        for key, name in personas.choices():
+            self.persona_combo.append(key, name)
+        self.persona_combo.set_active_id(personas.current())
+        self.persona_combo.set_tooltip_text(
+            "How Claude answers in this panel. Remembered across restarts; it "
+            "adds to the panel's instructions rather than replacing them.")
+        self.persona_combo.set_can_focus(False)
+        self.persona_combo.connect("changed", self._on_persona_changed)
+        head.pack_start(self.persona_combo, False, False, 4)
+
         self.status = Gtk.Label(label="")
         self.status.set_xalign(0)
         self.status.get_style_context().add_class("cb-status")
@@ -573,6 +630,22 @@ class Browser(Gtk.Window):
         box.set_no_show_all(True)
         box.hide()
         return box
+
+    def _on_persona_changed(self, combo):
+        """The panel's selector, writing straight through to the settings file.
+
+        Compared against what is on disk first, so setting the persona from the
+        API -- which updates this widget to match -- does not bounce back into a
+        second write of the value it just stored.
+        """
+        key = combo.get_active_id()
+        if not key or key == personas.current():
+            return
+        try:
+            personas.remember(key)
+        except (OSError, ValueError) as e:
+            return self._flash("could not save the persona: %s" % e)
+        self._set_status("persona: %s" % personas.label(key), "ok")
 
     def _on_panel_policy(self, _view, decision, kind):
         """Send a link clicked in an answer to a tab, never to the panel."""
@@ -736,6 +809,11 @@ class Browser(Gtk.Window):
             ("g", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
                 lambda: self.findbar.step(-1),
             ("d", Gdk.ModifierType.CONTROL_MASK): self.toggle_bookmark,
+            # Firefox's binding for reader view. Ctrl+Shift+R is already the
+            # research panel here, so the Alt variant is the free one that
+            # anyone's fingers already know.
+            ("r", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK):
+                self.toggle_reader,
             ("h", Gdk.ModifierType.CONTROL_MASK):
                 lambda: self._open_internal("cb:history"),
             ("o", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
@@ -809,9 +887,45 @@ class Browser(Gtk.Window):
 
         completion.connect("match-selected", self._on_suggestion)
         self.omnibox.set_completion(completion)
+        self._prefetch_id = None
+        self._warmer = urls.HostWarmer(self._prefetch_dns)
         self.omnibox.connect("changed", self._on_omnibox_changed)
 
+    def _prefetch_dns(self, host):
+        """Resolve a name into WebKit's own cache before the navigation needs it.
+
+        Deprecated upstream in 2.46 with nothing to replace it in the 4.1 API,
+        so it is called defensively: on a build without it the browser simply
+        does not preconnect, which is exactly where it was before.
+        """
+        try:
+            self.context.prefetch_dns(host)
+        except (AttributeError, TypeError, GLib.Error):
+            pass
+
+    def _schedule_prefetch(self, entry):
+        """Warm the typed host's DNS a beat after typing stops.
+
+        Debounced rather than deduped alone: the dedupe in `HostWarmer` cannot
+        tell "example.c" from "example.com", so without the pause a single
+        domain still costs a lookup for each of its prefixes.
+        """
+        if self._prefetch_id is not None:
+            GLib.source_remove(self._prefetch_id)
+            self._prefetch_id = None
+        if not entry.has_focus():
+            return
+        text = entry.get_text()
+
+        def fire():
+            self._prefetch_id = None
+            self._warmer.consider(text)
+            return GLib.SOURCE_REMOVE
+
+        self._prefetch_id = GLib.timeout_add(PREFETCH_DELAY_MS, fire)
+
     def _on_omnibox_changed(self, entry):
+        self._schedule_prefetch(entry)
         if self.store is None or not entry.has_focus():
             return
         text = entry.get_text().strip()
@@ -859,7 +973,7 @@ class Browser(Gtk.Window):
         """
         tab = self.current() or self.new_tab()
         self._begin_load(tab)
-        tab.view.load_uri(url if raw else normalize(url))
+        perf.load_url(tab.view, url if raw else normalize(url))
         if focus:
             tab.view.grab_focus()
         return tab
@@ -906,7 +1020,11 @@ class Browser(Gtk.Window):
             machine["tab_ceiling"] = resources.tab_ceiling(self.machine, MAX_AGENT_TABS)
             machine["loading"] = sum(1 for t in self.tabs if t.loading)
             return pages.data_page(palette, self.nonce, machine,
-                                   self._storage_facts, storage.human)
+                                   self._storage_facts, storage.human,
+                                   pagetext_info=(self.pagetext.stats()
+                                                  if self.pagetext else None),
+                                   light={"enabled": perf.light_enabled(),
+                                          "hints": perf.hint_headers()})
 
         if name == "passwords":
             if self.vault is None:
@@ -981,7 +1099,7 @@ class Browser(Gtk.Window):
                             else "Could not clear: %s" % result.get("error"))
                 self._reload_internal()
 
-            storage.clear(self.context, title, cleared)
+            self._clear_kind(title, cleared)
         elif action == "clear_history" and self.store:
             self.store.clear_history()
             self.store.flush()
@@ -1118,7 +1236,10 @@ class Browser(Gtk.Window):
         self.notebook.set_show_tabs(len(self.tabs) > 1)
         if not background:
             self.notebook.set_current_page(index)
-        view.load_uri(normalize(url) if url else "about:blank")
+        if url:
+            perf.load_url(view, normalize(url))
+        else:
+            view.load_uri("about:blank")
         return tab
 
     def _tab_label(self, tab):
@@ -1210,6 +1331,36 @@ class Browser(Gtk.Window):
             return
         self.store.record(url, tab.view.get_title() or "")
         tab._recorded = url
+        self._cache_text(tab, url)
+
+    def _cache_text(self, tab, url):
+        """Keep the page's text for `cbctl recall`.
+
+        Hung off the same point as the history write, and for the same reason:
+        this is where we know the load finished and the tab is not private.
+        Nothing here blocks -- evaluate_javascript is asynchronous, and the
+        callback hands the text straight to a queue drained on a writer thread,
+        so neither the extraction nor the commit sits on the load's frame.
+        """
+        if self.pagetext is None:
+            return
+
+        def on_result(view, result, _data=None):
+            try:
+                value = view.evaluate_javascript_finish(result)
+                payload = json.loads(value.to_string()) if value else None
+            except (GLib.Error, json.JSONDecodeError, TypeError, AttributeError):
+                return  # a page we could not read is not worth a log line
+            if not isinstance(payload, dict):
+                return
+            self.pagetext.record(url, payload.get("title") or "",
+                                 payload.get("text") or "")
+
+        try:
+            tab.view.evaluate_javascript(extract.TEXT, -1, None, None, None,
+                                         on_result, None)
+        except GLib.Error:
+            pass
 
     def _retitle(self, tab):
         """Titles usually arrive after the load finishes. Update in place --
@@ -1278,9 +1429,8 @@ class Browser(Gtk.Window):
             if getattr(tab, "label", None):
                 tab.label.set_text(name)
                 info = tab.info()
-                tab.label.set_tooltip_text(
-                    info["url"] + ("\nDiscarded to free memory — click to reload"
-                                   if tab.discarded else ""))
+                tab.label.set_tooltip_text(tabnames.tab_tooltip(
+                    info["url"], info["discarded"], info.get("summary", "")))
             if getattr(tab, "label_box", None):
                 # Dimmed rather than badged: a discarded tab is still that tab,
                 # and a row of "zzz" markers would make an invisible optimisation
@@ -1435,16 +1585,53 @@ class Browser(Gtk.Window):
         url = tab.view.get_uri() or ""
         if not url or url.startswith("about:"):
             return False
-        tab.discarded = {"url": url, "title": tab.view.get_title() or ""}
+        tab.discarded = {"url": url, "title": tab.view.get_title() or "",
+                         "summary": ""}
         # Resolve anyone waiting on this tab before the page goes: they asked
         # about a load that is now never going to finish.
         self._settle(tab, {"ok": False, "error": "tab discarded to free memory",
                            **tab.info()})
         tab.loading = False
         tab.view.load_uri("about:blank")
+        self._capture_summary(tab, tab.discarded, url)
         self._relabel_tabs()
         self._flash("Freed a background tab — %s" % self.machine.reason())
         return True
+
+    def _capture_summary(self, tab, state, url):
+        """Leave a standing note of what a discarded tab held.
+
+        Derived locally from the page-text cache, never from the API. The API
+        answer would be better prose, and it would be paid for by a network
+        round trip fired *by memory pressure* -- on a machine that is by
+        definition already struggling, for a tab the user may never look at
+        again. A lead extract of text that is already on disk costs a single
+        indexed read.
+
+        It runs from an idle rather than inline because the point of a discard
+        is to free memory *now*: the sqlite read is small, but charging it to
+        the discard's own frame is exactly the stutter the discard exists to
+        avoid, and by then `load_uri` has already been issued.
+
+        Nothing extra is needed to keep private pages out of this. `discard_tab`
+        refuses a private tab outright, and the cache being read is only ever
+        written behind `store.recordable` in `_record` -- the one privacy choke
+        point -- so a page that was never recordable simply has no text here.
+        """
+        if self.pagetext is None:
+            return
+
+        def later():
+            # Identity of the dict, not a boolean: a tab restored and discarded
+            # again while this was queued carries a *new* state dict, so a
+            # summary of the older page can never land on the newer one.
+            if tab.discarded is state:
+                state["summary"] = tabnames.lead_extract(
+                    self.pagetext.text_for(url) or "")
+                self._relabel_tabs()
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(later)
 
     def restore_tab(self, tab):
         """Bring a discarded tab back. Called when it is selected, or by API."""
@@ -1454,7 +1641,7 @@ class Browser(Gtk.Window):
         tab.discarded = None
         tab.touch()
         self._begin_load(tab)
-        tab.view.load_uri(url)
+        perf.load_url(tab.view, url)
         self._relabel_tabs()
         return True
 
@@ -1970,11 +2157,18 @@ class Browser(Gtk.Window):
             return False
         return True
 
-    def _run_stream(self, make_generator, title="Claude", subtitle="", clear=True):
+    def _run_stream(self, make_generator, title="Claude", subtitle="", clear=True,
+                    tally=None):
         """Drive a text-producing generator on a worker thread.
 
         The generator does blocking network I/O, so it cannot run on the GTK
         thread; every write comes back through idle_add, gated on the run token.
+
+        `tally` is a dict the ai.* call fills with what the scrubber removed
+        from the page before sending it. It is rendered as the card's meta line
+        as soon as the prompt has been built -- before the answer arrives, not
+        after -- because a redaction the user only learns about once they have
+        finished reading is one they cannot weigh while reading.
         """
         import threading
 
@@ -1999,9 +2193,19 @@ class Browser(Gtk.Window):
                 self._finish_run(token, "failed", "error")
             return GLib.SOURCE_REMOVE
 
+        def note(counts):
+            if token == self.run_id and counts:
+                self._js(panel_html.call("meta", card, scrub.describe(counts)))
+            return GLib.SOURCE_REMOVE
+
         def work():
             try:
-                for chunk in make_generator():
+                generator = make_generator()
+                # The prompt is assembled by the call above, not lazily inside
+                # the generator, so the tally is complete here.
+                if tally is not None:
+                    GLib.idle_add(note, dict(tally))
+                for chunk in generator:
                     if token != self.run_id:
                         return
                     GLib.idle_add(write, chunk)
@@ -2070,10 +2274,16 @@ class Browser(Gtk.Window):
         if not self._require_key():
             return
         self._set_status("reading page…", "busy")
-        self._with_page(lambda page: self._run_stream(
-            lambda: ai.summarize(page),
-            title="TL;DR",
-            subtitle=page.get("title") or page.get("url") or "this page"))
+
+        def go(page):
+            tally = {}
+            self._run_stream(
+                lambda: ai.summarize(page, tally=tally),
+                title="TL;DR",
+                subtitle=page.get("title") or page.get("url") or "this page",
+                tally=tally)
+
+        self._with_page(go)
 
     # -- mode: research across tabs -----------------------------------------
 
@@ -2097,10 +2307,12 @@ class Browser(Gtk.Window):
                     self._panel_write("None of the open tabs had readable text.",
                                       replace=True, tag="error")
                     return self._set_status("nothing to read", "warn")
+                tally = {}
                 return self._run_stream(
-                    lambda: ai.synthesize(pages, question),
+                    lambda: ai.synthesize(pages, question, tally=tally),
                     title="Research",
-                    subtitle="%d tab%s" % (len(pages), "" if len(pages) == 1 else "s"))
+                    subtitle="%d tab%s" % (len(pages), "" if len(pages) == 1 else "s"),
+                    tally=tally)
 
             def got(page):
                 if (page.get("text") or "").strip():
@@ -2180,8 +2392,13 @@ class Browser(Gtk.Window):
             self._pending = ""
             self._new_card("you", "You")
             self._js(panel_html.call("append", str(self._card_id), text))
-            self._with_page(lambda page: self._run_stream(
-                lambda: ai.ask(text, page), title="Claude", clear=False))
+
+            def go(page):
+                tally = {}
+                self._run_stream(lambda: ai.ask(text, page, tally=tally),
+                                 title="Claude", clear=False, tally=tally)
+
+            self._with_page(go)
 
     # -- agent API ----------------------------------------------------------
     # Every method here takes a trailing `done` callback and calls it once.
@@ -2223,7 +2440,7 @@ class Browser(Gtk.Window):
             tab.touch()
             tab.discarded = None
             self._begin_load(tab)
-            tab.view.load_uri(normalize(url))
+            perf.load_url(tab.view, normalize(url))
             self._await_load(tab, wait, done)
 
         self._admit(go, done)
@@ -2342,6 +2559,41 @@ class Browser(Gtk.Window):
 
         self.api_eval(tab_id, READ_CONSOLE, filter_entries)
 
+    def api_reader(self, tab_id, font_px, width_px, done):
+        """Toggle reader mode and report the state it ended in.
+
+        Undecorated for the same reason api_console is: the tab is resolved by
+        api_eval, and resolving it twice would light the "Claude is driving"
+        indicator twice for one operation.
+        """
+        def summarize(payload):
+            if not payload.get("ok"):
+                return done(payload)
+            result = payload.get("result") or {}
+            if not isinstance(result, dict):
+                return done({"ok": False, "error": "reader script returned no state"})
+            state = dict(result)
+            if state.get("words"):
+                state["minutes"] = reader.minutes(state["words"])
+            done(state)
+
+        self.api_eval(tab_id, reader.toggle(font_px, width_px), summarize)
+
+    def toggle_reader(self):
+        """Ctrl+Alt+R, the binding Firefox uses for the same thing."""
+        def announce(state):
+            if not state.get("ok"):
+                return self._flash(state.get("error") or "Reader mode unavailable")
+            if state.get("reader"):
+                minutes = state.get("minutes")
+                self._flash("Reader · %d words%s"
+                            % (state.get("words", 0),
+                               " · %d min" % minutes if minutes else ""))
+            else:
+                self._flash("Reader off")
+
+        self.api_reader(None, None, None, announce)
+
     @needs_tab
     def api_screenshot(self, tab, path, done):
         def on_snapshot(view, result, _data=None):
@@ -2385,7 +2637,10 @@ class Browser(Gtk.Window):
               "tab_ceiling": resources.tab_ceiling(self.machine, MAX_AGENT_TABS),
               "discarded": sum(1 for s in states if s["discarded"]),
               "freeable": len(resources.pick_victims(states, len(self.tabs))),
-              "loading": sum(1 for t in self.tabs if t.loading)})
+              "loading": sum(1 for t in self.tabs if t.loading),
+              # So an agent reading a suspiciously thin page can tell whether we
+              # asked for it rather than blaming the site.
+              "light": perf.light_enabled()})
 
     @needs_tab
     def api_discard(self, tab, done):
@@ -2398,6 +2653,24 @@ class Browser(Gtk.Window):
                                     "private, empty, or already discarded)",
               **tab.info()})
 
+    def api_recall(self, query, limit, done):
+        """Search the cached text of pages already visited.
+
+        Undecorated and tab-free: it answers from disk, not from any tab, so an
+        agent can ask what it read an hour ago in a tab that is long closed.
+        """
+        if self.pagetext is None:
+            return done({"ok": False, "error": "page text cache is disabled"})
+        if not self.pagetext.available:
+            return done({"ok": False, "error": self.pagetext.reason or
+                         "full-text search unavailable"})
+        try:
+            count = int(limit) if limit not in (None, "") else 10
+        except (TypeError, ValueError):
+            count = 10
+        matches = self.pagetext.search(query or "", max(1, min(count, 50)))
+        done({"ok": True, "count": len(matches), "matches": matches})
+
     def api_storage(self, done):
         storage.summary(self.context, done)
 
@@ -2406,4 +2679,216 @@ class Browser(Gtk.Window):
             self._reload_internal()
             done(result)
 
-        storage.clear(self.context, kind or "cache", finished)
+        self._clear_kind(kind, finished)
+
+    def _clear_kind(self, kind, done):
+        """Delete one category of stored data, whoever asked.
+
+        The one place that knows the page-text cache is clearable next to
+        WebKit's own data: both the `clear` op and the cb:data buttons come
+        through here, so "everything" cannot come to mean two different sets
+        depending on which surface was used.
+        """
+        kind = kind or "cache"
+        # Validated here rather than left to storage.clear, whose message can
+        # only name the WebKit categories it knows about -- a user told to "try
+        # cache/cookies/storage/all" would reasonably conclude the page-text
+        # cache is not clearable at all.
+        if kind != "pagetext" and kind not in storage.KINDS:
+            return done({"ok": False, "error": "unknown kind %r; try %s"
+                         % (kind, "/".join(sorted(set(storage.KINDS) | {"pagetext"})))})
+        if kind in ("pagetext", "all"):
+            if self.pagetext is None:
+                if kind == "pagetext":
+                    return done({"ok": False,
+                                 "error": "the page text cache is disabled"})
+            else:
+                self.pagetext.clear()
+                # Flushed rather than left to the writer thread: this returns to
+                # a page reload that reads the stats straight back, and two
+                # DELETEs on a capped database are far cheaper than showing a
+                # user who just erased their reading history that it is still
+                # there.
+                self.pagetext.flush()
+        if kind == "pagetext":
+            return done({"ok": True, "cleared": kind})
+        storage.clear(self.context, kind, done)
+
+    def api_persona(self, name, done):
+        """Report the Claude panel's persona, or switch to it.
+
+        No `name` is a read, which is what makes one op enough: `cbctl persona`
+        says which one is active and `cbctl persona critic` changes it. The
+        value is written to the settings file, so it survives a restart the same
+        way every other preference here does.
+        """
+        if name in (None, ""):
+            return done({"ok": True, **personas.describe()})
+        try:
+            key = personas.remember(name)
+        except ValueError as e:
+            return done({"ok": False, "error": str(e), **personas.describe()})
+        except OSError as e:
+            return done({"ok": False,
+                         "error": "could not write the settings file: %s" % e})
+        # The panel is the other place this value is visible; leaving it showing
+        # the old persona would make the setting look like it had not taken.
+        self.persona_combo.set_active_id(key)
+        done({"ok": True, **personas.describe()})
+
+    # -- playbooks ----------------------------------------------------------
+    # Recording happens in control.py, at the one point every API-initiated
+    # operation passes through. What lives here is the half that needs tabs:
+    # replaying a validated sequence, one step at a time.
+
+    def _no_playbooks(self, done):
+        if self.playbooks is None:
+            done({"ok": False, "error": "playbooks are disabled (the data "
+                                        "directory could not be opened)"})
+            return True
+        return False
+
+    def api_playbook_record(self, action, name, done):
+        action = (action or "").strip().lower()
+
+        if action == "status":
+            return done({"ok": True, **self.recorder.status()})
+
+        if action == "start":
+            if self.recorder.active:
+                return done({"ok": False,
+                             "error": "already recording %r -- stop or cancel "
+                                      "that first" % self.recorder.name})
+            if self._no_playbooks(done):
+                return None
+            try:
+                started = self.recorder.start(name)
+            except playbooks.PlaybookError as e:
+                return done({"ok": False, "error": str(e)})
+            return done({"ok": True, "recording": started,
+                         "note": "every operation from here until "
+                                 "`playbook-record stop` is captured; "
+                                 "credential fields are skipped"})
+
+        if action == "cancel":
+            dropped = self.recorder.cancel()
+            return done({"ok": True, "cancelled": dropped})
+
+        if action == "stop":
+            if not self.recorder.active:
+                return done({"ok": False, "error": "not recording"})
+            book, steps, skipped = self.recorder.stop()
+            if self._no_playbooks(done):
+                return None
+            if not steps:
+                return done({"ok": False, "skipped_secrets": skipped,
+                             "error": "nothing replayable was recorded, so %r "
+                                      "was not saved" % book})
+            try:
+                self.playbooks.save(book, steps, skipped)
+            except (playbooks.PlaybookError, OSError) as e:
+                return done({"ok": False, "error": str(e)})
+            return done({"ok": True, "saved": book, "steps": len(steps),
+                         "ops": [s["op"] for s in steps],
+                         "skipped_secrets": skipped,
+                         # Said plainly rather than left to be discovered: a
+                         # login playbook that silently dropped its password
+                         # step would look broken on the first replay.
+                         **({"note": "%d credential field(s) were not recorded; "
+                                     "the browser's own autofill supplies those "
+                                     "on replay" % skipped} if skipped else {})})
+
+        done({"ok": False, "error": "unknown action %r; use start, stop, cancel "
+                                    "or status" % action})
+
+    def api_playbook_list(self, done):
+        if self._no_playbooks(done):
+            return None
+        done({"ok": True, "playbooks": self.playbooks.summaries(),
+              "recording": self.recorder.status()})
+
+    def api_playbook_delete(self, name, done):
+        if self._no_playbooks(done):
+            return None
+        try:
+            gone = self.playbooks.delete(name)
+        except OSError as e:
+            return done({"ok": False, "error": str(e)})
+        if not gone:
+            return done({"ok": False, "error": "no playbook named %r" % (name,)})
+        done({"ok": True, "deleted": name})
+
+    def api_playbook_run(self, name, done):
+        """Replay a saved playbook, strictly one step at a time.
+
+        Two rules shape this loop.
+
+        **Everything is validated before anything runs.** The file is replayed
+        input: an op name is checked against the registry and its parameters
+        against that op's declared ones, so a playbook can only ever reach an
+        `api_*` method that already exists with arguments that op already
+        accepts. Nothing is evaluated, and a bad fourth step is refused before
+        the first three have moved the browser somewhere nobody asked for.
+
+        **Steps run in series, and the loads among them still queue.** Each step
+        starts only when the previous one has called back, and the navigating
+        ops reach `_admit` exactly as they would over HTTP -- so a six-page
+        playbook is six queued loads, not six simultaneous ones. Firing them at
+        once is the thing that froze the machine for twenty minutes.
+        """
+        if self._no_playbooks(done):
+            return None
+        book = self.playbooks.get(name)
+        if book is None:
+            return done({"ok": False, "error": "no playbook named %r" % (name,),
+                         "playbooks": self.playbooks.names()})
+        try:
+            steps = playbooks.validate(book.get("steps"))
+        except playbooks.PlaybookError as e:
+            return done({"ok": False,
+                         "error": "%s cannot be replayed: %s" % (name, e)})
+
+        results = []
+        finished = [False]
+
+        def finish(payload):
+            # `done` exactly once, however the run ends -- a second call would
+            # put a payload nobody is waiting for onto the control queue.
+            if finished[0]:
+                return
+            finished[0] = True
+            done(payload)
+
+        def run(index):
+            if index >= len(steps):
+                return finish({"ok": True, "playbook": name,
+                               "steps": results})
+            op, params = steps[index]
+            try:
+                method, call_args = op.call(self, dict(params))
+            except Exception as e:
+                return finish({"ok": False, "playbook": name, "steps": results,
+                               "error": "step %d (%s) could not be built: %s"
+                                        % (index + 1, op.name, e)})
+
+            def after(payload):
+                payload = payload if isinstance(payload, dict) else {}
+                ok = payload.get("ok", True)
+                results.append({"step": index + 1, "op": op.name,
+                                "ok": bool(ok),
+                                **({"error": payload["error"]}
+                                   if payload.get("error") else {})})
+                if not ok:
+                    return finish({
+                        "ok": False, "playbook": name, "steps": results,
+                        "error": "step %d (%s) failed: %s"
+                                 % (index + 1, op.name,
+                                    payload.get("error") or "no reason given")})
+                # Through an idle rather than straight on: an op that answers
+                # synchronously would otherwise recurse once per step, and the
+                # main loop gets a chance to paint between steps.
+                GLib.idle_add(lambda: (run(index + 1), GLib.SOURCE_REMOVE)[1])
+
+            getattr(self, method)(*call_args, after)
+
+        run(0)
