@@ -166,6 +166,63 @@ def put(key, value, path=None, environ=None):
     return path
 
 
+def remove(key, path=None, environ=None):
+    """Delete a setting's assignment so the built-in default applies again.
+
+    The mirror of `put`, and cb:settings is why it exists: "back to default"
+    has to *mean* the default. Writing the current default value back would pin
+    it instead -- a later release that ships a better default would silently not
+    reach anyone who had ever pressed that button -- so the line goes away.
+
+    Surgical for the same reason `put` is: comments, ordering and the template's
+    commented examples are the user's, and a `#CB_GPU=` line documenting what the
+    key means must survive the value being cleared. Secrets are refused on the
+    same grounds as well -- deleting the user's API key from inside the browser
+    is not a smaller thing than writing it.
+
+    Returns True when a line was actually removed.
+    """
+    if key in SECRET_KEYS:
+        raise ValueError("%s is not settable from inside the browser" % key)
+
+    path = Path(path) if path else config_path()
+    environ = os.environ if environ is None else environ
+    try:
+        existing = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        existing = []
+
+    out, dropped = [], False
+    for raw in existing:
+        stripped = raw.strip()
+        candidate = (stripped[len("export "):].lstrip()
+                     if stripped.startswith("export ") else stripped)
+        name, sep, _rest = candidate.partition("=")
+        if sep and not stripped.startswith("#") and name.strip() == key:
+            dropped = True
+            continue
+        out.append(raw)
+
+    if dropped:
+        # Same atomic replace as put(): a half-written file reads as the browser
+        # having forgotten settings the user never touched.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(("\n".join(out) + "\n") if out else "", encoding="utf-8")
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+
+    # Popped, not left behind. put() pushes what it writes into this process's
+    # environment, and `setting` falls back to the environment -- so a value
+    # that outlived the line it came from would keep answering for a setting the
+    # user has just reset.
+    environ.pop(key, None)
+    return dropped
+
+
 def load(path=None, environ=None, warn=None):
     """Apply the config file to `environ`, overriding what is already set.
 
@@ -220,6 +277,9 @@ TEMPLATE = """\
 # Whatever you set here wins over your shell environment, so the browser behaves
 # the same from a terminal, the desktop menu and the dock. Keep it private:
 # chmod 600.
+#
+# Every CB_* line below is also editable from cb:settings inside the browser,
+# which writes this same file. The API key is not, and deliberately so.
 
 # Enables Ask, TL;DR, Research and the Command bar. This is the browser's own
 # key: it is read from this file only, is never put into the environment, and an
@@ -234,8 +294,9 @@ TEMPLATE = """\
 #CB_BLOCK=1
 
 # Ask sites for a lighter page: sends Save-Data: on with each page this browser
-# loads, and asks for reduced motion. On by default; set to 0 and restart if a
-# site serves you a degraded page you did not want.
+# loads, and asks for reduced motion. On by default. The switch on cb:data
+# writes this line; setting it here works too. The header follows on the next
+# page load, the reduced motion only from the next launch.
 #CB_LIGHT=1
 
 # Start page and search engine (%s is the query).
@@ -250,7 +311,8 @@ TEMPLATE = """\
 # The panel's own selector writes this line; setting it here works too.
 #CB_PERSONA=off
 
-# dark or light, overriding the system preference.
+# dark, light, or phosphor -- the near-black HUD you get when this is unset.
+# "system" is the one that follows the desktop's own dark/light preference.
 #CB_THEME=
 
 # Force software rendering (off) or GPU compositing (on).

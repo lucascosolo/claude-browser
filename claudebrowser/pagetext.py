@@ -98,6 +98,16 @@ END;
 
 _WORD = re.compile(r"[^\W_]+", re.UNICODE)
 
+#: Delimiters `search(highlight=True)` wraps matched terms in. Control
+#: characters rather than markup, because the caller has to escape the snippet
+#: for its own output before it can safely turn a match into `<mark>`; anything
+#: spellable in HTML would be indistinguishable from text the visited page
+#: chose. `record()` strips both from bodies so a page cannot forge one.
+HL_OPEN = "\x02"
+HL_CLOSE = "\x03"
+
+_HL_STRIP = {ord(HL_OPEN): None, ord(HL_CLOSE): None}
+
 
 def default_path():
     return data_dir() / "pagetext.db"
@@ -191,6 +201,7 @@ class PageText:
         while True:
             job = self._queue.get()
             if job is None:
+                self._close_local()
                 self._queue.task_done()
                 return
             try:
@@ -200,6 +211,20 @@ class PageText:
                 pass  # losing a page's text must never take the browser with it
             finally:
                 self._queue.task_done()
+
+    def _close_local(self):
+        """Close this thread's connection, if it has one.
+
+        sqlite3 refuses a close() from a thread other than the one that opened
+        the connection, so each thread has to hand its own back -- the writer
+        does it on its way out, `close()` does it for the caller."""
+        db = getattr(self._local, "db", None)
+        if db is not None:
+            self._local.db = None
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
 
     def _write(self, job):
         """`job` is a callable taking a connection, not a single statement:
@@ -223,6 +248,7 @@ class PageText:
             self._queue.put(None)
             self._writer.join(timeout=2)
             self._background = False
+        self._close_local()
 
     def _query(self, sql, args=()):
         try:
@@ -236,7 +262,7 @@ class PageText:
         """Cache one page's extracted text. Returns whether it was accepted."""
         if not recordable(url) or not (text or "").strip():
             return False
-        body = text[:MAX_DOC_CHARS]
+        body = text[:MAX_DOC_CHARS].translate(_HL_STRIP)
         digest = content_hash(body)
         title = title or ""
         now = int(time.time())
@@ -323,22 +349,27 @@ class PageText:
             "WHERE p.url = ?", (url,))
         return rows[0]["text"] if rows else None
 
-    def search(self, query, limit=10):
+    def search(self, query, limit=10, highlight=False):
         """Rank cached pages against a query. Never raises on bad input.
 
         One hit per body, not per URL: three URLs for one article are one
         result, attributed to the most recently used of them.
+
+        With `highlight`, matched terms in the snippet come back wrapped in
+        HL_OPEN/HL_CLOSE. Off by default so the CLI and MCP answers stay plain
+        text -- only a surface that renders markup wants the markers.
         """
         if not self.available:
             return []
         expr = match_query(query)
         if not expr:
             return []
+        open_, close = (HL_OPEN, HL_CLOSE) if highlight else ("", "")
         try:
             rows = self._connect().execute(
                 """SELECT p.url AS url, p.title AS title, p.last_used AS last_used,
                           b.id AS body,
-                          snippet(body_fts, 0, '', '', '…', 14) AS snippet,
+                          snippet(body_fts, 0, ?, ?, '…', 14) AS snippet,
                           bm25(body_fts) AS score
                    FROM body_fts
                    JOIN bodies b ON b.id = body_fts.rowid
@@ -346,7 +377,7 @@ class PageText:
                    WHERE body_fts MATCH ?
                    ORDER BY score, p.last_used DESC
                    LIMIT ?""",
-                (expr, max(1, int(limit)) * 8)).fetchall()
+                (open_, close, expr, max(1, int(limit)) * 8)).fetchall()
         except sqlite3.DatabaseError:
             # A malformed MATCH expression is user input, not a server fault.
             return []

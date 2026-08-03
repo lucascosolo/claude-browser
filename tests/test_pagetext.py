@@ -14,15 +14,25 @@ sys.path.insert(0, str(ROOT))
 from claudebrowser import pagetext  # noqa: E402
 
 
-def store(**kw):
-    # background=False: an in-memory database cannot be shared across threads,
-    # so a writer thread would get its own empty copy.
-    return pagetext.PageText(":memory:", background=False, **kw)
+class Isolated(unittest.TestCase):
+    """A store per test, handed back at the end.
+
+    `store()` used to be a bare factory and nothing ever closed what it made,
+    so every case leaked its sqlite3 connection and the run ended in a wall of
+    `ResourceWarning: unclosed database` -- noise that a real leak could hide
+    in."""
+
+    def store(self, **kw):
+        # background=False: an in-memory database cannot be shared across
+        # threads, so a writer thread would get its own empty copy.
+        p = pagetext.PageText(":memory:", background=False, **kw)
+        self.addCleanup(p.close)
+        return p
 
 
-class DedupeTest(unittest.TestCase):
+class DedupeTest(Isolated):
     def setUp(self):
-        self.p = store()
+        self.p = self.store()
 
     def test_same_text_at_two_urls_is_stored_once(self):
         text = "The quick brown fox jumps over the lazy dog. " * 20
@@ -72,9 +82,9 @@ class DedupeTest(unittest.TestCase):
                          pagetext.MAX_DOC_CHARS)
 
 
-class EvictionTest(unittest.TestCase):
+class EvictionTest(Isolated):
     def setUp(self):
-        self.p = store()
+        self.p = self.store()
         self._cap = pagetext.MAX_BYTES
 
     def tearDown(self):
@@ -123,9 +133,9 @@ class EvictionTest(unittest.TestCase):
         self.assertGreater(after["pages"], 5, "a small overflow is not a purge")
 
 
-class SearchTest(unittest.TestCase):
+class SearchTest(Isolated):
     def setUp(self):
-        self.p = store()
+        self.p = self.store()
         if not self.p.available:
             self.skipTest("this sqlite3 has no FTS5")
         self.p.record("https://a.example/otters", "Otters",
@@ -172,6 +182,30 @@ class SearchTest(unittest.TestCase):
         # The store is intact afterwards.
         self.assertTrue(self.p.search("otters"))
 
+    def test_snippets_are_plain_text_unless_highlighting_is_asked_for(self):
+        """The CLI and MCP answers are read as text; markers in them would be
+        noise on every line."""
+        plain = self.p.search("otters")[0]["snippet"]
+        self.assertNotIn(pagetext.HL_OPEN, plain)
+        self.assertNotIn(pagetext.HL_CLOSE, plain)
+
+    def test_highlighting_wraps_the_matched_term(self):
+        snippet = self.p.search("otters", highlight=True)[0]["snippet"]
+        self.assertIn(pagetext.HL_OPEN, snippet)
+        self.assertIn(pagetext.HL_CLOSE, snippet)
+        marked = snippet.split(pagetext.HL_OPEN)[1].split(pagetext.HL_CLOSE)[0]
+        self.assertIn("tter", marked.lower())
+
+    def test_a_page_cannot_forge_a_highlight_marker(self):
+        """The delimiters are what tells pages.py which run of characters is a
+        real match. A body that contains them would be rendering its own."""
+        self.p.record("https://a.example/forge", "Forge",
+                      "wombats %spwned%s wombats" % (pagetext.HL_OPEN,
+                                                     pagetext.HL_CLOSE))
+        hit = self.p.search("wombats", highlight=True)[0]
+        self.assertNotIn(pagetext.HL_OPEN + "pwned", hit["snippet"])
+        self.assertIn("pwned", hit["snippet"], "the words themselves stay")
+
     def test_a_forgotten_page_stops_matching(self):
         self.p.forget("https://a.example/rocks")
         self.assertEqual(self.p.search("granite"), [])
@@ -186,7 +220,7 @@ class MatchQueryTest(unittest.TestCase):
         self.assertEqual(pagetext.match_query("!!! ??"), "")
 
 
-class NoFts5Test(unittest.TestCase):
+class NoFts5Test(Isolated):
     """The browser must still start, and still cache text, on an sqlite3 built
     without FTS5. Simulated by pointing the schema at a module that cannot
     exist, which produces the same 'no such module' failure."""
@@ -196,7 +230,7 @@ class NoFts5Test(unittest.TestCase):
         pagetext.FTS_SCHEMA = (
             "CREATE VIRTUAL TABLE IF NOT EXISTS body_fts "
             "USING fts_that_does_not_exist(text);")
-        self.p = store()
+        self.p = self.store()
 
     def tearDown(self):
         pagetext.FTS_SCHEMA = self._schema

@@ -119,6 +119,7 @@ class Store:
         while True:
             job = self._queue.get()
             if job is None:
+                self._close_local()
                 self._queue.task_done()
                 return
             sql, args = job
@@ -129,6 +130,20 @@ class Store:
                 pass  # losing a history row must never take the browser with it
             finally:
                 self._queue.task_done()
+
+    def _close_local(self):
+        """Close this thread's connection, if it has one.
+
+        sqlite3 refuses a close() from a thread other than the one that opened
+        the connection, so each thread has to hand its own back -- the writer
+        does it on its way out, `close()` does it for the caller."""
+        db = getattr(self._local, "db", None)
+        if db is not None:
+            self._local.db = None
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
 
     def _write(self, sql, args=()):
         if self._background:
@@ -150,6 +165,7 @@ class Store:
             self._queue.put(None)
             self._writer.join(timeout=2)
             self._background = False
+        self._close_local()
 
     def _query(self, sql, args=()):
         try:

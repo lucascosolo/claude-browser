@@ -30,7 +30,13 @@ claudebrowser/
   pagetext.py  on-disk page-text cache + FTS5 `recall` search (GTK-free)
   scrub.py     outbound PII redaction over page text (GTK-free)
   passwords.py saved logins in the system keyring + the injected form script
-  store.py pages.py panel_html.py style.py perf.py envfile.py
+  settings.py  EVERY SETTING DESCRIBED ONCE -- values, validation, when each
+               one lands. Behind cb:settings and `cbctl settings` (GTK-free)
+  style.py     THE PALETTE + the GTK3 sheet. Three themes by name, never by a
+               boolean; `phosphor` is the default (GTK-free)
+  pages.py     the cb: pages; its own copy of the HUD sheet, same tokens
+  panel_html.py the Claude panel document; ditto
+  store.py perf.py envfile.py
 tests/         unittest, no display needed
 ```
 
@@ -41,8 +47,8 @@ tests/         unittest, no display needed
 ./cbctl health                              # is it up
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 449 tests, ~60s, no display
-CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
+./cbctl settings                            # every setting; add KEY VALUE to change one
+CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 576 tests, ~9s, no display
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
@@ -51,10 +57,23 @@ default 10), `CB_COOKIES` (`nothird`/`all`/`none`), `CB_ITP`, `CB_MEM_LIMIT`,
 higher slows the cursor down, clamped to 5), `CB_SCRUB` (outbound PII redaction,
 default on; `0`/`off` sends page text raw), `CB_LIGHT` (ask servers for a
 cheaper page — `Save-Data: on` plus reduced motion, default on; `0`/`off`),
-`CB_PERSONA` (the Claude panel's answering style; `off` by default).
+`CB_PERSONA` (the Claude panel's answering style; `off` by default), `CB_THEME`
+(`phosphor` by default, or `dark`/`light`/`system`).
 
-There is no linter or type checker configured. `python3 -m py_compile` is the
-syntax gate.
+`settings.py` describes all 19 of them, with the validator each one's *consumer*
+actually needs. `test_settings.EVERY_KEY` is a hand-kept copy of that key list —
+adding a knob means adding it in both places, on purpose, so a new setting is a
+deliberate act in a test as well as in the table.
+
+`CB_AUTOSTART=0` is not optional: `test_offline.py` runs `cbctl` and `cb-mcp` as
+real subprocesses, and `client.py` autostarts the browser by default — without
+it a test run opens a window.
+
+There is no linter or type checker configured. `python3 -m py_compile
+claudebrowser/*.py` is the syntax gate, and it is *not* redundant with the
+suite: `browser.py`, `control.py`, `findbar.py` and `__main__.py` need a display
+and so are never imported by any test. On everything else the suite is the
+stronger gate; on those four, py_compile is the only one there is.
 
 ## The rules that matter
 
@@ -72,6 +91,16 @@ syntax gate.
 - **Selectors and values are attacker-adjacent** — they can come from a page the
   agent is reading. They go through `extract._js_str`, which escapes `<`, `>`
   and U+2028/9 on top of `json.dumps`.
+- **The `nonce` in `pages.shell()` is a script-message auth token, not a CSP
+  nonce.** There is no Content-Security-Policy anywhere in this project —
+  `grep -rni "security.policy"` finds nothing — and reading it as one leads
+  straight to the wrong conclusions about what it defends. The `cbui` script
+  handler is registered on the *shared* UserContentManager, so any page loaded
+  in this browser can call `window.webkit.messageHandlers.cbui.postMessage(...)`
+  and ask for history to be cleared. Every `cb:` document is rendered with a
+  per-session random token, attaches it as `msg.t`, and the native handler drops
+  anything without it. It authenticates the *sender of a message*; it says
+  nothing about what script a document may execute.
 - **A page is never asked what origin it is.** Autofill is driven from the native
   side against `view.get_uri()`; the injected script only rings a doorbell and
   the native side reads the credential back out of the *focused* view. The
@@ -157,11 +186,47 @@ syntax gate.
   cannot forget it. `agent.SYSTEM` deliberately stays outside: it is
   instructions for driving a browser with tools, and an answering style layered
   over it would change what the agent *does* rather than how it writes.
-- **`envfile.put` is the only writer of the settings file, and it refuses
-  `SECRET_KEYS`.** It rewrites the first uncommented assignment in place and
-  leaves comments, ordering and the commented-out template examples alone --
-  the file is the user's. A setter that could write `ANTHROPIC_API_KEY` would be
-  a route from an API call to the user's credential, which is why it raises
+- **A theme is a *name*, never a boolean, and the palette is one fixed set of
+  tokens.** `style.palette(name)` / `style.css(name)` take `dark`, `light` or
+  `phosphor`; `style.resolve()` sends anything else to `style.DEFAULT_THEME`
+  rather than raising, because a typo in `CB_THEME` must not stop the browser
+  starting. Every theme carries every one of `bg bar panel field field_focus
+  tab_active line edge text dim accent accent_soft on_accent agent agent_soft
+  on_agent ok warn grid mono name` — a template written against one theme has
+  to render in all three, which `test_style.test_every_theme_carries_every_token`
+  holds. Add a token and you add it three times.
+- **`accent` and `agent` are two different inks on purpose.** `accent` is
+  *chrome* state (focus, active tab, load progress, private-window frame);
+  `agent` is *Claude* state (the AI buttons, "Claude is driving this tab", the
+  busy status). They are the same coral in dark and light, and cyan vs amber in
+  phosphor. The reason they cannot be merged is off-screen from `style.py`: the
+  cursor `extract.HALO` draws is painted *into the page*, where the chrome theme
+  cannot reach, and it is amber. Collapse the two and either the cursor stops
+  matching its own chrome, or "Claude is doing something" becomes the same ink
+  as "this field has focus" — the one signal that must never be missed made the
+  most common colour on screen.
+- **Phosphor is the default; the *absence* of `CB_THEME` is not deference to the
+  desktop.** An unset value means nobody has chosen, and the answer to that is
+  `DEFAULT_THEME`. "Follow the desktop" is now the explicit string `system`,
+  handled in `Browser._theme_for` and nowhere else — `style.resolve()` has never
+  heard of it and must not learn, since `style.py` is GTK-free and the desktop
+  preference is a GTK reading.
+- **Every settings write goes through `settings.apply`, and the validator is
+  written from what the *consumer* does with the value.** `CB_PORT` and
+  `CB_MAX_TABS` are `int()`-ed before the window exists, so they do not degrade
+  to a default — a settings surface that can write them is one that can stop the
+  next launch. The page, the `/settings` route and `cbctl settings` all call the
+  same function, so they cannot disagree. `settings` is deliberately not an MCP
+  tool: several of these decide what is sent to Anthropic, and one is the token
+  guarding the API the agent is calling through.
+- **`envfile.put` and `envfile.remove` are the only writers of the settings
+  file, and both refuse `SECRET_KEYS`.** `put` rewrites the first uncommented
+  assignment in place and leaves comments, ordering and the commented-out
+  template examples alone -- the file is the user's. `remove` deletes the line
+  instead of writing the default back, which is what "reset to default" has to
+  mean: a line the user never chose would pin the value against any future
+  change of default. A setter that could write `ANTHROPIC_API_KEY` would be a
+  route from an API call to the user's credential, which is why it raises
   instead.
 - Named exports of intent in comments: explain *why*, especially where a choice
   looks arbitrary but encodes a real constraint.
@@ -204,6 +269,53 @@ syntax gate.
   what every current styling answer tells you to use. In GTK3 those rules match
   nothing, so the menu paints as bare text floating over the page with no card
   behind it and no error anywhere. Style `popover.cb-menu` itself.
+- **GTK3's CSS parser silently drops what it does not understand.** An unknown
+  property is not an error you can see: the sheet loads, the rule vanishes, and
+  the only trace is a warning on stderr at every launch, which nobody reads
+  after the first week. This is why `test_style.Parses` exists — it hangs a
+  `parsing-error` handler on a real `Gtk.CssProvider` and asserts the list comes
+  back empty for every theme. A `CssProvider` is not a widget and never touches
+  the screen, so this runs headless with the rest of the suite. Note the trap it
+  was built for: GTK3 has **no `text-transform`**, so the phosphor chrome gets
+  its engraved look from the mono face and letter-spacing instead. The `cb:`
+  pages *do* use `text-transform` — those are rendered by WebKit, not GTK, and
+  the two sheets are not the same sheet.
+- **The phosphor sheet is additive, in all three files.** `style._HUD`,
+  `pages._HUD_CSS` and `panel_html._HUD` are appended to the base template for
+  that theme only, and every rule in them overrides one already above. Written
+  this way so dark and light come out exactly as they did before phosphor
+  existed — picking it is meant to be a visible choice, not a silent redesign of
+  the other two, which `test_phosphor_is_additive` pins. In `panel_html` the HUD
+  text is spliced in at `_HUD_SLOT` *before* the single `%`-format pass rather
+  than substituted as a value: a `%`-substituted value is not rescanned, so its
+  own `%(accent)s` would reach the document raw.
+- **`grid == bg` is a deliberate no-op, not a copy-paste slip.** In dark and
+  light the scanline ink equals the background, so the token exists in every
+  palette and no template has to branch on whether the theme has a texture. Do
+  not "clean it up" by making `grid` optional — that puts an `if` in every place
+  that reads it.
+- **`panel_html.page()` takes the whole palette.** It used to rebuild the dict
+  key by key, which meant every token added to `style.py` — `edge`, `grid`,
+  `agent`, `mono` — silently stopped at that function and the panel drifted out
+  of the theme it was supposed to be part of, with no error anywhere. The only
+  two names remapped are the ones the panel's template calls something else
+  (`bg` = the chrome's `panel`, `card` = the chrome's `bar`).
+  `test_pages_style.test_every_palette_token_reaches_the_panel` is the guard.
+- **A mutable/bound default is fixed at `def` time, and that is a hole a test
+  can fall through.** `ai._open(payload, timeout, sleep=None)` takes `None` and
+  resolves to `time.sleep` inside the body, precisely because `sleep=time.sleep`
+  in the signature binds the real function once at import and no caller can ever
+  replace it. The test that tried to worked around it by patching
+  `ai.time.sleep` — which disabled sleeping *process-wide* for everything that
+  ran after it in the same suite. If an injection point looks unused, check
+  whether it is actually reachable before deleting it.
+- **`close()` on a background-writer store has to close a connection too.**
+  `store` and `pagetext` each keep one sqlite3 connection *per thread*, and
+  sqlite3 refuses a `close()` from a thread other than the one that opened it —
+  so shutting the writer thread down is not shutting the store down. Each side
+  hands its own connection back (`_close_local`): the writer on its way out,
+  `close()` for the caller. Run the suite under `-W error::ResourceWarning`
+  occasionally; that is what surfaced the leak.
 - **Clearing `background` on a themed button is not enough.** The stock theme
   draws its bevel with a `background-image` gradient *and* an inset `box-shadow`.
   Set both to `none` or a "flat" text button keeps a ghost outline.
@@ -298,7 +410,14 @@ syntax gate.
   are different hosts as far as a set is concerned. The prefetch decision is
   `urls.prefetch_host`, built on `looks_like_url` so it can never disagree with
   what Enter would do — warming a name for a search query is a lookup nobody
-  visits and a leak of what was typed.
+  visits and a leak of what was typed. The recall suggestions hanging off the
+  same signal need the same treatment twice over: an FTS5 query is a disk read
+  through an index, so it is debounced (`RECALL_DELAY_MS`), run on a worker
+  thread (`pagetext` keeps one connection per thread, so this does not disturb
+  the writer), and stamped with a serial that every keystroke bumps. Without the
+  serial, a query that returns after another character was typed appends rows
+  that do not match the box — the answer to a question nobody is asking any
+  more.
 - **A redaction placeholder is evidence to the next pattern.** `scrub.py`'s
   account-number rule fires on wording like `card` or `iban` next to a digit
   run — and `[card]` is a string it wrote itself one pass earlier, so without
@@ -371,6 +490,18 @@ answer. Reopening one needs a new fact, not a new preference.
   user may never return to. A summary keyed by content hash and generated
   lazily when a card renders was the alternative; the lead extract is free,
   needs no new table, and is honest about being the opening of the page.
+- **An animated CRT/HUD chrome, and a second full stylesheet to carry it.**
+  Phosphor is a `repeating-linear-gradient` at 3% alpha painted once into each
+  chrome strip and cached by GTK like any other background — no flicker, no
+  sweep, no timer. An animated one is a per-frame repaint of decoration on the
+  two cores that are already laying out the page, on a machine where
+  `CB_LIGHT` is spending real effort asking *sites* to stop animating. The
+  overrides are appended to the existing sheet rather than written as a second
+  template, so dark and light cannot be changed by editing phosphor.
+- **A settings page that writes any key it is given.** `CB_PORT=banana` is not
+  "falls back to the default", it is a browser that does not start next launch.
+  Validation lives in `settings.py`, written from what each consumer does, and
+  `ANTHROPIC_API_KEY` is not editable from the browser at all.
 - **Canvas-grade UI toys** — an animated knowledge graph, a session time-lapse,
   physics-y tab folders, a tray widget cycling summaries. They need a frontend
   this GTK chrome does not have and would not gain cheaply.

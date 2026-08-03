@@ -21,7 +21,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  # noqa: E402
                passwords, perf, personas, playbooks, reader, resources, scrub,
-               storage, store, style, tabnames, urls)
+               settings, storage, store, style, tabnames, urls)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -30,6 +30,16 @@ HOME = os.environ.get("CB_HOME", "cb:home")
 # Firing on the keystroke itself would resolve every prefix of a hostname --
 # "e", "exa", "exampl.c" -- names that do not exist, several per navigation.
 PREFETCH_DELAY_MS = 300
+
+# The omnibox's page-text search, on the same reasoning as the DNS prefetch
+# above: an FTS5 query is far more expensive than the history lookup beside it,
+# so it waits for a pause in typing and never runs for a prefix short enough to
+# match half the index. Four characters is roughly where a query stops being a
+# prefix of everything; the results are appended after the history matches and
+# capped, so the ordinary suggestions for a short word keep the top of the list.
+RECALL_DELAY_MS = 260
+RECALL_MIN_CHARS = 4
+RECALL_SUGGESTIONS = 4
 
 # What the hamburger holds: (heading, ((icon, label, accelerator, action), ...)).
 # Claude comes first because it is the reason this browser exists; everything
@@ -54,15 +64,19 @@ MENU_SECTIONS = (
         ("user-bookmarks-symbolic", "Bookmarks", "Ctrl+Shift+O", "cb:bookmarks"),
         ("document-open-recent-symbolic", "History", "Ctrl+H", "cb:history"),
         ("dialog-password-symbolic", "Saved logins", "", "cb:passwords"),
+        ("media-playback-start-symbolic", "Playbooks", "", "cb:playbooks"),
     )),
     ("This page", (
         ("edit-find-symbolic", "Find on page", "Ctrl+F", "find"),
+        ("view-paged-symbolic", "Reader mode", "Ctrl+Alt+R", "reader"),
     )),
     ("Machine", (
         ("drive-harddisk-symbolic", "Cookies & cache", "", "cb:data"),
+        ("preferences-system-symbolic", "Settings", "", "cb:settings"),
     )),
 )
-INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history", "cb:data")
+INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history", "cb:data",
+            "cb:playbooks", "cb:settings")
 # console.* is not exposed to the embedder in webkit2gtk, so we shim it in the
 # page at document-start and read the ring buffer back out with JS later.
 CONSOLE_SHIM = """
@@ -265,21 +279,36 @@ class Tab:
 
 
 class Browser(Gtk.Window):
-    def __init__(self, urls=None, dark=None):
+    def __init__(self, urls=None, theme=None):
         super().__init__(title="claude-browser")
         self.set_default_size(1180, 780)
         self.tabs = []
 
-        settings = Gtk.Settings.get_default()
-        if dark is None:
-            dark = bool(settings and settings.get_property("gtk-application-prefer-dark-theme"))
-        self.dark = dark
-        self._apply_css(dark)
+        gtk_settings = Gtk.Settings.get_default()
+        # Read before _apply_css overwrites it: that call sets the same property,
+        # so this is the only moment the desktop's own preference is still
+        # legible -- and cb:settings offers "follow the desktop" as a choice.
+        # Held as a theme name, not a flag: there are three themes now, and only
+        # two of them are what a desktop can express.
+        self.system_theme = "dark" if (
+            gtk_settings
+            and gtk_settings.get_property("gtk-application-prefer-dark-theme")
+        ) else "light"
+        self.theme = self._theme_for(theme)
+        self._apply_css(self.theme)
 
         # Before any WebView exists: WebKit reads the GTK settings block once at
         # web-process start as well as watching it, so flipping this after the
         # first page is already laid out would be a re-layout for nothing.
-        for note in perf.tune_gtk(settings):
+        # Remembered because the switch on cb:data can change CB_LIGHT later, and
+        # the animations are then no longer whatever the setting says they are --
+        # that page reports what was applied, not what would be applied now.
+        self.light_at_start = perf.light_enabled()
+        # A refused setting has to be explained on the page that refused it; the
+        # omnibox flash is gone in a second and a half. Consumed by the next
+        # render of cb:settings, which the write path triggers.
+        self._settings_notice = None
+        for note in perf.tune_gtk(gtk_settings):
             print("perf: %s" % note, flush=True)
 
         # One shared content manager. The console shim runs at document-start,
@@ -397,15 +426,43 @@ class Browser(Gtk.Window):
 
     # -- construction -------------------------------------------------------
 
-    def _apply_css(self, dark):
-        provider = Gtk.CssProvider()
-        provider.load_from_data(style.css(dark))
-        Gtk.StyleContext.add_provider_for_screen(
-            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-        )
+    def _theme_for(self, wanted):
+        """The theme name to render, given what the setting asks for.
+
+        Only the literal "system" defers to the desktop. An unset CB_THEME is
+        not read as deference -- it means nobody has chosen, and the answer to
+        that is style.DEFAULT_THEME.
+        """
+        if (wanted or "").strip().lower() == "system":
+            return style.resolve(self.system_theme)
+        return style.resolve(wanted)
+
+    def _apply_css(self, theme):
+        # One provider, reloaded. It used to build a new one per call, which was
+        # harmless while this only ran at startup; cb:settings can now re-theme a
+        # running window, and adding a provider per switch leaves every previous
+        # sheet attached to the screen for the life of the process.
+        provider = getattr(self, "_css_provider", None)
+        if provider is None:
+            provider = self._css_provider = Gtk.CssProvider()
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
         s = Gtk.Settings.get_default()
+        # Reduced motion, decided here because it is the only place that can see
+        # both halves. The first call happens before `perf.tune_gtk` has run, so
+        # `gtk-enable-animations` is still its default True and the setting is
+        # what answers; every later call (a re-theme from cb:settings) sees the
+        # property tune_gtk actually managed to set. Either way a sheet with no
+        # transitions in it is the one thing that cannot be undone by a widget
+        # animating anyway.
+        animations = bool(s.get_property("gtk-enable-animations")) if s else True
+        provider.load_from_data(
+            style.css(theme, motion=animations and not perf.light_enabled()))
         if s:
-            s.set_property("gtk-application-prefer-dark-theme", dark)
+            s.set_property("gtk-application-prefer-dark-theme",
+                           style.is_dark(theme))
 
     def _icon_button(self, icon, tooltip, handler):
         btn = Gtk.Button()
@@ -604,7 +661,7 @@ class Browser(Gtk.Window):
         self.panel_ready = False
         self.panel_queue = []
         self.panel_view.connect("load-changed", self._on_panel_loaded)
-        self.panel_view.load_html(panel_html.page(style.palette(self.dark)), None)
+        self.panel_view.load_html(panel_html.page(style.palette(self.theme)), None)
         box.pack_start(self.panel_view, True, True, 0)
 
         prompt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -888,6 +945,8 @@ class Browser(Gtk.Window):
         completion.connect("match-selected", self._on_suggestion)
         self.omnibox.set_completion(completion)
         self._prefetch_id = None
+        self._recall_id = None
+        self._recall_serial = 0
         self._warmer = urls.HostWarmer(self._prefetch_dns)
         self.omnibox.connect("changed", self._on_omnibox_changed)
 
@@ -926,11 +985,12 @@ class Browser(Gtk.Window):
 
     def _on_omnibox_changed(self, entry):
         self._schedule_prefetch(entry)
-        if self.store is None or not entry.has_focus():
+        if not entry.has_focus():
             return
         text = entry.get_text().strip()
         self._suggest_model.clear()
-        if len(text) < 1:
+        self._schedule_recall(text)
+        if self.store is None or len(text) < 1:
             return
         for row in self.store.suggest(text, limit=8):
             title = GLib.markup_escape_text(row["title"] or "")
@@ -939,6 +999,64 @@ class Browser(Gtk.Window):
                        % (title, url)) if title else url
             self._suggest_model.append(
                 [display, row["url"], "★" if row.get("bookmark") else ""])
+
+    def _schedule_recall(self, text):
+        """Search the text of read pages a beat after typing stops.
+
+        Bumping the serial on every keystroke is what makes a late answer safe
+        to apply: a query that returns after another character was typed is
+        answering a question nobody is asking any more, and appending it would
+        put rows in the popup that do not match the box.
+        """
+        if self._recall_id is not None:
+            GLib.source_remove(self._recall_id)
+            self._recall_id = None
+        self._recall_serial += 1
+        if not self.pagetext or not self.pagetext.available:
+            return
+        if len(text) < RECALL_MIN_CHARS:
+            return
+        import threading
+
+        serial = self._recall_serial
+
+        def fire():
+            self._recall_id = None
+            # Off the main loop: this is a disk read through an index, on a
+            # machine chosen for being slow, with a keystroke waiting to be
+            # painted. pagetext keeps one connection per thread, so reading here
+            # does not disturb its writer.
+            threading.Thread(target=self._recall_worker, args=(text, serial),
+                             daemon=True).start()
+            return GLib.SOURCE_REMOVE
+
+        self._recall_id = GLib.timeout_add(RECALL_DELAY_MS, fire)
+
+    def _recall_worker(self, text, serial):
+        try:
+            hits = self.pagetext.search(text, limit=RECALL_SUGGESTIONS)
+        except Exception:
+            return  # a suggestion that failed is not worth taking the box down
+        GLib.idle_add(self._show_recall, text, serial, hits)
+
+    def _show_recall(self, text, serial, hits):
+        """Append page-text hits below the history matches already in the model."""
+        if serial != self._recall_serial or self.omnibox.get_text().strip() != text:
+            return GLib.SOURCE_REMOVE
+        seen = {row[1] for row in self._suggest_model}
+        for hit in hits:
+            if hit["url"] in seen:
+                continue  # already offered as a title or URL match
+            title = GLib.markup_escape_text(hit["title"] or hit["url"])
+            snippet = GLib.markup_escape_text(hit["snippet"] or hit["url"])
+            self._suggest_model.append([
+                "<b>%s</b>  <span size='small' alpha='60%%'>%s</span>"
+                % (title, snippet),
+                hit["url"],
+                # A different glyph from the bookmark star, in the column that
+                # already exists to say what kind of match a row is.
+                "¶"])
+        return GLib.SOURCE_REMOVE
 
     def _on_suggestion(self, _completion, model, treeiter):
         url = model[treeiter][1]
@@ -999,7 +1117,7 @@ class Browser(Gtk.Window):
         request.finish(stream, len(data), "text/html; charset=utf-8")
 
     def _render_internal(self, name, query=""):
-        palette = style.palette(self.dark)
+        palette = style.palette(self.theme)
         term = ""
         for part in (query or "").split("&"):
             key, _sep, value = part.partition("=")
@@ -1024,13 +1142,34 @@ class Browser(Gtk.Window):
                                    pagetext_info=(self.pagetext.stats()
                                                   if self.pagetext else None),
                                    light={"enabled": perf.light_enabled(),
-                                          "hints": perf.hint_headers()})
+                                          "hints": perf.hint_headers(),
+                                          "motion": self.light_at_start})
+
+        # Answered before the store check below for the same reason cb:data is:
+        # the settings file has nothing to do with the history database, and a
+        # browser whose database failed to open is exactly when you want to
+        # reach the settings.
+        if name == "settings":
+            notice, self._settings_notice = self._settings_notice, None
+            return pages.settings_page(palette, self.nonce, settings.describe(),
+                                       notice=notice)
 
         if name == "passwords":
             if self.vault is None:
                 return pages.passwords_page(palette, self.nonce, [], available=False)
             return pages.passwords_page(palette, self.nonce, self.vault.entries(),
                                         never=self.vault.never_list())
+
+        # Playbooks live in their own file, so like the two above they render
+        # whether or not the history database opened. When even that file could
+        # not be reached `self.playbooks` is None and the page says so rather
+        # than raising into the scheme handler.
+        if name == "playbooks":
+            return pages.playbooks_page(
+                palette, self.nonce,
+                self.playbooks.summaries() if self.playbooks else [],
+                recording=self.recorder.status(),
+                available=self.playbooks is not None)
 
         if self.store is None:
             return pages.shell(
@@ -1041,7 +1180,8 @@ class Browser(Gtk.Window):
         if name == "history":
             rows = self.store.history(term or None)
             marked = {r["url"] for r in self.store.bookmarks()}
-            return pages.history_page(palette, self.nonce, rows, term, marked)
+            return pages.history_page(palette, self.nonce, rows, term, marked,
+                                      fulltext=self._text_matches(term))
         if name == "bookmarks":
             return pages.bookmarks_page(palette, self.nonce,
                                         self.store.bookmarks(term or None), term)
@@ -1051,6 +1191,19 @@ class Browser(Gtk.Window):
                 dict(t.info(), current=(t is current)) for t in self.tabs])
         return pages.home(palette, self.nonce, self.store.bookmarks(limit=12),
                           self.store.history(limit=12), self.store.counts())
+
+    def _text_matches(self, term, limit=8):
+        """What a cb:history query matched in the *text* of pages, if anything.
+
+        Empty rather than loud when there is no page-text store or this sqlite3
+        was built without FTS5: cb:history is history's page, and its search box
+        should not start reporting on a feature the user never asked for.
+        """
+        if not self.pagetext or not self.pagetext.available:
+            return []
+        if len((term or "").strip()) < RECALL_MIN_CHARS:
+            return []
+        return self.pagetext.search(term, limit=limit, highlight=True)
 
     def _on_ui_message(self, _manager, result):
         """Actions posted by cb: pages. Every one is nonce-checked first."""
@@ -1100,6 +1253,31 @@ class Browser(Gtk.Window):
                 self._reload_internal()
 
             self._clear_kind(title, cleared)
+        elif action == "set_light":
+            # `title` carries the wanted state ("on"/"off") for the same reason
+            # clear_data puts the kind there, and it is the state rather than a
+            # flip so a stale cb:data tab cannot invert a setting it is no longer
+            # showing. Parsed by the same spelling-tolerant reader as CB_LIGHT.
+            wanted = perf.light_enabled(title)
+            try:
+                perf.remember(wanted)
+            except (OSError, ValueError) as e:
+                self._flash("Could not save that setting: %s" % e)
+            else:
+                self._flash("Lighter pages on — from the next page load"
+                            if wanted else "Lighter pages off")
+                self._reload_internal()
+        elif action in ("set_setting", "reset_setting"):
+            # `url` carries the key and `title` the new value, on the same
+            # reasoning as clear_data's kind: the message shape is fixed at
+            # {action, url, title}, and a fourth field would be one every other
+            # sender has to ignore. A reset has no value at all.
+            self._change_setting(url, None if action == "reset_setting" else title)
+        elif action.startswith("pb_"):
+            # `title` carries the playbook name, for the same reason clear_data
+            # puts the kind there: the message shape is fixed at
+            # {action, url, title}.
+            self._playbook_action(action, title)
         elif action == "clear_history" and self.store:
             self.store.clear_history()
             self.store.flush()
@@ -1916,6 +2094,7 @@ class Browser(Gtk.Window):
             "newtab": lambda: self.new_tab(HOME),
             "private": lambda: self.new_tab(HOME, private=True),
             "find": self.findbar.open,
+            "reader": self.toggle_reader,
         }[key]()
 
     # -- saved logins -------------------------------------------------------
@@ -2736,6 +2915,93 @@ class Browser(Gtk.Window):
         self.persona_combo.set_active_id(key)
         done({"ok": True, **personas.describe()})
 
+    def _change_setting(self, key, value):
+        """One control on cb:settings, answered by the api_* method behind it.
+
+        The same arrangement as _playbook_action: the page gets no write path of
+        its own, so a value refused over the API cannot be one the page quietly
+        accepts. `value` is None for the per-setting reset.
+        """
+        if not key:
+            return          # api_settings reads with no key; a control never does
+
+        def landed(result):
+            result = result if isinstance(result, dict) else {}
+            if result.get("ok"):
+                return self._flash(result.get("note") or "Saved")
+            error = result.get("error") or "that setting could not be changed"
+            # Both, and for different readers: the flash is where the user is
+            # looking, and the notice survives on the page after the flash has
+            # gone -- the control itself has already snapped back to the stored
+            # value, so without it there is nothing left saying why.
+            self._settings_notice = {"error": error}
+            self._flash(error)
+            self._reload_internal()
+
+        self.api_settings(key, value, value is None, landed)
+
+    def api_settings(self, name, value, reset, done):
+        """Report every setting, or change one.
+
+        Shaped like api_persona: no `name` is a read, which is what lets one op
+        serve `cbctl settings` and `cbctl settings CB_THEME dark`. Validation
+        lives in settings.py rather than here, so the page, the HTTP route and
+        the CLI cannot disagree about what a setting accepts.
+
+        Nothing in the answer carries the control token's value -- describe()
+        reports only whether one is set -- so a settings read is not a way to
+        exfiltrate the credential that guards this API.
+        """
+        if not name:
+            return done({"ok": True, **settings.describe()})
+
+        try:
+            knob = settings.get(name)
+            # A key with neither a value nor --reset is a read of that one
+            # setting. Treating it as "set this to nothing" would make
+            # `cbctl settings CB_THEME` -- the obvious way to ask what the
+            # theme is -- silently blank the theme instead of answering.
+            if value is None and not reset:
+                return done({"ok": True,
+                             "setting": settings.describe_one(knob)})
+            if reset:
+                settings.reset(name)
+            else:
+                settings.apply(name, value)
+        except ValueError as e:
+            return done({"ok": False, "error": str(e), **settings.describe()})
+        except OSError as e:
+            return done({"ok": False,
+                         "error": "could not write the settings file: %s" % e})
+
+        self._settings_took_effect(knob)
+        # Every open cb: page is now showing a stale value -- cb:settings most
+        # of all, but cb:data reports the light-mode switch too.
+        self._reload_internal()
+        done({"ok": True, "setting": name, "effect": knob.effect_note,
+              "note": "%s — %s" % (knob.label, knob.effect.lower()),
+              **settings.describe()})
+
+    def _settings_took_effect(self, knob):
+        """The half of a settings change that can land without a restart.
+
+        Deliberately short. Nothing here reaches into another module to replace
+        a value it captured at import: that would be a second, invisible way for
+        a setting to arrive, and the page would then have to guess which of the
+        two a given key follows. What is here is the surface this window owns.
+        """
+        if knob.key == personas.SETTING:
+            # The panel's selector is the other place this is visible; leaving it
+            # on the old persona makes the setting look like it did not take.
+            self.persona_combo.set_active_id(personas.current())
+        elif knob.key == "CB_THEME":
+            wanted = settings.effective(knob)[0]
+            self.theme = self._theme_for(wanted)
+            self._apply_css(self.theme)
+            # The Claude panel is not re-themed: it is a loaded document, and
+            # reloading it would throw away the conversation in it. cb:settings
+            # says so rather than letting it look like a rendering bug.
+
     # -- playbooks ----------------------------------------------------------
     # Recording happens in control.py, at the one point every API-initiated
     # operation passes through. What lives here is the half that needs tabs:
@@ -2747,6 +3013,51 @@ class Browser(Gtk.Window):
                                         "directory could not be opened)"})
             return True
         return False
+
+    def _playbook_action(self, action, name):
+        """One button on cb:playbooks, answered by the api_* method behind it.
+
+        The page gets no path of its own: `pb_run` hands the name to
+        `api_playbook_run`, which validates the file and chains the steps
+        through the queue exactly as the HTTP route would. A replay loop written
+        for the page would be the copy that drifts. Everything ends in a
+        re-render, because every one of these changes what the page shows.
+        """
+        def steps(n):
+            n = int(n or 0)
+            return "%d step%s" % (n, "" if n == 1 else "s")
+
+        def landed(result):
+            result = result if isinstance(result, dict) else {}
+            if not result.get("ok"):
+                self._flash(result.get("error") or "that did not work")
+            elif action == "pb_start":
+                self._flash("Recording %s" % (result.get("recording") or name))
+            elif action == "pb_stop":
+                self._flash("Saved %s — %s" % (result.get("saved") or name,
+                                               steps(result.get("steps"))))
+            elif action == "pb_cancel":
+                self._flash("Recording discarded" if result.get("cancelled")
+                            else "Nothing was being recorded")
+            elif action == "pb_delete":
+                self._flash("Deleted %s" % (result.get("deleted") or name))
+            else:
+                self._flash("%s finished — %s"
+                            % (name, steps(len(result.get("steps") or []))))
+            self._reload_internal()
+
+        if action == "pb_start":
+            self.api_playbook_record("start", name, landed)
+        elif action in ("pb_stop", "pb_cancel"):
+            self.api_playbook_record(action[3:], None, landed)
+        elif action == "pb_delete":
+            self.api_playbook_delete(name, landed)
+        elif action == "pb_run":
+            # Said before the first step rather than only after the last: a
+            # replay can spend a minute in the load queue, and a button that
+            # goes quiet for that long reads as one that did nothing.
+            self._flash("Running %s…" % name)
+            self.api_playbook_run(name, landed)
 
     def api_playbook_record(self, action, name, done):
         action = (action or "").strip().lower()

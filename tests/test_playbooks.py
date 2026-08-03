@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from claudebrowser import api, playbooks  # noqa: E402
+from claudebrowser import api, pages, playbooks, style  # noqa: E402
 
 
 class TestValidation(unittest.TestCase):
@@ -292,6 +292,126 @@ class TestStorage(unittest.TestCase):
         from claudebrowser import store
 
         self.assertEqual(playbooks.default_path().parent, store.data_dir())
+
+
+class TestPage(unittest.TestCase):
+    """cb:playbooks -- the only surface where a person, rather than an agent,
+    can see what has been recorded and get rid of it.
+
+    Rendered directly, with no display: pages.py is deliberately GTK-free, and
+    the store is fed in as the plain dicts `Playbooks.summaries()` returns.
+    """
+
+    palette = style.palette("dark")
+
+    def render(self, books=(), recording=None, available=True):
+        return pages.playbooks_page(self.palette, "NONCE", list(books),
+                                    recording=recording, available=available)
+
+    @staticmethod
+    def book(name="report", steps=2, ops=("open", "click"), **extra):
+        return dict({"name": name, "steps": steps, "ops": list(ops),
+                     "created": None, "skipped_secrets": 0}, **extra)
+
+    def test_the_rail_links_to_it(self):
+        self.assertIn("cb:playbooks", [url for url, _label, _d in pages.NAV])
+
+    def test_it_lists_name_step_count_and_what_it_does(self):
+        html = self.render([self.book()])
+        self.assertIn("report", html)
+        self.assertIn("2 steps", html)
+        self.assertIn("open → click", html)
+
+    def test_one_step_is_not_pluralised(self):
+        self.assertIn("1 step<", self.render([self.book(steps=1, ops=["reload"])]))
+
+    def test_repeated_ops_are_collapsed_rather_than_repeated(self):
+        self.assertEqual(pages._what_it_does(["open", "click", "click", "text"]),
+                         "open → click ×2 → text")
+
+    def test_a_long_sequence_is_cut_rather_than_run_off_the_row(self):
+        line = pages._what_it_does(["a", "b", "c", "d", "e", "f", "g", "h"])
+        self.assertTrue(line.endswith("…"), line)
+        self.assertNotIn("h", line)
+
+    def test_an_empty_collection_says_how_to_make_one(self):
+        html = self.render([])
+        self.assertIn("No playbooks yet", html)
+        self.assertIn("Start recording", html)
+
+    def test_run_and_delete_go_through_the_nonce_path(self):
+        """cbui.send is what stamps the per-session token onto a message. A
+        button that reached the browser any other way would be one a website
+        could imitate."""
+        html = self.render([self.book()])
+        self.assertIn("cbui.pbrun(event", html)
+        self.assertIn("cbui.pbdrop(event", html)
+        self.assertIn("action: 'pb_run'", html)
+        self.assertIn("action: 'pb_delete'", html)
+        self.assertIn("cbui.pbstart(event)", html)
+
+    def test_delete_is_armed_in_the_page_and_never_a_modal(self):
+        """window.confirm() inside a WebView blocks this embedder's GTK main
+        loop, so the confirmation is a second click on the same button."""
+        html = self.render([self.book()])
+        handler = html.split("pbdrop: function")[1].split("confirmData:")[0]
+        self.assertIn("dataset.armed", handler)
+        self.assertIn("Click again", handler)
+        self.assertNotIn("confirm(", handler)
+
+    def test_a_hostile_name_cannot_break_out_of_the_markup_or_the_js(self):
+        hostile = 'a" onclick="steal()'
+        html = self.render([self.book(name=hostile)])
+        self.assertNotIn(hostile, html)
+        self.assertIn(pages._js(hostile), html)
+        self.assertIn('<span class="rt">a&quot; onclick=&quot;steal()</span>', html)
+
+    def test_a_recording_in_progress_is_impossible_to_miss(self):
+        html = self.render([], recording={"recording": True, "name": "login",
+                                          "steps": 4, "skipped_secrets": 1})
+        self.assertIn("Recording", html)
+        self.assertIn("login", html)
+        self.assertIn("4 steps captured", html)
+        self.assertIn("1 credential field skipped", html)
+        self.assertIn("pb_stop", html)
+        self.assertIn("pb_cancel", html)
+        # The field that starts one is gone while a recording is running: the
+        # recorder holds a single capture, and a second Start would be refused.
+        self.assertNotIn('id="pbname"', html)
+
+    def test_idle_offers_a_name_and_says_what_gets_captured(self):
+        html = self.render([], recording={"recording": False, "name": None,
+                                          "steps": 0, "skipped_secrets": 0})
+        self.assertIn('id="pbname"', html)
+        self.assertIn("Start recording", html)
+        # The capture point is the control API, so hand-driving records
+        # nothing -- a user who is not told that saves an empty playbook.
+        self.assertIn("Browsing by hand is not captured", html)
+
+    def test_no_recorder_state_at_all_still_renders(self):
+        self.assertIn("Start recording", self.render([self.book()]))
+
+    def test_a_disabled_store_degrades_instead_of_raising(self):
+        """`Browser.playbooks` is None when the data directory could not be
+        opened. The page has to say so, the way cb:passwords does for a missing
+        keyring, rather than traceback into the scheme handler."""
+        html = self.render([], available=False)
+        self.assertIn("Playbooks are unavailable", html)
+        self.assertNotIn("pb_start", html.split("<script>")[0])
+
+    def test_it_renders_what_the_store_actually_hands_over(self):
+        """Guards the seam: summaries() is the page's only input, so a key
+        renamed there has to fail here rather than in a running browser."""
+        with tempfile.TemporaryDirectory() as tmp:
+            books = playbooks.Playbooks(Path(tmp) / "playbooks.json")
+            books.save("morning", [{"op": "open",
+                                    "params": {"url": "https://example.com"}},
+                                   {"op": "click", "params": {"selector": "a"}}])
+            html = self.render(books.summaries())
+        self.assertIn("morning", html)
+        self.assertIn("2 steps", html)
+        self.assertIn("open → click", html)
+        self.assertIn("saved just now", html)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,8 @@ import html
 import json
 import time
 
+from . import pagetext
+
 NAV = (
     ("cb:home", "Home", "M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"),
     ("cb:deck", "Deck", "M3 5h8v6H3zm10 0h8v6h-8zM3 13h8v6H3zm10 0h8v6h-8z"),
@@ -34,10 +36,18 @@ NAV = (
     ("cb:passwords", "Logins",
      "M6 10V7a6 6 0 1 1 12 0v3h1a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1"
      " 0 0 1 1-1zm2 0h8V7a4 4 0 0 0-8 0z"),
+    ("cb:playbooks", "Playbooks",
+     "M4 6h10M4 12h7M4 18h7M15 12.5l6 3.5-6 3.5z"),
     ("cb:data", "Data",
      "M12 3c4.97 0 9 1.34 9 3s-4.03 3-9 3-9-1.34-9-3 4.03-3 9-3zM3 9c0 1.66 4.03 3 9 3"
      "s9-1.34 9-3v4c0 1.66-4.03 3-9 3s-9-1.34-9-3zm0 6c0 1.66 4.03 3 9 3s9-1.34 9-3v4"
      "c0 1.66-4.03 3-9 3s-9-1.34-9-3z"),
+    # Sliders rather than a gear: the rail is 19px of stroke, and a gear's teeth
+    # disappear at that size into a grey blob.
+    ("cb:settings", "Settings",
+     "M3 8h6.5M15 8h6M3 16h9.5M18 16h3"
+     "M14.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0"
+     "M17.5 16a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0"),
 )
 
 
@@ -158,9 +168,13 @@ def shell(title, palette, nonce, active, body, search=None):
             '<input id="q" class="filter" type="search" placeholder="%s" value="%s" '
             'autocomplete="off">' % (_e(search[0]), _e(search[1])))
 
+    # The HUD is concatenated before the single %-format pass rather than
+    # formatted on its own: a value substituted by % is not rescanned, so its
+    # %(accent)s would reach the document as literal text.
+    sheet = _CSS + (_HUD_CSS if palette.get("name") == "phosphor" else "")
     return _DOC % {
         "title": _e(title),
-        "css": _CSS % palette,
+        "css": sheet % palette,
         "rail": rail,
         "head": _e(title),
         "search": searchbox,
@@ -175,9 +189,12 @@ def home(palette, nonce, bookmarks, recent, counts):
     """A start page that is a dashboard, not a blank rectangle."""
     n_history, n_marks = counts
 
+    # `ai` on the three that start Claude: this page's only agent controls, and
+    # the ink that means "Claude" is not the ink that means "focus".
     actions = "".join(
-        '<button class="qa" onclick="cbui.send({action:%s})">'
-        '<b>%s</b><span>%s</span></button>' % (_js(a), _e(label), _e(sub))
+        '<button class="qa%s" onclick="cbui.send({action:%s})">'
+        '<b>%s</b><span>%s</span></button>'
+        % (" ai" if a.startswith("claude:") else "", _js(a), _e(label), _e(sub))
         for a, label, sub in (
             ("claude:tldr", "TL;DR", "Summarize a page"),
             ("claude:agent", "Command", "Let Claude drive"),
@@ -214,9 +231,44 @@ def home(palette, nonce, bookmarks, recent, counts):
     return shell("Home", palette, nonce, "cb:home", body)
 
 
-def history_page(palette, nonce, rows, query="", marked=()):
+def _snippet_html(text):
+    """Render an FTS5 snippet, with its matched terms marked up.
+
+    Escaped first and marked up second, always in that order: the snippet is
+    prose from a visited page, and the only thing separating a real match from
+    a page that wrote `<mark>` into its own body is that the control characters
+    pagetext.py delimits with cannot survive being typed into HTML.
+    """
+    return (_e(text)
+            .replace(pagetext.HL_OPEN, "<mark>")
+            .replace(pagetext.HL_CLOSE, "</mark>"))
+
+
+def _text_hit(url, title, snippet):
+    letter, hue = _mark(url)
+    return """
+    <a class="row hit" href="%(url)s">
+      <span class="mark sm" style="--h:%(hue)d">%(letter)s</span>
+      <span class="ht">
+        <span class="rt">%(title)s</span>
+        <span class="hs">%(snippet)s</span>
+      </span>
+      <span class="ru">%(host)s</span>
+    </a>""" % {
+        "url": _e(url), "hue": hue, "letter": _e(letter),
+        "title": _e(title or _host(url)), "host": _e(_host(url)),
+        "snippet": _snippet_html(snippet),
+    }
+
+
+def history_page(palette, nonce, rows, query="", marked=(), fulltext=()):
+    """History, and -- when the page was loaded with a query -- what that query
+    matched in the *text* of pages, which titles and URLs alone cannot find."""
     marked = set(marked)
-    if not rows:
+    fulltext = list(fulltext)
+    if not rows and fulltext:
+        body = ""
+    elif not rows:
         body = _empty("&#8635;", "No history" if not query else "Nothing matches “%s”"
                       % html.escape(query), "")
     else:
@@ -233,10 +285,15 @@ def history_page(palette, nonce, rows, query="", marked=()):
                                row["url"] in marked, row["visits"]))
         chunks.append("</div>")
         body = "".join(chunks)
+    if fulltext:
+        body += ('<h2>Found in page text <em>%d</em></h2><div class="rows ft">%s</div>'
+                 % (len(fulltext), "".join(
+                     _text_hit(h.get("url") or "", h.get("title") or "",
+                               h.get("snippet") or "") for h in fulltext)))
     body += ('<div class="footer"><button class="danger" '
              'onclick="cbui.confirmClear()">Clear all history</button></div>')
     return shell("History", palette, nonce, "cb:history", body,
-                 search=("Search history…", query))
+                 search=("Search history — Enter searches page text", query))
 
 
 def bookmarks_page(palette, nonce, rows, query=""):
@@ -315,6 +372,123 @@ def _never_row(origin):
     }
 
 
+def playbooks_page(palette, nonce, books, recording=None, available=True):
+    """Saved sequences, and whether one is being recorded right now.
+
+    The recording banner is at the top rather than in the footer because a
+    recording that was left running is the failure mode worth catching: every
+    operation until it is stopped goes into the file, and the only place that is
+    visible is here.
+    """
+    if not available:
+        return shell("Playbooks", palette, nonce, "cb:playbooks", _empty(
+            "&#9654;", "Playbooks are unavailable",
+            "They are a file beside the browser's database, and that directory "
+            "could not be opened."))
+
+    body = _recorder_bar(recording or {})
+    if books:
+        body += '<div class="rows">%s</div>' % "".join(
+            _book_row(b) for b in books)
+    else:
+        body += _empty("&#9654;", "No playbooks yet",
+                       "Start a recording above, drive the browser through the "
+                       "sequence, then save it.")
+    return shell("Playbooks", palette, nonce, "cb:playbooks", body)
+
+
+def _recorder_bar(status):
+    """Either what is being captured, or the field that starts a capture.
+
+    The note says out loud that hand-driving the browser records nothing: the
+    capture point is the control API, so a user who starts a recording here and
+    then clicks around by hand would otherwise save an empty playbook and have
+    to guess why.
+    """
+    if status.get("recording"):
+        steps = int(status.get("steps") or 0)
+        skipped = int(status.get("skipped_secrets") or 0)
+        return """
+    <div class="rec">
+      <span class="dot"></span>
+      <span class="rt">Recording %(name)s</span>
+      <span class="ru">%(steps)d step%(plural)s captured%(skipped)s</span>
+      <button class="pbbtn" onclick="return cbui.send({action:'pb_stop'})"
+              title="Stop recording and save it under this name">Save</button>
+      <button class="pbbtn danger" onclick="return cbui.send({action:'pb_cancel'})"
+              title="Stop recording and throw it away">Discard</button>
+    </div>
+    <p class="note">%(note)s</p>""" % {
+            "name": "&ldquo;%s&rdquo;" % _e(status.get("name") or ""),
+            "steps": steps,
+            "plural": "" if steps == 1 else "s",
+            "skipped": (" &middot; %d credential field%s skipped"
+                        % (skipped, "" if skipped == 1 else "s")) if skipped else "",
+            "note": _e(
+                "The count is from when this page was drawn; reload to see it "
+                "again. Credential fields are never written to the file — the "
+                "browser's own autofill supplies those on replay."),
+        }
+
+    return """
+    <div class="rec off">
+      <input id="pbname" class="pbname" type="text" autocomplete="off"
+             spellcheck="false" placeholder="Name for a new recording">
+      <button class="pbbtn" onclick="return cbui.pbstart(event)">Start recording</button>
+    </div>
+    <p class="note">%s</p>""" % _e(
+        "A recording captures the operations Claude and cbctl perform — opening "
+        "pages, clicking, filling fields. Browsing by hand is not captured, so "
+        "drive the browser through the sequence the way you want it replayed.")
+
+
+def _book_row(book):
+    name = book.get("name") or ""
+    steps = int(book.get("steps") or 0)
+    letter = next((c for c in name if c.isalnum()), "?").upper()
+    return """
+    <div class="row book">
+      <span class="mark sm" style="--h:%(hue)d">%(letter)s</span>
+      <span class="rt">%(name)s</span>
+      <span class="ru">%(what)s</span>
+      <span class="rw">%(steps)d step%(plural)s%(when)s</span>
+      <button class="pbbtn" onclick="return cbui.pbrun(event, %(jn)s)"
+              title="Replay this playbook">Run</button>
+      <button class="pbbtn danger" onclick="return cbui.pbdrop(event, %(jn)s)"
+              title="Delete this playbook">Delete</button>
+    </div>""" % {
+        "hue": _hue(name), "letter": _e(letter), "name": _e(name),
+        "what": _e(_what_it_does(book.get("ops") or [])),
+        "steps": steps, "plural": "" if steps == 1 else "s",
+        "when": (" &middot; saved %s" % _e(_ago(book["created"])))
+                if book.get("created") else "",
+        "jn": _js(name),
+    }
+
+
+def _what_it_does(ops, limit=6):
+    """The op sequence as one readable line.
+
+    Only the op names are available here -- `summaries()` deliberately does not
+    hand out the parameters, which is where the URLs and selectors are -- so the
+    line says the shape of the sequence rather than its targets. Runs are
+    collapsed, because "click, click, click" reads as a stutter where
+    "click x3" reads as a count.
+    """
+    groups = []
+    for op in ops:
+        label = str(op or "?")
+        if groups and groups[-1][0] == label:
+            groups[-1][1] += 1
+        else:
+            groups.append([label, 1])
+    shown = ["%s%s" % (label, "" if n == 1 else " ×%d" % n)
+             for label, n in groups[:limit]]
+    if len(groups) > limit:
+        shown.append("…")
+    return " → ".join(shown) or "nothing to replay"
+
+
 def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
               light=None):
     """What the browser is holding: memory, and what is on disk.
@@ -352,6 +526,9 @@ def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
           %(light)s
         </div>
         <p class="note">%(light_note)s</p>
+        <div class="footer">
+          %(light_button)s
+        </div>
       </section>
       <section>
         <h2>Cookies &amp; cache</h2>
@@ -408,21 +585,28 @@ def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
             ("Limit for agent-opened tabs", machine.get("tab_ceiling", "—")),
             ("Loading right now", machine.get("loading", 0)),
         )),
-        # Reported rather than made switchable here, because it takes effect at
-        # web-process start: a button that appeared to toggle it would be lying
-        # about every tab already open. CB_LIGHT plus a restart is the honest
-        # shape, and this row is how you find out which way it is set.
+        # Two rows rather than one, because after the switch below is used they
+        # can disagree: the header follows immediately, the animation setting was
+        # read once at startup and cannot. Reporting them together as a single
+        # "light mode: on" would make the second one a lie for the rest of the
+        # session. `motion` is what tune_gtk was actually told; it falls back to
+        # the header state for a caller that does not pass it.
         "light": "".join(_fact(label, value) for label, value in (
             ("Ask sites for a lighter page",
              "on (Save-Data: on)" if (light or {}).get("enabled") else "off"),
             ("Reduced motion",
-             "requested" if (light or {}).get("enabled") else "not requested"),
+             "requested at startup" if (light or {}).get(
+                 "motion", (light or {}).get("enabled")) else "not requested"),
         )),
         "light_note": _e(
             "Servers that honour Save-Data send smaller images and fewer fonts. "
             "It rides on pages this browser loads for you, not on files a page "
-            "fetches for itself — WebKitGTK gives no way to reach those. "
-            "Set CB_LIGHT=0 and restart if a site serves you a degraded page."),
+            "fetches for itself — WebKitGTK gives no way to reach those. The "
+            "switch takes effect on the next page load and is remembered as "
+            "CB_LIGHT in your settings file. Reduced motion is the half that "
+            "cannot follow: WebKit reads it once, before the first tab exists, "
+            "so it stays as it was until the browser restarts."),
+        "light_button": _light_button(bool((light or {}).get("enabled"))),
         "store": "".join(_fact(label, value) for label, value in (
             ("Cookie policy", {"all": "accept all",
                                "none": "reject all",
@@ -456,6 +640,170 @@ def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
         "pagetext_button": _clear_button("pagetext", "Clear page text"),
     }
     return shell("Data", palette, nonce, "cb:data", body)
+
+
+def settings_page(palette, nonce, described, notice=None):
+    """Every setting in the browser, editable.
+
+    The page renders what `settings.describe()` hands it and knows nothing else
+    about any particular key: a knob added to that table appears here with its
+    own control, its own explanation and its own honest note about when it
+    lands, with nothing to remember on this side.
+
+    Values are treated as hostile text throughout. Most of them are, in the
+    ordinary case, typed by the user -- but the settings file is also editable
+    by hand and by anything else running as this user, and a search template of
+    `"><script>` reaching this document unescaped would be script running in a
+    page that holds the message nonce.
+    """
+    banner = ""
+    if notice:
+        banner = ('<div class="notice %s">%s</div>'
+                  % ("bad" if notice.get("error") else "",
+                     _e(notice.get("error") or notice.get("message") or "")))
+
+    chunks = [banner]
+    for section in described.get("sections") or []:
+        rows = "".join(_setting_row(item) for item in section.get("settings") or [])
+        chunks.append("""
+      <section>
+        <h2>%(title)s</h2>
+        <p class="note">%(note)s</p>
+        <div class="rows">%(rows)s</div>
+      </section>""" % {"title": _e(section.get("title") or ""),
+                       "note": _e(section.get("note") or ""),
+                       "rows": rows})
+
+    chunks.append(
+        '<p class="note">%s <code>%s</code>. %s</p>'
+        % (_e("Every one of these is a line in"), _e(described.get("path") or ""),
+           _e("Editing that file by hand does the same thing, and your API key "
+              "lives there too — it is deliberately not editable from here.")))
+    return shell("Settings", palette, nonce, "cb:settings", "".join(chunks))
+
+
+def _setting_row(item):
+    """One setting: what it is, when a change lands, and the control for it."""
+    kind = item.get("kind")
+    control = {
+        "bool": _set_toggle,
+        "choice": _set_select,
+        "secret": _set_secret,
+    }.get(kind, _set_input)(item)
+
+    # Offered only when there is a line to remove. A "Default" button on a
+    # setting that is already the default does nothing, and a button that does
+    # nothing is one people stop trusting.
+    reset = ""
+    if item.get("in_file"):
+        reset = ('<button class="pbbtn" title="%s" onclick="return cbui.setreset(event, %s)"'
+                 '>Default</button>'
+                 % (_e("Remove the line and go back to the browser's default"),
+                    _js(item.get("key") or "")))
+
+    return """
+    <div class="row set">
+      <span class="sl">
+        <span class="rt">%(label)s</span>
+        <span class="sx">%(explain)s</span>
+        <span class="eff" title="%(note)s">%(effect)s</span>%(source)s
+      </span>
+      <span class="sc">%(control)s%(reset)s</span>
+    </div>""" % {
+        "label": _e(item.get("label") or item.get("key") or ""),
+        "explain": _e(item.get("explain") or ""),
+        "effect": _e(item.get("effect") or ""),
+        "note": _e(item.get("effect_note") or ""),
+        # Named because it changes what "Default" means: a value inherited from
+        # the environment survives the line being removed, and a user who does
+        # not know that reads the button as broken.
+        "source": ('<span class="eff env" title="%s">from your environment</span>'
+                   % _e("This browser was launched by a shell that exported it. "
+                        "Setting it here writes the settings file, which wins.")
+                   ) if item.get("source") == "environment" else "",
+        "control": control,
+        "reset": reset,
+    }
+
+
+def _set_toggle(item):
+    """A boolean. Posts the state it wants rather than a flip, for the reason
+    `_light_button` does: a page left open while the value changed elsewhere
+    would otherwise toggle against something it is no longer showing."""
+    on = bool(item.get("on"))
+    return ('<button class="pbbtn%(cls)s" onclick="return cbui.setting(event, %(key)s, %(want)s)"'
+            ' title="%(tip)s">%(text)s</button>'
+            % {"cls": " on" if on else "",
+               "key": _js(item.get("key") or ""),
+               "want": _js("0" if on else "1"),
+               "tip": _e("Turn it off" if on else "Turn it on"),
+               "text": "On" if on else "Off"})
+
+
+def _set_select(item):
+    options = "".join(
+        '<option value="%s"%s>%s</option>'
+        % (_e(choice.get("value")),
+           " selected" if choice.get("value") == item.get("value") else "",
+           _e(choice.get("label")))
+        for choice in item.get("choices") or [])
+    return ('<select class="sin pick" onchange="return cbui.setpick(event, %s)">%s</select>'
+            % (_js(item.get("key") or ""), options))
+
+
+def _set_input(item):
+    """A number or a free-text value, with its own Save button.
+
+    Not saved on every keystroke: each save is a rewrite of the user's settings
+    file, and a half-typed URL is a value the validator would rightly refuse
+    four times per word.
+    """
+    number = item.get("kind") == "number"
+    attrs = ""
+    if number:
+        for name, key in (("min", "minimum"), ("max", "maximum"), ("step", "step")):
+            if item.get(key) is not None:
+                attrs += ' %s="%s"' % (name, _e(item.get(key)))
+    return ('<input class="sin" type="%(type)s" value="%(value)s"%(attrs)s '
+            'data-k="%(dkey)s" autocomplete="off" spellcheck="false" %(unit)s>'
+            '<button class="pbbtn" onclick="return cbui.setinput(event, %(key)s)">Save</button>'
+            % {"type": "number" if number else "text",
+               "value": _e(item.get("value") or ""),
+               "attrs": attrs,
+               "dkey": _e(item.get("key") or ""),
+               "unit": ('title="%s"' % _e(item.get("unit"))) if item.get("unit") else "",
+               "key": _js(item.get("key") or "")})
+
+
+def _set_secret(item):
+    """The control token. Its value is never in this document.
+
+    The field starts empty whether or not a token is set -- the placeholder is
+    the only thing that says which -- so a new one can be typed without the old
+    one ever having been rendered, and "Default" is how it is cleared.
+    """
+    return ('<input class="sin" type="password" value="" autocomplete="off" '
+            'spellcheck="false" data-k="%(dkey)s" placeholder="%(hint)s">'
+            '<button class="pbbtn" onclick="return cbui.setinput(event, %(key)s)">Save</button>'
+            % {"hint": _e("A token is set — type a new one to replace it"
+                          if item.get("set") else "No token — the API is open to "
+                          "anything on this machine"),
+               "dkey": _e(item.get("key") or ""),
+               "key": _js(item.get("key") or "")})
+
+
+def _light_button(enabled):
+    """The on/off switch for the Save-Data hint.
+
+    It posts the state it wants rather than "flip it": a cb:data tab left open
+    while the setting was changed elsewhere would otherwise toggle against a
+    value it is no longer showing. Unarmed, unlike the clear buttons -- nothing
+    is destroyed, and the same click turns it back.
+    """
+    want = "off" if enabled else "on"
+    return ('<button data-want="%s" onclick="return cbui.send('
+            '{action:\'set_light\', title:%s})">%s</button>'
+            % (want, _js(want), _e("Turn it off" if enabled else "Turn it on")))
 
 
 def _clear_button(kind, label):
@@ -562,6 +910,11 @@ _CSS = """
   --bg:%(bg)s; --card:%(bar)s; --panel:%(panel)s; --line:%(line)s; --text:%(text)s;
   --dim:%(dim)s; --accent:%(accent)s; --soft:%(accent_soft)s; --on:%(on_accent)s;
   --ok:%(ok)s; --warn:%(warn)s; --field:%(field)s;
+  /* The rest of the contract, so this sheet can say "Claude" (--agent) without
+     borrowing the chrome's focus colour, and can draw structure (--edge) with
+     something other than the load-bearing 1px rule. */
+  --edge:%(edge)s; --agent:%(agent)s; --agent-soft:%(agent_soft)s;
+  --mono:%(mono)s;
 }
 * { box-sizing:border-box; }
 html,body { margin:0; height:100%%; }
@@ -569,6 +922,14 @@ body {
   background:var(--bg); color:var(--text);
   font:14px/1.5 system-ui,-apple-system,"Segoe UI",Cantarell,sans-serif;
   display:flex; min-height:100%%;
+  /* The static scanline the chrome carries, at 3%% (`08` is the alpha byte).
+     `grid` equals `bg` in dark and light, so there this is the surface painted
+     over itself and resolves to nothing -- one cached gradient, no branch, and
+     and never animated, because a background that repaints forever
+     is the one thing this browser exists not to do. Written against the raw token because a hex
+     alpha suffix cannot be appended to a var(). */
+  background-image:repeating-linear-gradient(
+    to bottom, %(grid)s08 0, %(grid)s08 1px, transparent 1px, transparent 3px);
 }
 ::selection { background:var(--accent); color:var(--on); }
 
@@ -618,11 +979,19 @@ header h1 { font-size:20px; font-weight:650; margin:0; letter-spacing:-.01em; }
 .qa b { font-size:13px; font-weight:620; }
 .qa span { font-size:11.5px; color:var(--dim); }
 .qa:hover { border-color:var(--accent); background:var(--soft); }
+/* The three actions that start Claude carry the agent ink, not the chrome
+   accent. In dark and light the two tokens are the same coral, so this changes
+   nothing there and everything in phosphor -- which is the point of the split:
+   "Claude is doing something" must never be re-read as "this has focus". */
+.qa.ai b { color:var(--agent); }
+.qa.ai:hover { border-color:var(--agent); background:var(--agent-soft); }
 
 section { margin-bottom:30px; }
 h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim);
      font-weight:700; margin:0 0 11px; display:flex; align-items:center; gap:8px; }
-h2 em { font-style:normal; font-weight:500; color:var(--line); }
+/* --dim, not --line: a count beside a heading is text you are meant to read,
+   and --line is a hairline colour that sits near 1:1 against the surface. */
+h2 em { font-style:normal; font-weight:500; color:var(--dim); }
 h2 .more { margin-left:auto; color:var(--accent); text-decoration:none;
            font-size:11px; letter-spacing:.04em; }
 h2 .more:hover { text-decoration:underline; }
@@ -668,6 +1037,29 @@ h2 .more:hover { text-decoration:underline; }
 .row.login:hover .act { opacity:1; }
 .rows + h2 { margin-top:26px; }
 
+/* cb:playbooks. The recording banner is loud on purpose: a capture left running
+   keeps recording everything the API does, and this page is the only place that
+   fact is visible. Its buttons are always shown for the same reason the ones on
+   cb:passwords are -- they are what the page is for. */
+.rec { display:flex; align-items:center; gap:11px; border-radius:11px;
+       padding:11px 12px; margin-bottom:6px;
+       border:1px solid var(--accent); background:var(--soft); }
+.rec.off { border-color:var(--line); background:var(--card); }
+.rec .dot { flex:0 0 auto; width:9px; height:9px; border-radius:50%%;
+            background:var(--warn); }
+.rec .rt { font-weight:620; max-width:none; }
+.pbname { flex:1 1 auto; min-width:0; background:var(--field); color:var(--text);
+          border:1px solid var(--line); border-radius:8px; padding:7px 12px;
+          font:13px system-ui,sans-serif; }
+.pbname:focus { outline:none; border-color:var(--accent); }
+.pbbtn { flex:0 0 auto; background:var(--card); color:var(--text); cursor:pointer;
+         border:1px solid var(--line); border-radius:7px; padding:4px 11px;
+         font:12px system-ui,sans-serif; }
+.pbbtn:hover { border-color:var(--accent); }
+.pbbtn.danger:hover { border-color:var(--warn); color:var(--warn); }
+.pbbtn[disabled] { opacity:.55; cursor:default; }
+.rec + .note { margin-top:8px; }
+
 .day { font-size:11.5px; text-transform:uppercase; letter-spacing:.07em;
        color:var(--dim); font-weight:700; margin:22px 0 8px; }
 .rows { display:flex; flex-direction:column; gap:4px; }
@@ -677,6 +1069,18 @@ h2 .more:hover { text-decoration:underline; }
 .ru { flex:1 1 auto; font-size:11.5px; color:var(--dim); white-space:nowrap;
       overflow:hidden; text-overflow:ellipsis; }
 .rw { flex:0 0 auto; font-size:11px; color:var(--dim); }
+
+/* full-text hits: two lines, because the snippet is the answer to "why did this
+   page match?" and a one-line row would ellipsize exactly that away. */
+.row.hit { align-items:flex-start; padding:9px 10px; }
+.ht { min-width:0; flex:1 1 auto; display:flex; flex-direction:column; gap:2px; }
+.row.hit .rt { max-width:100%%; }
+.hs { font-size:12px; color:var(--dim); line-height:1.45;
+      display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+      overflow:hidden; }
+.hs mark { background:var(--soft); color:var(--text); border-radius:3px;
+           padding:0 2px; }
+.row.hit .ru { flex:0 0 auto; max-width:30%%; }
 
 /* A saved password renders as dots until it is asked for; `.shown` is the only
    state in which a secret is in this document at all. */
@@ -722,6 +1126,34 @@ h2 .more:hover { text-decoration:underline; }
 .note { color:var(--dim); font-size:12px; line-height:1.55; margin:14px 2px 0;
         max-width:62ch; }
 
+/* cb:settings. Two columns that collapse: the explanation is the widest thing
+   on the page and the control the smallest, so the row wraps rather than
+   ellipsizing away the sentence that says what the knob does. */
+.row.set { align-items:flex-start; padding:11px 12px; gap:14px; flex-wrap:wrap; }
+.sl { flex:1 1 340px; min-width:0; display:flex; flex-direction:column; gap:3px; }
+.row.set .rt { max-width:100%%; font-weight:600; white-space:normal; }
+.sx { font-size:11.5px; color:var(--dim); line-height:1.5; }
+.sc { flex:0 0 auto; margin-left:auto; display:flex; align-items:center; gap:6px; }
+.eff { display:inline-block; margin-top:3px; font-size:9.5px; font-weight:700;
+       text-transform:uppercase; letter-spacing:.06em; padding:2px 6px;
+       border-radius:5px; background:var(--panel); color:var(--dim);
+       align-self:flex-start; }
+.eff.env { background:var(--soft); color:var(--accent); margin-left:5px; }
+.sin { background:var(--field); color:var(--text); border:1px solid var(--line);
+       border-radius:8px; padding:6px 10px; font:13px system-ui,sans-serif;
+       min-width:120px; max-width:340px; }
+.sin:focus { outline:none; border-color:var(--accent); }
+.sin.pick { min-width:180px; }
+.pbbtn.on { border-color:var(--accent); color:var(--accent); background:var(--soft); }
+
+/* The one place a refused value is explained. Rendered from the browser, above
+   everything, because the control that was refused has already snapped back to
+   the stored value and would otherwise be the only clue. */
+.notice { border:1px solid var(--accent); background:var(--soft); color:var(--text);
+          border-radius:10px; padding:10px 13px; margin:0 0 20px;
+          font-size:12.5px; line-height:1.5; }
+.notice.bad { border-color:var(--warn); }
+
 .empty { text-align:center; color:var(--dim); padding:44px 16px; grid-column:1/-1; }
 .ei { font-size:26px; opacity:.5; margin-bottom:8px; }
 .eh { font-size:12px; margin-top:5px; opacity:.85; }
@@ -743,6 +1175,130 @@ kbd { background:var(--panel); border:1px solid var(--line); border-bottom-width
   .main { padding:18px 15px 50px; }
   .rt { max-width:100%%; } .ru { display:none; }
 }
+
+/* Every transition on this page is a one-shot on interaction -- a border
+   lighting on hover, a row fading as it is deleted -- and none of them is
+   allowed to survive a stated preference against motion. This is the live
+   branch on this machine, not a courtesy: WebKitGTK maps
+   `prefers-reduced-motion` onto GTK's `gtk-enable-animations`, and
+   perf.tune_gtk turns that off whenever CB_LIGHT is on, which is the default.
+   `!important` because the JS in _DOC sets `style.transition` inline when it
+   removes a row, and an inline declaration outranks any rule that is not. */
+@media (prefers-reduced-motion:reduce) {
+  * { transition:none !important; animation:none !important;
+      scroll-behavior:auto !important; }
+}
+"""
+
+# ---------------------------------------------------------------------------
+# The HUD layer, appended for the phosphor theme only -- the same arrangement
+# style.py uses for the chrome, so the two halves of the browser are read and
+# edited the same way, and so dark and light keep exactly the pages they had.
+#
+# Every rule below is geometry or type. Not one of them introduces an ink: the
+# colours are the tokens the base sheet already declared, each already held to
+# its contrast floor by tests/test_style.py. What "HUD" means here, in the same
+# terms as the chrome:
+#
+#   * square corners, everywhere, without exception.
+#   * bracketed slots instead of boxes. A field is held between two 2px uprights
+#     that light on focus, matching the omnibox exactly.
+#   * registration marks. Two corner brackets per surface, diagonally opposite;
+#     four would just be a second border.
+#   * micro-labels: monospaced, uppercase, tracked hard. Applied only to the
+#     legends -- headings, badges, counters. The titles, hosts, snippets and
+#     explanations under them stay proportional, because they are what the
+#     instrument is *showing*, not what it is labelled with.
+#   * one glow, on focus. 1px hard edge plus bloom, which is the CRT tell, and
+#     it happens on interaction rather than on a timer.
+# ---------------------------------------------------------------------------
+_HUD_CSS = """
+/* A radius is the loudest 2010s-app tell there is; a HUD is drawn with a
+   plotter. This is the single largest part of the difference. */
+.railbtn, .filter, .bigbar, .qa, .tile, .row, .card, .mark, .act, .pbname,
+.pbbtn, .rec, .badge, .lvl, .eff, .sin, .notice, .bar, .bar i, .pw.shown,
+.hs mark, kbd, .footer button { border-radius:0; }
+
+/* Structure is drawn in --edge; --line stays the load-bearing rule it is. */
+.rail { border-right:1px solid %(edge)s; }
+.tile, .row, .card, .rec.off { border-color:%(edge)s; }
+.mark { border-color:%(edge)s; }
+
+/* ---- type: legends are engraved, content is not ---- */
+.railbtn, h1, h2, .day, .badge, .lvl, .eff, .rw, .pbbtn, .footer button,
+.qa b, kbd, .curl { font-family:%(mono)s; }
+h1 { text-transform:uppercase; letter-spacing:.16em; font-size:17px;
+     font-weight:600; }
+/* Brackets around the page name: the cheapest way to say "this is a readout",
+   and it needs no extra element in the document. */
+h1::before { content:"["; color:%(accent)s; margin-right:7px; }
+h1::after { content:"]"; color:%(accent)s; margin-left:7px; }
+header { border-bottom:1px solid %(edge)s; padding-bottom:13px; }
+h2, .day { letter-spacing:.2em; font-size:11px; }
+h2 { border-bottom:1px solid %(edge)s; padding-bottom:7px; }
+.badge, .lvl, .eff { letter-spacing:.14em; }
+.railbtn { text-transform:uppercase; letter-spacing:.1em; font-size:9.5px; }
+.railbtn.on { box-shadow:inset 2px 0 0 %(accent)s; }
+
+/* ---- registration marks ---- */
+.tile, .card, .qa, .rec, .notice { position:relative; }
+.tile::before, .tile::after, .card::before, .card::after,
+.qa::before, .qa::after, .rec::before, .rec::after,
+.notice::before, .notice::after {
+  content:""; position:absolute; width:6px; height:6px;
+  border:1px solid %(edge)s; pointer-events:none;
+}
+.tile::before, .card::before, .qa::before, .rec::before, .notice::before {
+  top:-1px; left:-1px; border-right:none; border-bottom:none;
+}
+.tile::after, .card::after, .qa::after, .rec::after, .notice::after {
+  bottom:-1px; right:-1px; border-left:none; border-top:none;
+}
+.tile:hover::before, .tile:hover::after,
+.card:hover::before, .card:hover::after,
+.qa:hover::before, .qa:hover::after { border-color:%(accent)s; }
+.card.cur::before, .card.cur::after { border-color:%(accent)s; }
+/* The Claude quick actions keep their amber marks even under the hover rule
+   above, which would otherwise repaint them cyan the moment the pointer lands
+   on the one control on this page that starts the agent. */
+.qa.ai::before, .qa.ai::after,
+.qa.ai:hover::before, .qa.ai:hover::after { border-color:%(agent)s; }
+.qa.ai:hover { box-shadow:0 0 10px -2px %(agent)s66; }
+
+/* ---- fields as bracketed slots, exactly as the omnibox is ---- */
+.filter, .bigbar, .pbname, .sin {
+  border:1px solid %(line)s;
+  border-left:2px solid %(edge)s;
+  border-right:2px solid %(edge)s;
+  font-family:%(mono)s;
+}
+.filter:focus, .bigbar:focus, .pbname:focus, .sin:focus {
+  border-color:%(line)s;
+  border-left-color:%(accent)s; border-right-color:%(accent)s;
+  box-shadow:0 0 0 1px %(accent)s73, 0 0 10px %(accent)s4d;
+}
+.bigbar { padding:15px 18px; }
+
+/* ---- controls read as switch positions: a hairline that lights ---- */
+.pbbtn, .footer button, .qa { border-color:%(line)s; }
+.pbbtn:hover, .footer button:hover, .tile:hover, .card:hover, .qa:hover {
+  border-color:%(accent)s; box-shadow:0 0 10px -2px %(accent)s66;
+}
+.pbbtn.danger:hover, .footer .danger:hover {
+  border-color:%(warn)s; box-shadow:0 0 10px -2px %(warn)s66;
+}
+.pbbtn.on { box-shadow:0 0 10px -2px %(accent)s66; }
+/* The hover lift is the one motion left; a HUD does not float. */
+.tile:hover, .card:hover { transform:none; }
+.railbtn:hover { background:%(field_focus)s; }
+
+/* ---- readouts ---- */
+.bar { border-color:%(edge)s; background:%(field)s; height:9px; }
+.rec .dot { border-radius:0; box-shadow:0 0 8px %(warn)s; }
+.rec { box-shadow:0 0 14px -4px %(accent)s80; }
+.card.cur { box-shadow:0 0 0 1px %(accent)s, 0 0 14px -3px %(accent)s80; }
+.card.priv { border-style:dashed; }
+kbd { border-bottom-width:1px; border-color:%(edge)s; }
 """
 
 _DOC = """<!doctype html>
@@ -810,6 +1366,72 @@ _DOC = """<!doctype html>
                 setTimeout(function () { el.remove(); }, 120); }
       return this.send({action: 'pw_allow', url: origin});
     },
+    pbstart: function (ev) {
+      ev.preventDefault();
+      var box = document.getElementById('pbname');
+      var name = box ? box.value.trim() : '';
+      // Refused here rather than round-tripped: an empty name comes back from
+      // clean_name as an error flash, which reads as a bug in the button.
+      if (!name) { if (box) box.focus(); return false; }
+      return this.send({action: 'pb_start', title: name});
+    },
+    pbrun: function (ev, name) {
+      ev.preventDefault();
+      // A replay walks pages one step at a time and can take a while. Disabling
+      // the button is what stops a second click starting a second walk over the
+      // same tab.
+      var b = ev.currentTarget;
+      b.disabled = true;
+      b.textContent = 'Running…';
+      return this.send({action: 'pb_run', title: name});
+    },
+    pbdrop: function (ev, name) {
+      // Armed like the clear buttons, and never a modal dialog -- one inside a
+      // WebView blocks this embedder's main loop. Deleting a playbook is not
+      // undoable, so it takes two clicks.
+      ev.preventDefault();
+      var b = ev.currentTarget;
+      if (b.dataset.armed) {
+        b.disabled = true;
+        b.textContent = 'Deleting…';
+        return this.send({action: 'pb_delete', title: name});
+      }
+      b.dataset.armed = '1';
+      b.textContent = 'Click again';
+      setTimeout(function () {
+        delete b.dataset.armed; b.textContent = 'Delete';
+      }, 4000);
+      return false;
+    },
+    // cb:settings. Every one of these posts {action, url: key, title: value} --
+    // the message shape is fixed at {action, url, title}, so the key travels as
+    // the url and the value as the title, the way clear_data carries its kind.
+    setting: function (ev, key, value) {
+      ev.preventDefault();
+      return this.send({action: 'set_setting', url: key, title: value});
+    },
+    setpick: function (ev, key) {
+      return this.send({action: 'set_setting', url: key,
+                        title: ev.currentTarget.value});
+    },
+    setinput: function (ev, key) {
+      // The box is found from the element that fired rather than by key, so
+      // nothing here has to build a selector out of a settings name.
+      ev.preventDefault();
+      var el = ev.currentTarget;
+      var box = el.tagName === 'INPUT' ? el : el.parentNode.querySelector('input');
+      if (!box) return false;
+      var value = box.value;
+      // A password field is cleared on the way out: the token has already been
+      // handed over, and leaving it sitting in the DOM is the thing the field
+      // exists to avoid.
+      if (box.type === 'password') { box.value = ''; }
+      return this.send({action: 'set_setting', url: key, title: value});
+    },
+    setreset: function (ev, key) {
+      ev.preventDefault();
+      return this.send({action: 'reset_setting', url: key});
+    },
     confirmData: function (ev, kind, label) {
       // Same two-click arming as confirmClear, and for the same reason: a
       // window.confirm() inside a WebView blocks this embedder's main loop.
@@ -854,13 +1476,34 @@ _DOC = """<!doctype html>
     });
   }
 
+  var pbname = document.getElementById('pbname');
+  if (pbname) {
+    pbname.focus();
+    pbname.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { cbui.pbstart(e); }
+    });
+  }
+
+  // Enter saves the field it was pressed in, which is what anyone who has just
+  // typed a URL into a box expects. The Save button beside it stays, because
+  // the same box is also changed with the arrow keys of a number spinner.
+  document.querySelectorAll('input.sin').forEach(function (box) {
+    box.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { cbui.setinput(e, box.dataset.k); }
+    });
+  });
+
   // Filtering is local: re-rendering from Python on every keystroke would mean
-  // a full page load per character.
+  // a full page load per character. Enter is the exception -- searching the text
+  // of pages is a database query, so it costs one navigation, deliberately.
   var q = document.getElementById('q');
   if (q) {
     var apply = function () {
       var needle = q.value.toLowerCase();
-      document.querySelectorAll('.tile, .row').forEach(function (el) {
+      // .hit rows are server-rendered answers to the submitted query; the
+      // needle being typed now is not what matched them, and a substring test
+      // against a snippet would hide results the user just asked for.
+      document.querySelectorAll('.tile, .row:not(.hit)').forEach(function (el) {
         var hit = el.textContent.toLowerCase().indexOf(needle) !== -1 ||
                   (el.getAttribute('href') || '').toLowerCase().indexOf(needle) !== -1;
         el.style.display = hit ? '' : 'none';
@@ -876,6 +1519,13 @@ _DOC = """<!doctype html>
     };
     q.addEventListener('input', apply);
     if (q.value) apply();
+    q.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter') return;
+      if ((location.href || '').toLowerCase().indexOf('cb:history') !== 0) return;
+      cbui.send({action: 'go',
+                 url: 'cb:history' + (q.value.trim()
+                        ? '?q=' + encodeURIComponent(q.value.trim()) : '')});
+    });
   }
 
   document.addEventListener('keydown', function (e) {
