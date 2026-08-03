@@ -57,6 +57,7 @@ MENU_SECTIONS = (
     )),
     ("This page", (
         ("edit-find-symbolic", "Find on page", "Ctrl+F", "find"),
+        ("view-paged-symbolic", "Reader mode", "Ctrl+Alt+R", "reader"),
     )),
     ("Machine", (
         ("drive-harddisk-symbolic", "Cookies & cache", "", "cb:data"),
@@ -279,6 +280,10 @@ class Browser(Gtk.Window):
         # Before any WebView exists: WebKit reads the GTK settings block once at
         # web-process start as well as watching it, so flipping this after the
         # first page is already laid out would be a re-layout for nothing.
+        # Remembered because the switch on cb:data can change CB_LIGHT later, and
+        # the animations are then no longer whatever the setting says they are --
+        # that page reports what was applied, not what would be applied now.
+        self.light_at_start = perf.light_enabled()
         for note in perf.tune_gtk(settings):
             print("perf: %s" % note, flush=True)
 
@@ -1024,7 +1029,8 @@ class Browser(Gtk.Window):
                                    pagetext_info=(self.pagetext.stats()
                                                   if self.pagetext else None),
                                    light={"enabled": perf.light_enabled(),
-                                          "hints": perf.hint_headers()})
+                                          "hints": perf.hint_headers(),
+                                          "motion": self.light_at_start})
 
         if name == "passwords":
             if self.vault is None:
@@ -1100,6 +1106,20 @@ class Browser(Gtk.Window):
                 self._reload_internal()
 
             self._clear_kind(title, cleared)
+        elif action == "set_light":
+            # `title` carries the wanted state ("on"/"off") for the same reason
+            # clear_data puts the kind there, and it is the state rather than a
+            # flip so a stale cb:data tab cannot invert a setting it is no longer
+            # showing. Parsed by the same spelling-tolerant reader as CB_LIGHT.
+            wanted = perf.light_enabled(title)
+            try:
+                perf.remember(wanted)
+            except (OSError, ValueError) as e:
+                self._flash("Could not save that setting: %s" % e)
+            else:
+                self._flash("Lighter pages on — from the next page load"
+                            if wanted else "Lighter pages off")
+                self._reload_internal()
         elif action == "clear_history" and self.store:
             self.store.clear_history()
             self.store.flush()
@@ -1916,6 +1936,7 @@ class Browser(Gtk.Window):
             "newtab": lambda: self.new_tab(HOME),
             "private": lambda: self.new_tab(HOME, private=True),
             "find": self.findbar.open,
+            "reader": self.toggle_reader,
         }[key]()
 
     # -- saved logins -------------------------------------------------------

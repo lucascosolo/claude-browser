@@ -14,21 +14,39 @@ nothing at all.
 """
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 
-from claudebrowser import pages, perf, style
+from claudebrowser import envfile, pages, perf, style
 
 
-class TestKnob(unittest.TestCase):
+class Isolated(unittest.TestCase):
+    """CB_LIGHT now comes from the settings file first, so every test here needs
+    a settings file of its own. Without this, a developer who has used the
+    switch on cb:data once has a real ~/.config/claude-browser/env that decides
+    what these assertions see."""
+
     def setUp(self):
-        self.saved = os.environ.get(perf.LIGHT_ENV)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = Path(self.tmp.name) / "claude-browser" / "env"
+
+        for name in ("XDG_CONFIG_HOME", perf.LIGHT_ENV):
+            saved = os.environ.get(name)
+            self.addCleanup(self._restore, name, saved)
+        os.environ["XDG_CONFIG_HOME"] = self.tmp.name
         os.environ.pop(perf.LIGHT_ENV, None)
 
-    def tearDown(self):
-        os.environ.pop(perf.LIGHT_ENV, None)
-        if self.saved is not None:
-            os.environ[perf.LIGHT_ENV] = self.saved
+    @staticmethod
+    def _restore(name, saved):
+        if saved is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = saved
 
+
+class TestKnob(Isolated):
     def test_it_defaults_on(self):
         self.assertTrue(perf.light_enabled())
 
@@ -53,16 +71,7 @@ class TestKnob(unittest.TestCase):
         self.assertTrue(perf.light_enabled())
 
 
-class TestHeaders(unittest.TestCase):
-    def setUp(self):
-        self.saved = os.environ.get(perf.LIGHT_ENV)
-        os.environ.pop(perf.LIGHT_ENV, None)
-
-    def tearDown(self):
-        os.environ.pop(perf.LIGHT_ENV, None)
-        if self.saved is not None:
-            os.environ[perf.LIGHT_ENV] = self.saved
-
+class TestHeaders(Isolated):
     def test_save_data_is_what_goes_out(self):
         self.assertEqual(perf.hint_headers(), {"Save-Data": "on"})
 
@@ -105,7 +114,7 @@ class TestHeaders(unittest.TestCase):
         self.assertIsNone(perf.make_request("https://example.com/"))
 
 
-class TestLoadUrl(unittest.TestCase):
+class TestLoadUrl(Isolated):
     """`load_url` picks a WebKit call; which one it picks is the whole logic."""
 
     class FakeView:
@@ -117,15 +126,6 @@ class TestLoadUrl(unittest.TestCase):
 
         def load_request(self, request):
             self.calls.append(("load_request", request))
-
-    def setUp(self):
-        self.saved = os.environ.get(perf.LIGHT_ENV)
-        os.environ.pop(perf.LIGHT_ENV, None)
-
-    def tearDown(self):
-        os.environ.pop(perf.LIGHT_ENV, None)
-        if self.saved is not None:
-            os.environ[perf.LIGHT_ENV] = self.saved
 
     def test_on_it_loads_a_request(self):
         view = self.FakeView()
@@ -141,7 +141,7 @@ class TestLoadUrl(unittest.TestCase):
         self.assertEqual(view.calls, [("load_uri", "https://example.com/")])
 
 
-class TestTuneGtk(unittest.TestCase):
+class TestTuneGtk(Isolated):
     """The GTK half. A real Gtk.Settings needs a display; what is testable is
     that the right property is asked for, and that it is left alone when the
     knob is off."""
@@ -155,15 +155,6 @@ class TestTuneGtk(unittest.TestCase):
             if self.fail:
                 raise TypeError("no such property")
             self.props[name] = value
-
-    def setUp(self):
-        self.saved = os.environ.get(perf.LIGHT_ENV)
-        os.environ.pop(perf.LIGHT_ENV, None)
-
-    def tearDown(self):
-        os.environ.pop(perf.LIGHT_ENV, None)
-        if self.saved is not None:
-            os.environ[perf.LIGHT_ENV] = self.saved
 
     def test_it_turns_animations_off(self):
         settings = self.FakeSettings()
@@ -205,7 +196,7 @@ class TestDataPageSurface(unittest.TestCase):
         html = self.render({"enabled": True})
         self.assertIn("Ask sites for a lighter page", html)
         self.assertIn("Save-Data: on", html)
-        self.assertIn("CB_LIGHT=0", html)
+        self.assertIn("CB_LIGHT", html)
 
     def test_it_says_when_it_is_off(self):
         html = self.render({"enabled": False})
@@ -218,6 +209,86 @@ class TestDataPageSurface(unittest.TestCase):
         page with no error anywhere."""
         html = self.render(None)
         self.assertIn("Ask sites for a lighter page", html)
+
+    def test_the_switch_offers_the_other_state(self):
+        self.assertIn("Turn it off", self.render({"enabled": True}))
+        self.assertIn("Turn it on", self.render({"enabled": False}))
+
+    def test_the_switch_posts_the_state_it_wants(self):
+        """Not a flip: the button carries "on" or "off" so a cb:data tab that
+        has been sitting open cannot invert a setting changed since it rendered."""
+        self.assertIn('{action:\'set_light\', title:&quot;off&quot;}',
+                      self.render({"enabled": True}))
+        self.assertIn('{action:\'set_light\', title:&quot;on&quot;}',
+                      self.render({"enabled": False}))
+
+    def test_the_switch_goes_through_the_nonce_path(self):
+        """cbui.send is what stamps the per-session token onto the message. A
+        button that reached the browser any other way would be one a website
+        could imitate."""
+        self.assertIn("cbui.send({action:'set_light'", self.render({"enabled": True}))
+
+    def test_motion_is_reported_separately_from_the_header(self):
+        """After the switch is used the two genuinely disagree, and saying
+        "reduced motion: requested" because the header is back on would be a
+        lie for the rest of the session."""
+        html = self.render({"enabled": True, "motion": False})
+        self.assertIn("Save-Data: on", html)
+        self.assertIn("not requested", html)
+        html = self.render({"enabled": False, "motion": True})
+        self.assertIn("requested at startup", html)
+
+    def test_the_note_admits_the_restart(self):
+        self.assertIn("restarts", self.render({"enabled": True}))
+
+
+class TestRemembering(Isolated):
+    """The switch writes the same settings file the persona selector does, which
+    is what makes the choice survive the next launch."""
+
+    def test_round_trip_through_the_settings_file(self):
+        self.assertIs(perf.remember(False, path=self.config), False)
+        self.assertEqual(envfile.values(self.config)[perf.LIGHT_ENV], "0")
+        self.assertFalse(perf.light_enabled(path=self.config))
+
+        self.assertIs(perf.remember(True, path=self.config), True)
+        self.assertEqual(envfile.values(self.config)[perf.LIGHT_ENV], "1")
+        self.assertTrue(perf.light_enabled(path=self.config))
+
+    def test_switching_replaces_rather_than_appends(self):
+        for wanted in (False, True, False):
+            perf.remember(wanted, path=self.config)
+        self.assertEqual(self.config.read_text().count("CB_LIGHT="), 1)
+
+    def test_it_takes_effect_without_a_restart(self):
+        """The whole point of reading the setting per call: the next navigation
+        stops carrying the hint, rather than the one after the next launch."""
+        perf.remember(False, path=self.config)
+        self.assertEqual(perf.hint_headers(), {})
+        self.assertIsNone(perf.make_request("https://example.com/"))
+        perf.remember(True, path=self.config)
+        self.assertEqual(perf.hint_headers(), {"Save-Data": "on"})
+
+    def test_the_file_wins_over_the_environment(self):
+        """envfile's rule, and the reason the switch works at all: a CB_LIGHT
+        exported by whatever shell launched the browser cannot pin the setting
+        against what the user just clicked."""
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text("CB_LIGHT=0\n")
+        os.environ[perf.LIGHT_ENV] = "1"
+        self.assertFalse(perf.light_enabled(path=self.config))
+
+    def test_a_hand_edit_is_picked_up(self):
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text("CB_LIGHT=off\n")
+        self.assertFalse(perf.light_enabled(path=self.config))
+
+    def test_the_default_path_is_the_settings_file(self):
+        """Called with no path at all -- the way the browser calls it -- it must
+        land in the same file every other setting lives in."""
+        perf.remember(False)
+        self.assertEqual(envfile.config_path(), self.config)
+        self.assertFalse(perf.light_enabled())
 
 
 if __name__ == "__main__":

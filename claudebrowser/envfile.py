@@ -234,8 +234,9 @@ TEMPLATE = """\
 #CB_BLOCK=1
 
 # Ask sites for a lighter page: sends Save-Data: on with each page this browser
-# loads, and asks for reduced motion. On by default; set to 0 and restart if a
-# site serves you a degraded page you did not want.
+# loads, and asks for reduced motion. On by default. The switch on cb:data
+# writes this line; setting it here works too. The header follows on the next
+# page load, the reduced motion only from the next launch.
 #CB_LIGHT=1
 
 # Start page and search engine (%s is the query).

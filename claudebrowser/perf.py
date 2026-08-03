@@ -31,6 +31,8 @@ import gi
 gi.require_version("WebKit2", "4.1")
 from gi.repository import GLib, WebKit2  # noqa: E402
 
+from . import envfile  # noqa: E402
+
 CACHE = Path(GLib.get_user_cache_dir()) / "claude-browser"
 
 # The heavy hitters, not an exhaustive list. A full EasyList clone would cost
@@ -123,20 +125,42 @@ LIGHT_ENV = "CB_LIGHT"
 HINTS = {"Save-Data": "on"}
 
 
-def light_enabled(raw=None):
+def light_enabled(raw=None, path=None):
     """Is light mode on? Default yes.
 
     On by default for the same reason the ad blocker is: this browser exists for
     a two-core laptop, and a hint that asks for fewer bytes costs a page nothing
-    it can notice. `CB_LIGHT=0` turns it off for a session when a site serves a
-    degraded page you did not want.
+    it can notice. `CB_LIGHT=0` turns it off when a site serves a degraded page
+    you did not want.
+
+    Read from the settings file on every call, like the persona is: the switch
+    on cb:data writes that file, and a value captured at import would leave the
+    browser sending a hint the user has just turned off until it was restarted.
+    `envfile.setting` falls back to the environment, so `CB_LIGHT=0 ./cb` still
+    works for one session.
 
     Anything unrecognised means on, matching CB_BLOCK: a typo should not
     silently remove a default the user never asked to lose.
     """
     if raw is None:
-        raw = os.environ.get(LIGHT_ENV, "")
+        raw = envfile.setting(LIGHT_ENV, "", path=path)
     return (raw or "").strip().lower() not in ("0", "off", "false", "no")
+
+
+def remember(enabled, path=None):
+    """Persist the light-mode choice, and return what was stored.
+
+    Written to the settings file rather than held in memory, for the reason
+    personas.remember gives: the browser is launched from a menu, a terminal and
+    a dock, and a preference you have to re-pick every launch is one you stop
+    using. `envfile.put` also updates this process's environment, so the next
+    navigation sees the new value without waiting for the file to be re-read.
+
+    Only the header half follows immediately -- see `tune_gtk` for the half that
+    cannot.
+    """
+    envfile.put(LIGHT_ENV, "1" if enabled else "0", path=path)
+    return bool(enabled)
 
 
 def hint_headers():
@@ -207,6 +231,12 @@ def tune_gtk(settings):
     effect needs a display to confirm. What is certain either way is the local
     half -- GTK stops animating this browser's own chrome, which is per-frame
     work on the two cores the page is being laid out on.
+
+    This one is decided once, before the first WebView exists, and stays decided
+    for the life of the process: WebKit reads the settings block at web-process
+    start, so turning light mode on from cb:data changes the header on the next
+    load but cannot reach the animations of tabs that are already laid out. The
+    page says so rather than implying the switch does both.
 
     Deliberately not done with injected CSS. An `animation: none !important`
     sheet fights the page's own styles, breaks anything waiting on an

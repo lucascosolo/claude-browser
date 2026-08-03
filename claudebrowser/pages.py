@@ -352,6 +352,9 @@ def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
           %(light)s
         </div>
         <p class="note">%(light_note)s</p>
+        <div class="footer">
+          %(light_button)s
+        </div>
       </section>
       <section>
         <h2>Cookies &amp; cache</h2>
@@ -408,21 +411,28 @@ def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
             ("Limit for agent-opened tabs", machine.get("tab_ceiling", "—")),
             ("Loading right now", machine.get("loading", 0)),
         )),
-        # Reported rather than made switchable here, because it takes effect at
-        # web-process start: a button that appeared to toggle it would be lying
-        # about every tab already open. CB_LIGHT plus a restart is the honest
-        # shape, and this row is how you find out which way it is set.
+        # Two rows rather than one, because after the switch below is used they
+        # can disagree: the header follows immediately, the animation setting was
+        # read once at startup and cannot. Reporting them together as a single
+        # "light mode: on" would make the second one a lie for the rest of the
+        # session. `motion` is what tune_gtk was actually told; it falls back to
+        # the header state for a caller that does not pass it.
         "light": "".join(_fact(label, value) for label, value in (
             ("Ask sites for a lighter page",
              "on (Save-Data: on)" if (light or {}).get("enabled") else "off"),
             ("Reduced motion",
-             "requested" if (light or {}).get("enabled") else "not requested"),
+             "requested at startup" if (light or {}).get(
+                 "motion", (light or {}).get("enabled")) else "not requested"),
         )),
         "light_note": _e(
             "Servers that honour Save-Data send smaller images and fewer fonts. "
             "It rides on pages this browser loads for you, not on files a page "
-            "fetches for itself — WebKitGTK gives no way to reach those. "
-            "Set CB_LIGHT=0 and restart if a site serves you a degraded page."),
+            "fetches for itself — WebKitGTK gives no way to reach those. The "
+            "switch takes effect on the next page load and is remembered as "
+            "CB_LIGHT in your settings file. Reduced motion is the half that "
+            "cannot follow: WebKit reads it once, before the first tab exists, "
+            "so it stays as it was until the browser restarts."),
+        "light_button": _light_button(bool((light or {}).get("enabled"))),
         "store": "".join(_fact(label, value) for label, value in (
             ("Cookie policy", {"all": "accept all",
                                "none": "reject all",
@@ -456,6 +466,20 @@ def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
         "pagetext_button": _clear_button("pagetext", "Clear page text"),
     }
     return shell("Data", palette, nonce, "cb:data", body)
+
+
+def _light_button(enabled):
+    """The on/off switch for the Save-Data hint.
+
+    It posts the state it wants rather than "flip it": a cb:data tab left open
+    while the setting was changed elsewhere would otherwise toggle against a
+    value it is no longer showing. Unarmed, unlike the clear buttons -- nothing
+    is destroyed, and the same click turns it back.
+    """
+    want = "off" if enabled else "on"
+    return ('<button data-want="%s" onclick="return cbui.send('
+            '{action:\'set_light\', title:%s})">%s</button>'
+            % (want, _js(want), _e("Turn it off" if enabled else "Turn it on")))
 
 
 def _clear_button(kind, label):
