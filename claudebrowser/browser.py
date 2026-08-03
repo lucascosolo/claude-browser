@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import time
 
 import gi
 
@@ -18,8 +19,8 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import (agent, ai, auth, extract, pages, panel_html, passwords, perf,  # noqa: E402
-               store, style, tabnames)
+from . import (agent, ai, auth, extract, findbar, pages, panel_html, passwords,  # noqa: E402
+               perf, resources, storage, store, style, tabnames)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -48,8 +49,14 @@ MENU_SECTIONS = (
         ("document-open-recent-symbolic", "History", "Ctrl+H", "cb:history"),
         ("dialog-password-symbolic", "Saved logins", "", "cb:passwords"),
     )),
+    ("This page", (
+        ("edit-find-symbolic", "Find on page", "Ctrl+F", "find"),
+    )),
+    ("Machine", (
+        ("drive-harddisk-symbolic", "Cookies & cache", "", "cb:data"),
+    )),
 )
-INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history")
+INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history", "cb:data")
 # console.* is not exposed to the embedder in webkit2gtk, so we shim it in the
 # page at document-start and read the ring buffer back out with JS later.
 CONSOLE_SHIM = """
@@ -107,6 +114,45 @@ PAGE_MIN = 120
 # that the glow is gone before the user wonders whether it is stuck on.
 AGENT_GLOW_MS = 2600
 
+# How often the resource guard reads /proc. Two small file reads, so the cost is
+# not the poll -- it is that a poll too far apart lets a tab storm get all the
+# way to swap before anything notices. Four seconds is inside the window between
+# "an agent asked for a tab" and "the machine is in trouble".
+GUARD_POLL_S = 4
+
+# Page loads the control API will run at once on a healthy machine. Two, not
+# more: on two cores, five concurrent loads finish later *in total* than five
+# sequential ones and their memory peaks coincide, which is precisely the
+# failure this is here to prevent. Under any pressure at all it drops to one.
+MAX_CONCURRENT_LOADS = 2
+
+# How many more may wait their turn. Deep enough that an agent working through
+# a list is never told no, shallow enough that one that has lost the plot and is
+# firing opens in a loop finds out immediately rather than in five minutes.
+MAX_QUEUED_LOADS = 6
+
+# How long a queued load will wait for memory before giving up. Well under the
+# 90s the control API allows an open, so the caller gets a reason rather than a
+# timeout -- "the machine is out of memory" is actionable and "timed out" is not.
+QUEUE_WAIT_S = 55
+
+# The whole time a request may spend queued, whatever the reason. Being sixth in
+# line behind five slow pages is not a machine problem, but it is still a long
+# wait, and it has to end in an answer the caller can read rather than in the
+# control API's own timeout. Kept under the 150s the open/navigate ops allow.
+QUEUE_TOTAL_S = 100
+
+# After this long, a load stops counting against the concurrency limit. A page
+# that never finishes -- a hung server, an endless stream -- would otherwise
+# hold the only slot for as long as it stayed open.
+STUCK_LOAD_S = 40
+
+# The most tabs an agent may have open at once. The user is never held to this
+# -- Ctrl+T always works, because a person opening a tab has looked at the
+# screen and an agent has not. resources.tab_ceiling() lowers it further on a
+# machine that is already struggling.
+MAX_AGENT_TABS = int(os.environ.get("CB_MAX_TABS", "10"))
+
 
 def needs_tab(method):
     """Resolve the leading tab id, or answer "no such tab" and stop.
@@ -141,7 +187,7 @@ class Tab:
 
     _next_id = 1
 
-    def __init__(self, manager, related=None, private=False):
+    def __init__(self, manager, context, related=None, private=False):
         self.id = Tab._next_id
         Tab._next_id += 1
         self.private = private
@@ -152,7 +198,7 @@ class Tab:
         # give up the shared-web-process trick and cost one more process.
         if private:
             self.view = WebKit2.WebView(
-                web_context=WebKit2.WebContext.get_default(),
+                web_context=context,
                 user_content_manager=manager,
                 is_ephemeral=True,
             )
@@ -166,7 +212,14 @@ class Tab:
         # the content blocker come along with it.
             self.view = WebKit2.WebView.new_with_related_view(related)
         else:
-            self.view = WebKit2.WebView.new_with_user_content_manager(manager)
+            # NOT new_with_user_content_manager(): that constructor takes the
+            # *default* context, so the very first tab -- the one every other
+            # tab is created related to, and therefore the one that decides the
+            # whole window's storage -- would silently opt out of the persistent
+            # cookie jar this browser just built. It has to be the property
+            # constructor to name a context at all.
+            self.view = WebKit2.WebView(web_context=context,
+                                        user_content_manager=manager)
         self.waiters = []
         self.loading = False
         self.failed = None
@@ -176,13 +229,27 @@ class Tab:
         # resolving the wrong request.
         self.generation = 0
 
+        # -- discard state ---------------------------------------------------
+        # `used` is a monotonic timestamp of the last time this tab was looked
+        # at or driven; it is what makes "least recently used" mean something.
+        # `discarded` holds the URL and title of a tab whose page has been
+        # dropped to reclaim memory -- the tab is still there, still in the same
+        # place in the strip, and reloads when it is next selected.
+        self.used = time.monotonic()
+        self.discarded = None
+        self.scroll = 0
+
+    def touch(self):
+        self.used = time.monotonic()
+
     def info(self):
         return {
             "id": self.id,
-            "url": self.view.get_uri() or "",
-            "title": self.view.get_title() or "",
+            "url": (self.discarded or {}).get("url") or self.view.get_uri() or "",
+            "title": (self.discarded or {}).get("title") or self.view.get_title() or "",
             "loading": self.loading,
             "private": self.private,
+            "discarded": bool(self.discarded),
         }
 
 
@@ -242,8 +309,13 @@ class Browser(Gtk.Window):
         self.pw_offer = None
 
         # Context tuning must happen before the first WebView exists, since the
-        # process model is fixed once a web process has been spawned.
-        context = WebKit2.WebContext.get_default()
+        # process model is fixed once a web process has been spawned. So must
+        # the context itself: a WebContext's data manager -- which is what makes
+        # cookies and the disk cache persist -- can only be set at construction.
+        # Everything downstream uses self.context, never WebContext.get_default();
+        # mixing the two would give private tabs a different jar than normal ones
+        # in the one direction that is not a feature.
+        context = self.context = storage.make_context_once()
         for note in perf.tune_context(context):
             print("perf: %s" % note, flush=True)
 
@@ -263,6 +335,7 @@ class Browser(Gtk.Window):
 
         self._build_chrome()
         self._bind_keys()
+        self._start_guard()
 
         self.connect("destroy", self._on_destroy)
         for url in (urls or [HOME]):
@@ -352,6 +425,12 @@ class Browser(Gtk.Window):
 
         self.pw_bar = self._build_pw_bar()
         root.pack_start(self.pw_bar, False, False, 0)
+
+        # Above the page rather than below it, where Firefox puts it: this
+        # window already has a console docked at the bottom, and a second strip
+        # under it would be two bars competing for the same edge.
+        self.findbar = findbar.FindBar(self._current_view)
+        root.pack_start(self.findbar, False, False, 0)
 
         # Page and panel share a draggable split rather than a fixed stack. As a
         # plain box the panel asked for a fixed 279px it could never give back:
@@ -650,6 +729,12 @@ class Browser(Gtk.Window):
             ("s", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK): self.tldr,
             ("r", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
                 lambda: self.research(),
+            ("f", Gdk.ModifierType.CONTROL_MASK): self.findbar.open,
+            # Chrome's and Firefox's second binding for the same thing. Costs a
+            # line; saves the muscle memory of anyone who learned either.
+            ("F3", 0): lambda: self.findbar.step(1),
+            ("g", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                lambda: self.findbar.step(-1),
             ("d", Gdk.ModifierType.CONTROL_MASK): self.toggle_bookmark,
             ("h", Gdk.ModifierType.CONTROL_MASK):
                 lambda: self._open_internal("cb:history"),
@@ -678,9 +763,18 @@ class Browser(Gtk.Window):
         if action:
             action()
             return True
-        if event.keyval == Gdk.KEY_Escape and self.panel.get_visible():
-            self.close_panel()
-            return True
+        if event.keyval == Gdk.KEY_Escape:
+            # The find bar wins Escape over the Claude panel, and both of them
+            # are handled here rather than in the focused widget: a handler
+            # connected to Gtk.Window sees the key *before* the default handler
+            # propagates it down, so the bar's own Escape binding never gets a
+            # look in while this one is connected.
+            if self.findbar.get_visible():
+                self.findbar.close()
+                return True
+            if self.panel.get_visible():
+                self.close_panel()
+                return True
         if event.keyval == Gdk.KEY_F12:
             tab = self.current()
             if tab:
@@ -800,6 +894,20 @@ class Browser(Gtk.Window):
 
         # Checked before the store, because saved logins live in the keyring and
         # do not care whether the history database opened.
+        # cb:data reports the machine and the disk, neither of which needs the
+        # history database, so it is answered before the store check below --
+        # a browser whose database failed to open is exactly when you want to
+        # look at what else is wrong.
+        if name == "data":
+            self._refresh_storage_facts()
+            machine = dict(self.machine.as_dict(), tabs=len(self.tabs))
+            states = self._tab_states()
+            machine["discarded"] = sum(1 for s in states if s["discarded"])
+            machine["tab_ceiling"] = resources.tab_ceiling(self.machine, MAX_AGENT_TABS)
+            machine["loading"] = sum(1 for t in self.tabs if t.loading)
+            return pages.data_page(palette, self.nonce, machine,
+                                   self._storage_facts, storage.human)
+
         if name == "passwords":
             if self.vault is None:
                 return pages.passwords_page(palette, self.nonce, [], available=False)
@@ -864,6 +972,16 @@ class Browser(Gtk.Window):
             if secret is not None and tab is not None:
                 self._pw_js(tab, "cbui.reveal(%s, %s)"
                             % (json.dumps(data.get("idx")), json.dumps(secret)))
+        elif action == "clear_data":
+            # `title` carries the kind -- the message shape is fixed at
+            # {action, url, title} and adding a field for one page is not worth
+            # a third parameter every other sender has to ignore.
+            def cleared(result):
+                self._flash("Cleared %s" % title if result.get("ok")
+                            else "Could not clear: %s" % result.get("error"))
+                self._reload_internal()
+
+            storage.clear(self.context, title, cleared)
         elif action == "clear_history" and self.store:
             self.store.clear_history()
             self.store.flush()
@@ -887,6 +1005,28 @@ class Browser(Gtk.Window):
                 self.research()
             else:
                 self.open_panel(mode)
+
+    def _refresh_storage_facts(self):
+        """Recompute what cb:data shows, and re-render only if it changed.
+
+        The page has to be handed bytes synchronously, but the cookie count
+        arrives on a callback, so the first render of cb:data shows a dash where
+        the number goes. This refills it -- and the "only if it changed" guard
+        is what keeps that from being an infinite reload loop, because the
+        second render finds the same number and stops.
+        """
+        fresh = storage.facts()
+        previous = getattr(self, "_storage_facts", None) or {}
+        fresh["domains"] = previous.get("domains")
+        self._storage_facts = fresh
+
+        def landed(count):
+            if count == previous.get("domains"):
+                return
+            self._storage_facts = dict(fresh, domains=count)
+            self._reload_internal()
+
+        storage.domains(self.context, landed)
 
     def _reload_internal(self):
         """Re-render any open cb: page after the data behind it changed."""
@@ -955,7 +1095,7 @@ class Browser(Gtk.Window):
         # A private tab must not be created *related* to a normal one, or it
         # inherits the very storage it exists to avoid.
         related = self.tabs[0].view if (self.tabs and not private) else None
-        tab = Tab(self.content, related=related, private=private)
+        tab = Tab(self.content, self.context, related=related, private=private)
         view = tab.view
 
         perf.tune_view(view)
@@ -1103,6 +1243,7 @@ class Browser(Gtk.Window):
         superseded, and leaving them hanging until the control timeout is worse
         than telling them so.
         """
+        self._pump_soon()
         waiters, tab.waiters = tab.waiters, []
         for generation, done in waiters:
             if generation == tab.generation:
@@ -1129,12 +1270,23 @@ class Browser(Gtk.Window):
         GTK import so it can be tested -- the interesting cases are collisions
         between tabs, not any single tab."""
         names = tabnames.label_tabs([
-            (t.view.get_uri() or "", t.view.get_title() or "", t.loading)
+            ((t.discarded or {}).get("url") or t.view.get_uri() or "",
+             (t.discarded or {}).get("title") or t.view.get_title() or "",
+             t.loading)
             for t in self.tabs])
         for tab, name in zip(self.tabs, names):
             if getattr(tab, "label", None):
                 tab.label.set_text(name)
-                tab.label.set_tooltip_text(tab.view.get_uri() or "")
+                info = tab.info()
+                tab.label.set_tooltip_text(
+                    info["url"] + ("\nDiscarded to free memory — click to reload"
+                                   if tab.discarded else ""))
+            if getattr(tab, "label_box", None):
+                # Dimmed rather than badged: a discarded tab is still that tab,
+                # and a row of "zzz" markers would make an invisible optimisation
+                # look like something went wrong.
+                ctx = tab.label_box.get_style_context()
+                (ctx.add_class if tab.discarded else ctx.remove_class)("cb-tab-dim")
 
     def _refresh(self, tab):
         self._relabel_tabs()
@@ -1169,8 +1321,12 @@ class Browser(Gtk.Window):
         deadline is refreshed rather than queued: an agent taking twelve steps
         against one tab should light it once and hold, not stack twelve timers.
         """
-        import time
-
+        # Being driven counts as being used. Without this, a tab an agent is
+        # working through -- reading, clicking, reading again -- looks idle to
+        # the memory guard, which discards it and makes the agent's next read
+        # pay for a reload. `needs_tab` funnels every tab-targeted API call
+        # through here, which is the same reason the glow lives here.
+        tab.touch()
         tab.agent_until = time.monotonic() + AGENT_GLOW_MS / 1000.0
         if getattr(tab, "label_box", None):
             tab.label_box.get_style_context().add_class("cb-agent")
@@ -1179,8 +1335,6 @@ class Browser(Gtk.Window):
             self._agent_glow_id = GLib.timeout_add(400, self._expire_agent_glow)
 
     def _expire_agent_glow(self):
-        import time
-
         now = time.monotonic()
         live = False
         for tab in self.tabs:
@@ -1198,18 +1352,287 @@ class Browser(Gtk.Window):
         """The window frame glows only while the driven tab is the one on
         screen -- a background tab being read is not something to alarm the
         user about, and the tab's own glow already says it is happening."""
-        import time
-
         tab = self.current()
         active = bool(tab and getattr(tab, "agent_until", 0) > time.monotonic())
         ctx = self.root.get_style_context()
         (ctx.add_class if active else ctx.remove_class)("cb-agent-window")
 
+    # -- the resource guard -------------------------------------------------
+    # See resources.py for the policy and why it exists. This half is the part
+    # that has to touch GTK: polling, discarding, restoring, and saying no.
+
+    def _start_guard(self):
+        """Begin watching the machine. Called once, at the end of __init__."""
+        self.machine = resources.Snapshot.take()
+        self._guard_note = ""
+        self._queue = []
+        self._pump_id = None
+        self._pump_queued = False
+        # First renice is deferred: no web process exists yet at construction
+        # time, and the first one appears when the first tab starts loading.
+        GLib.timeout_add_seconds(2, self._nice_web_processes)
+        GLib.timeout_add_seconds(GUARD_POLL_S, self._poll_machine)
+
+    def _poll_machine(self):
+        """Take a reading, shed what the reading says to shed, repeat forever."""
+        self.machine = resources.Snapshot.take()
+        if self.machine.memory_level() != resources.OK:
+            self._shed()
+        # Cheap, and it has to be repeated rather than done once: every new tab
+        # can spawn a process, and a process born after the last pass would
+        # otherwise run at the same priority as the window manager.
+        self._nice_web_processes()
+        self._paint_machine()
+        return GLib.SOURCE_CONTINUE
+
+    def _nice_web_processes(self):
+        try:
+            resources.renice_children()
+        except Exception:
+            pass          # a kernel without /proc, or a hardened container
+        return GLib.SOURCE_REMOVE
+
+    def _freeable(self):
+        """How many tabs could still be discarded if memory demanded it."""
+        return len(resources.pick_victims(self._tab_states(), len(self.tabs)))
+
+    def _tab_states(self):
+        current = self.current()
+        return [{"id": t.id, "used": t.used, "current": t is current,
+                 "discarded": bool(t.discarded), "loading": t.loading,
+                 "private": t.private, "url": t.view.get_uri() or ""}
+                for t in self.tabs]
+
+    def _shed(self):
+        """Discard as many idle background tabs as the pressure warrants."""
+        states = self._tab_states()
+        background = sum(1 for s in states
+                         if not s["current"] and not s["discarded"]
+                         and not s["private"] and s["url"])
+        count = resources.discard_count(self.machine, background)
+        for tab_id in resources.pick_victims(states, count):
+            tab = self.find(tab_id)
+            if tab:
+                self.discard_tab(tab)
+
+    def discard_tab(self, tab):
+        """Drop this tab's page, keeping the tab.
+
+        What is actually reclaimed: the parsed DOM, the layout tree, the
+        JavaScript heap and every image the page decoded, all of which live in a
+        web process shared with the other tabs -- so this frees real memory even
+        though the process itself stays. What is lost: that tab's back/forward
+        history, because WebKit offers no way to reinstate one. That is the
+        honest cost, and it is why a tab is only ever discarded when the machine
+        is genuinely short and never merely because it has been idle a while.
+
+        `about:blank` rather than terminate_web_process(): tabs deliberately
+        share one web process, so terminating it would take every other tab down
+        with the one being discarded.
+        """
+        if tab.discarded or tab.private or tab is self.current():
+            return False
+        url = tab.view.get_uri() or ""
+        if not url or url.startswith("about:"):
+            return False
+        tab.discarded = {"url": url, "title": tab.view.get_title() or ""}
+        # Resolve anyone waiting on this tab before the page goes: they asked
+        # about a load that is now never going to finish.
+        self._settle(tab, {"ok": False, "error": "tab discarded to free memory",
+                           **tab.info()})
+        tab.loading = False
+        tab.view.load_uri("about:blank")
+        self._relabel_tabs()
+        self._flash("Freed a background tab — %s" % self.machine.reason())
+        return True
+
+    def restore_tab(self, tab):
+        """Bring a discarded tab back. Called when it is selected, or by API."""
+        if not tab.discarded:
+            return False
+        url = tab.discarded["url"]
+        tab.discarded = None
+        tab.touch()
+        self._begin_load(tab)
+        tab.view.load_uri(url)
+        self._relabel_tabs()
+        return True
+
+    def _paint_machine(self):
+        """Show the machine's state only when it is worth showing.
+
+        A permanent memory gauge in the toolbar is a thing to worry about; a
+        line that appears when the browser is actually holding back is a thing
+        to act on. So this writes to the Claude panel's status only when the
+        panel is open, and otherwise stays quiet.
+        """
+        note = "" if self.machine.level() == resources.OK else self.machine.reason()
+        if note == self._guard_note:
+            return
+        self._guard_note = note
+        if note and self.panel.get_visible() and not self.panel_busy:
+            self._set_status("machine busy — %s" % note, "warn")
+
+    def _admit(self, then, done):
+        """Queue a page load until the machine has room for it.
+
+        This is the fix for the reported bug, and it is a *queue* rather than a
+        gate for a reason worth writing down. The first version of this let each
+        request poll independently and refuse itself after twenty seconds. On a
+        two-core laptop where a heavy page takes half a minute, six concurrent
+        opens meant one load and five refusals -- the machine survived, which
+        was the point, but the browser had become useless, which was not.
+
+        A queue fixes both halves. Loads run one or two at a time, so their
+        memory peaks never coincide (that simultaneity, not the tab count, is
+        what took the machine down). Everything else waits its turn in order and
+        starts the moment a slot frees, so six opens become six pages instead of
+        one page and five apologies.
+
+        Refusals still exist, because an unbounded queue is just a slower way to
+        run out of memory. They are for the two cases that are genuinely not
+        going to resolve: a queue that is already deep, and memory that stays
+        exhausted for a full wait.
+        """
+        if len(self._queue) >= MAX_QUEUED_LOADS:
+            return done({
+                "ok": False, "machine": self.machine.as_dict(),
+                "error": "refused: %d page loads are already queued on a machine "
+                         "that loads them one at a time. Wait for them, or work "
+                         "with the tabs that are already open."
+                         % len(self._queue)})
+        self._queue.append({"then": then, "done": done, "since": time.monotonic()})
+        self._pump()
+
+    def _pump(self):
+        """Start whatever the machine can take, in the order it was asked for."""
+        self._expire_queue()
+        while self._queue:
+            self.machine = snapshot = resources.Snapshot.take()
+            limit = 1 if snapshot.level() != resources.OK else MAX_CONCURRENT_LOADS
+            if self._inflight() >= limit:
+                break
+
+            entry = self._queue[0]
+            waited = time.monotonic() - entry["since"]
+            verdict, _delay, reason = resources.admit(snapshot, waited)
+
+            if verdict == "wait":
+                if waited < QUEUE_WAIT_S:
+                    self._shed()      # the wait is spent freeing memory, not idling
+                    break
+                verdict, reason = "no", (
+                    "refused: waited %ds for memory and the machine did not "
+                    "recover (%s). Close a tab, or discard one." % (waited, reason))
+
+            self._queue.pop(0)
+            if verdict == "no":
+                entry["done"]({"ok": False, "error": reason,
+                               "machine": snapshot.as_dict()})
+            else:
+                entry["then"]()
+
+        self._schedule_pump()
+
+    def _expire_queue(self):
+        """Answer anything that has been queued too long, before the HTTP side
+        gives up on it.
+
+        Being last in a queue of slow loads is the one way to wait a long time
+        without the machine being in any trouble at all, and the first version
+        of this let that run into the control API's own timeout. "Timed out
+        after 90s" tells an agent nothing it can act on; "you were behind five
+        page loads" tells it to stop opening tabs. Same delay, useful answer.
+        """
+        if not self._queue:
+            return
+        now = time.monotonic()
+        keep = []
+        for entry in self._queue:
+            waited = now - entry["since"]
+            if waited < QUEUE_TOTAL_S:
+                keep.append(entry)
+                continue
+            entry["done"]({
+                "ok": False, "machine": self.machine.as_dict(),
+                "error": "refused: queued %ds behind other page loads, which this "
+                         "machine runs one at a time. The tabs ahead of it are "
+                         "open; retry this one when they have settled."
+                         % waited})
+        self._queue = keep
+
+    def _inflight(self):
+        """Page loads currently running -- for admission accounting only.
+
+        A load that has been going for longer than STUCK_LOAD_S stops counting.
+        Without that, one page that never fires FINISHED (a hung server, a
+        stream) would hold the only slot forever and every later request would
+        queue behind it until it timed out. The tab is still loading; it has
+        just stopped being evidence about what the machine can take on.
+        """
+        now = time.monotonic()
+        return sum(1 for t in self.tabs
+                   if t.loading and now - getattr(t, "load_started", now) < STUCK_LOAD_S)
+
+    def _schedule_pump(self):
+        """Keep a timer alive exactly while something is queued.
+
+        The pump is also called when a load settles, which is what makes the
+        queue responsive; this timer is the backstop for the case where nothing
+        settles because the hold-up is memory rather than a load in progress.
+        """
+        if not self._queue:
+            if self._pump_id is not None:
+                GLib.source_remove(self._pump_id)
+                self._pump_id = None
+            return
+        if self._pump_id is None:
+            self._pump_id = GLib.timeout_add(700, self._pump_tick)
+
+    def _pump_tick(self):
+        self._pump_id = None
+        self._pump()
+        return GLib.SOURCE_REMOVE
+
+    def _pump_soon(self):
+        """Pump on the next idle, at most once however many times this is asked.
+
+        Called from `_settle`, so a finished load releases the next one without
+        waiting for a timer tick. It needs the coalescing flag because `_settle`
+        also fires for every tab the pump itself discards: pump, shed three
+        tabs, three settles, three queued pumps, each of which may shed again.
+        That converges on its own -- there are only so many tabs -- but it does
+        so by running the whole loop once per discarded tab, and one idle
+        callback does the same job.
+        """
+        if not self._queue or self._pump_queued:
+            return
+        self._pump_queued = True
+
+        def fire():
+            self._pump_queued = False
+            self._pump()
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(fire)
+
     def _on_switch(self, _nb, view, _index):
         tab = next((t for t in self.tabs if t.view is view), None)
         if tab:
+            tab.touch()
             GLib.idle_add(self._refresh, tab)
             GLib.idle_add(self._paint_agent_frame)
+            # Selecting a discarded tab is the moment it comes back. Deferred to
+            # idle so the switch itself paints first: on this hardware a reload
+            # started inline makes the tab click feel like it did not register.
+            if tab.discarded:
+                GLib.idle_add(lambda: (self.restore_tab(tab), GLib.SOURCE_REMOVE)[1])
+            GLib.idle_add(lambda: (self.findbar.on_tab_switched(),
+                                   GLib.SOURCE_REMOVE)[1])
+
+    def _current_view(self):
+        tab = self.current()
+        return tab.view if tab else None
 
     # -- chrome actions -----------------------------------------------------
 
@@ -1305,6 +1728,7 @@ class Browser(Gtk.Window):
             "agent": lambda: self.open_panel("agent"),
             "newtab": lambda: self.new_tab(HOME),
             "private": lambda: self.new_tab(HOME, private=True),
+            "find": self.findbar.open,
         }[key]()
 
     # -- saved logins -------------------------------------------------------
@@ -1768,16 +2192,41 @@ class Browser(Gtk.Window):
               "tabs": [t.info() for t in self.tabs]})
 
     def api_open(self, url, background, wait, done):
-        tab = self.new_tab(url, background=background)
-        self.note_agent_activity(tab)
-        self._begin_load(tab)
-        self._await_load(tab, wait, done)
+        """Open a tab -- if the machine can take one.
+
+        Two gates, in this order, because they fail for different reasons and
+        deserve different answers. The ceiling is a flat refusal: no amount of
+        waiting makes an eleventh tab a good idea, and the agent needs to hear
+        "close one" rather than sit in a retry loop. Pressure is a wait: it
+        passes on its own.
+        """
+        ceiling = resources.tab_ceiling(self.machine, MAX_AGENT_TABS)
+        if len(self.tabs) >= ceiling:
+            return done({
+                "ok": False, "machine": self.machine.as_dict(),
+                "error": "refused: %d tabs already open (limit %d on this machine). "
+                         "Close one with browser_close, or reuse a tab with "
+                         "browser_navigate." % (len(self.tabs), ceiling),
+                "tabs": [t.info() for t in self.tabs]})
+
+        def go():
+            tab = self.new_tab(url, background=background)
+            self.note_agent_activity(tab)
+            self._begin_load(tab)
+            self._await_load(tab, wait, done)
+
+        self._admit(go, done)
 
     @needs_tab
     def api_navigate(self, tab, url, wait, done):
-        self._begin_load(tab)
-        tab.view.load_uri(normalize(url))
-        self._await_load(tab, wait, done)
+        def go():
+            tab.touch()
+            tab.discarded = None
+            self._begin_load(tab)
+            tab.view.load_uri(normalize(url))
+            self._await_load(tab, wait, done)
+
+        self._admit(go, done)
 
     @needs_tab
     def api_history(self, tab, direction, wait, done):
@@ -1831,6 +2280,10 @@ class Browser(Gtk.Window):
         tab.generation += 1
         tab.loading = True
         tab.failed = None
+        # When this load started, so _inflight() can stop counting one that has
+        # clearly hung. Set here rather than on the STARTED event for the same
+        # reason `loading` is: the event has not arrived yet.
+        tab.load_started = time.monotonic()
 
     def _await_load(self, tab, wait, done):
         if not wait:
@@ -1844,6 +2297,21 @@ class Browser(Gtk.Window):
 
     @needs_tab
     def api_eval(self, tab, script, done):
+        """Evaluate in the tab -- bringing it back first if it was discarded.
+
+        Every read op (text, markdown, links, find, click, fill) funnels through
+        here, so this one check is what keeps discarding invisible to the API.
+        Without it an agent that opened a tab, worked elsewhere long enough for
+        memory to get tight, and came back would silently read `about:blank` and
+        report the page as empty.
+        """
+        if tab.discarded:
+            self.restore_tab(tab)
+            return self._await_load(
+                tab, True, lambda _payload: self._eval_now(tab, script, done))
+        self._eval_now(tab, script, done)
+
+    def _eval_now(self, tab, script, done):
         def on_result(view, result, _data=None):
             try:
                 value = view.evaluate_javascript_finish(result)
@@ -1899,3 +2367,43 @@ class Browser(Gtk.Window):
             WebKit2.SnapshotRegion.VISIBLE, WebKit2.SnapshotOptions.NONE,
             None, on_snapshot, None,
         )
+
+    # -- machine and storage ------------------------------------------------
+
+    def api_machine(self, done):
+        """What the browser thinks of the machine's state right now.
+
+        Worth exposing rather than keeping internal: an agent that has just been
+        told "wait" or "refused" can read this and decide whether to close a tab
+        or to do something else for a minute, which is a better answer than
+        retrying the same call until the timeout.
+        """
+        self.machine = resources.Snapshot.take()
+        states = self._tab_states()
+        done({"ok": True, **self.machine.as_dict(),
+              "tabs": len(self.tabs),
+              "tab_ceiling": resources.tab_ceiling(self.machine, MAX_AGENT_TABS),
+              "discarded": sum(1 for s in states if s["discarded"]),
+              "freeable": len(resources.pick_victims(states, len(self.tabs))),
+              "loading": sum(1 for t in self.tabs if t.loading)})
+
+    @needs_tab
+    def api_discard(self, tab, done):
+        """Drop a tab's page but keep the tab. The manual version of what the
+        memory guard does on its own -- useful to an agent that knows it is
+        finished with a tab but wants to keep the URL to come back to."""
+        if self.discard_tab(tab):
+            return done({"ok": True, "discarded": tab.id, **tab.info()})
+        done({"ok": False, "error": "cannot discard this tab (it is focused, "
+                                    "private, empty, or already discarded)",
+              **tab.info()})
+
+    def api_storage(self, done):
+        storage.summary(self.context, done)
+
+    def api_clear(self, kind, done):
+        def finished(result):
+            self._reload_internal()
+            done(result)
+
+        storage.clear(self.context, kind or "cache", finished)

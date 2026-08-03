@@ -141,22 +141,44 @@ def tune_context(context):
         context.set_cache_model(WebKit2.CacheModel.WEB_BROWSER)
         notes.append("browser cache model")
 
-    # WebKit's own memory-pressure handling moved between versions; try both
-    # homes rather than pin one.
+    # WebKit's own memory-pressure handling: the web processes watch their own
+    # footprint and shed caches, then whole documents, as they approach a limit.
+    # It is the layer below resources.py -- that one decides which *tabs* to
+    # give up, this one keeps a single tab from ballooning in the first place.
+    #
+    # This was previously written as `WebKit2.MemoryPressureSettings()` handed to
+    # whichever of two objects had a `set_memory_pressure_settings` attribute,
+    # inside a bare `except Exception: pass`. Both halves were wrong, and the
+    # except is why nobody noticed: the boxed type needs `.new()`, and the
+    # setter is a *static* function on WebsiteDataManager (it configures every
+    # web process, not one manager), so fetching it off the class and calling it
+    # with the settings object passed the settings as `self`. The handler has
+    # never actually been installed. The narrowed except is deliberate -- a
+    # future rename should be visible in the startup notes, not swallowed.
     if hasattr(WebKit2, "MemoryPressureSettings"):
         try:
-            settings = WebKit2.MemoryPressureSettings()
-            settings.set_memory_limit(512)  # MB before it starts shedding caches
-            target = None
-            if hasattr(context, "set_memory_pressure_settings"):
-                target = context.set_memory_pressure_settings
-            elif hasattr(WebKit2.WebsiteDataManager, "set_memory_pressure_settings"):
-                target = WebKit2.WebsiteDataManager.set_memory_pressure_settings
-            if target:
-                target(settings)
-                notes.append("memory pressure handler")
-        except Exception:
-            pass
+            settings = WebKit2.MemoryPressureSettings.new()
+            # MB per web process before it starts shedding. Tabs share one
+            # process here, so this is the ceiling for the whole page set, not
+            # per tab -- 512 of a 3.8GB machine's RAM, which is roughly where
+            # the desktop starts to suffer.
+            settings.set_memory_limit(int(os.environ.get("CB_MEM_LIMIT", "512")))
+            # Start shedding well before the limit rather than at it. The
+            # default thresholds assume there is headroom to recover in; on a
+            # machine that is already in swap there is not, and arriving at the
+            # ceiling is arriving too late.
+            settings.set_conservative_threshold(0.33)
+            settings.set_strict_threshold(0.55)
+            # Never let WebKit kill its own web process on pressure: with tabs
+            # sharing one process, a kill takes every tab down at once. Shedding
+            # is the behaviour we want; dying is not.
+            settings.set_kill_threshold(0.0)
+            settings.set_poll_interval(4.0)
+            WebKit2.WebsiteDataManager.set_memory_pressure_settings(settings)
+            notes.append("memory pressure handler (%dMB)"
+                         % settings.get_memory_limit())
+        except (AttributeError, TypeError) as e:
+            notes.append("memory pressure handler unavailable (%s)" % e)
 
     return notes
 

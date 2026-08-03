@@ -81,6 +81,7 @@ Right-clicking the menu entry offers **New Window** and **New Window (no agent A
 | Key | |
 |---|---|
 | `Ctrl+L` | focus the address bar |
+| `Ctrl+F` | **find on this page** — `Enter`/`Shift+Enter` step, `Aa` matches case, `Esc` closes |
 | `Ctrl+K` | ask Claude about the current page |
 | `Ctrl+Shift+K` | **the Claude console at full height, and back** |
 | `Ctrl+T` / `Ctrl+W` | new tab / close tab |
@@ -107,7 +108,7 @@ is more than one.
 
 ### Its own pages
 
-Five internal pages on the `cb:` scheme, laid out as cards and sharing the
+Six internal pages on the `cb:` scheme, laid out as cards and sharing the
 Claude panel's visual language. A slim icon rail moves between them.
 
 | | |
@@ -117,6 +118,7 @@ Claude panel's visual language. A slim icon rail moves between them.
 | `cb:bookmarks` | Everything saved, filterable. |
 | `cb:history` | Grouped by day, filterable, with per-entry delete and a two-step clear. |
 | `cb:passwords` | **Saved logins**, plus the sites you told it never to ask about. |
+| `cb:data` | **Memory, swap, CPU and disk** — what the resource guard is seeing, how many tabs it has freed, and two-step buttons to clear the cache, the cookies, or everything. |
 
 Tiles carry a **site mark** — a letter on a colour hashed from the hostname —
 rather than a favicon. Favicons would mean a network request per tile on the
@@ -298,6 +300,55 @@ use. What's done about it:
   browser cache model, memory-pressure handler, progress repaints coalesced
   to 10/s.
 
+### The resource guard
+
+The above is tuning. This is a brake, and it exists because of one incident: an
+agent was asked to research something, opened five tabs as fast as the API would
+take them, and the laptop thrashed for twenty minutes until it was
+power-cycled. Nothing in it was a bug — every step was reasonable, and there was
+simply nothing anywhere that said *no*.
+
+Four things now say no. All of them are in
+[`claudebrowser/resources.py`](claudebrowser/resources.py), which is GTK-free so
+the policy can be tested without a display.
+
+- **Page loads are queued, never parallel.** One or two run at a time and the
+  rest wait their turn in order. This is the one that fixes it: it was the
+  *simultaneity* that killed the machine, not the tab count — five pages loading
+  together peak their memory in the same second, where five in a row peak one at
+  a time and each releases before the next begins.
+- **Idle background tabs are dropped when memory gets tight**, least recently
+  used first, and reload when you come back to them. Never the tab you are
+  looking at, never one mid-load, and never a private tab — a private tab is not
+  written down anywhere, so discarding it is not a discard, it is a close.
+- **An agent gets a tab ceiling** (`CB_MAX_TABS`, default 10, lowered
+  automatically on a struggling machine) and a refusal that says what to do
+  about it. You never hit it: `Ctrl+T` always works, because a person opening a
+  tab has looked at the screen and an agent has not.
+- **WebKit's content processes are reniced below the UI.** This is the one that
+  turns "unusable" into "slow": thrashing is survivable if you can still move
+  the mouse and close a tab, and what forced the power cycle was the desktop
+  losing every scheduling contest to the page renderers.
+
+Two things it deliberately does **not** do, both learned by running it on the
+machine it was written for:
+
+- **CPU load never refuses anything.** A laptop with a couple of agents and a
+  Chrome open sits at a load average of ten all day. The first version refused
+  on CPU pressure and would have meant a browser that never opened a tab again.
+  Load average is also not a clean CPU signal on Linux — it counts uninterruptible
+  sleep, which is most of what a thrashing machine is doing, so half of what
+  looks like CPU pressure during a freeze is the memory pressure counted twice.
+- **Swap *occupancy* is not treated as pressure.** A machine with a few days
+  uptime sits at 70–80% swap used permanently, because pages evicted last week
+  and never touched again still count. Reading that as pressure made the browser
+  discard every background tab it had, repeatedly, on a healthy machine. The
+  live signal is the swap-in *rate* from `/proc/vmstat`.
+
+`./cbctl machine` prints what it is seeing; `cb:data` shows the same thing with
+bars. An agent that gets refused can call `browser_machine` and find out whether
+to wait, discard a tab, or do something else.
+
 Three APIs here exist, are documented, and do nothing in WebKitGTK 2.52:
 `set_process_model`, `set_enable_hyperlink_auditing`, and `innerText` on a
 detached node. `hasattr()` cannot tell you that — only running it can.
@@ -344,6 +395,23 @@ example on first run:
 ANTHROPIC_API_KEY=sk-ant-...
 CB_BLOCK=1
 ```
+
+| Setting | |
+|---|---|
+| `CB_BLOCK` | `0` turns the ad/tracker blocker off for a session. |
+| `CB_COOKIES` | `nothird` (default), `all`, or `none`. Third-party cookies are rejected by default; the ones this drops are mostly attached to loads the blocker already refuses. |
+| `CB_ITP` | `0` turns off tracking prevention. |
+| `CB_MAX_TABS` | The ceiling on tabs an *agent* may open, default 10. Never applies to you. |
+| `CB_MEM_LIMIT` | MB per web process before WebKit starts shedding caches, default 512. |
+| `CB_HOME`, `CB_PORT`, `CB_TOKEN`, `CB_THEME`, `CB_GPU`, `CB_WEBGL` | as before. |
+
+Cookies, the disk cache and per-site storage live in
+`~/.local/share/claude-browser` and `~/.cache/claude-browser`, and **persist
+across restarts** — you stay signed in. `cb:data` shows how much is there and
+clears any of it; `cbctl clear cookies|cache|storage|all` does the same from a
+shell. Clearing is deliberately *not* an MCP tool: signing you out of every site
+you use is not a step an agent should be able to take in pursuit of some other
+goal.
 
 This file exists because a window launched from the desktop menu **does not get
 your shell environment** — `~/.bashrc` is never read, so an `export` there works

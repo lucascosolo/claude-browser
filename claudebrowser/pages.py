@@ -34,6 +34,10 @@ NAV = (
     ("cb:passwords", "Logins",
      "M6 10V7a6 6 0 1 1 12 0v3h1a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1"
      " 0 0 1 1-1zm2 0h8V7a4 4 0 0 0-8 0z"),
+    ("cb:data", "Data",
+     "M12 3c4.97 0 9 1.34 9 3s-4.03 3-9 3-9-1.34-9-3 4.03-3 9-3zM3 9c0 1.66 4.03 3 9 3"
+     "s9-1.34 9-3v4c0 1.66-4.03 3-9 3s-9-1.34-9-3zm0 6c0 1.66 4.03 3 9 3s9-1.34 9-3v4"
+     "c0 1.66-4.03 3-9 3s-9-1.34-9-3z"),
 )
 
 
@@ -311,6 +315,122 @@ def _never_row(origin):
     }
 
 
+def data_page(palette, nonce, machine, storage_info, human):
+    """What the browser is holding: memory, and what is on disk.
+
+    One page for both because they answer the same question -- "why is this
+    slow, and what can I do about it" -- and because the buttons that free disk
+    are the ones you want in front of you while reading the memory numbers.
+
+    `human` is passed in rather than imported so this module stays free of
+    anything that needs WebKit, which is what lets it be rendered in a test.
+    """
+    used = machine.get("total_mb", 0) - machine.get("available_mb", 0)
+    swap_used, swap_total = machine.get("swap_used_mb", 0), machine.get("swap_total_mb", 0)
+
+    body = """
+      <section>
+        <h2>Memory <em class="lvl %(memlevel)s">%(memlevel)s</em>
+            <em class="lvl %(cpulevel)s">cpu %(cpulevel)s</em></h2>
+        <div class="rows">
+          %(mem)s
+          %(swap)s
+          %(cpu)s
+        </div>
+        <p class="note">%(explain)s</p>
+      </section>
+      <section>
+        <h2>Tabs</h2>
+        <div class="rows">
+          %(tabs)s
+        </div>
+      </section>
+      <section>
+        <h2>Cookies &amp; cache</h2>
+        <div class="rows">
+          %(store)s
+        </div>
+        <div class="footer">
+          %(buttons)s
+        </div>
+      </section>
+    """ % {
+        # The two levels are shown apart, never combined. They mean genuinely
+        # different things here -- memory decides whether a page load is refused,
+        # CPU only how many run at once -- and a single "critical" over a Memory
+        # heading, driven by a busy CPU on a machine with gigabytes free, is a
+        # scarier lie than either fact on its own.
+        "memlevel": _e(machine.get("memory", "ok")),
+        "cpulevel": _e(machine.get("cpu", "ok")),
+        # The caption names what is *available*, not just what is used, because
+        # the available number is the one every decision on this page is made
+        # from -- and on Linux "in use" reads alarmingly high on a healthy
+        # machine, since the kernel keeps as much page cache as it can.
+        "mem": _meter("Memory in use", used, machine.get("total_mb", 0),
+                      "%s of %s · %s free" % (
+                          human(used * 1024 * 1024),
+                          human(machine.get("total_mb", 0) * 1024 * 1024),
+                          human(machine.get("available_mb", 0) * 1024 * 1024))),
+        "swap": _meter("Swap in use", swap_used, swap_total,
+                       "%s of %s" % (human(swap_used * 1024 * 1024),
+                                     human(swap_total * 1024 * 1024))
+                       if swap_total else "no swap configured"),
+        "cpu": _meter("CPU load", machine.get("load", 0),
+                      max(1, machine.get("cores", 1)),
+                      "%.2f across %d core%s" % (machine.get("load", 0),
+                                                 machine.get("cores", 1),
+                                                 "s" if machine.get("cores", 1) != 1 else "")),
+        "explain": _e(
+            "Tabs you are not looking at are dropped to a URL when memory gets "
+            "tight, and reload when you come back to them. Nothing an agent "
+            "asks for starts while the machine is already saturated."),
+        "tabs": "".join(_fact(label, value) for label, value in (
+            ("Open", machine.get("tabs", 0)),
+            ("Freed to save memory", machine.get("discarded", 0)),
+            ("Limit for agent-opened tabs", machine.get("tab_ceiling", "—")),
+            ("Loading right now", machine.get("loading", 0)),
+        )),
+        "store": "".join(_fact(label, value) for label, value in (
+            ("Cookie policy", {"all": "accept all",
+                               "none": "reject all",
+                               "nothird": "reject third-party"}.get(
+                                   storage_info.get("policy"), "—")),
+            ("Sites with cookies", storage_info.get("domains")
+             if storage_info.get("domains") is not None else "—"),
+            ("Cookie jar", human(storage_info.get("cookie_jar_bytes"))),
+            ("Disk cache", human(storage_info.get("cache_bytes"))),
+            ("Stored in", storage_info.get("data_dir") or "—"),
+        )),
+        "buttons": "".join(
+            '<button class="danger" data-kind="%s" onclick="return cbui.confirmData(event, %s, %s)">'
+            '%s</button>' % (kind, _js(kind), _js(label), _e(label))
+            for kind, label in (("cache", "Clear cache"),
+                                ("cookies", "Clear cookies"),
+                                ("all", "Clear everything"))),
+    }
+    return shell("Data", palette, nonce, "cb:data", body)
+
+
+def _meter(label, value, total, caption):
+    """A labelled bar. Percentages are clamped, because a load average can and
+    does exceed the core count and a bar wider than its track looks like a bug
+    rather than the alarming number it actually is."""
+    pct = 0 if not total else max(0.0, min(1.0, float(value) / float(total)))
+    tone = "hot" if pct >= 0.86 else ("warm" if pct >= 0.7 else "")
+    return """
+    <div class="row meter">
+      <span class="rt">%(label)s</span>
+      <span class="bar"><i class="%(tone)s" style="width:%(pct).1f%%"></i></span>
+      <span class="ru">%(caption)s</span>
+    </div>""" % {"label": _e(label), "pct": pct * 100, "caption": _e(caption),
+                 "tone": tone}
+
+
+def _fact(label, value):
+    return ('<div class="row fact"><span class="rt">%s</span>'
+            '<span class="ru">%s</span></div>' % (_e(label), _e(str(value))))
+
+
 def deck(palette, nonce, tabs):
     """Every open tab as a card.
 
@@ -528,6 +648,25 @@ h2 .more:hover { text-decoration:underline; }
 .badge.now { background:var(--soft); color:var(--accent); }
 .badge.l { color:var(--warn); }
 
+/* cb:data. The meter is a plain div rather than <progress>, which cannot be
+   restyled consistently across GTK themes -- and the colour is the whole point:
+   the number people act on is "is the bar red", not the megabytes. */
+.row.meter .rt, .row.fact .rt { flex:0 0 40%%; max-width:40%%; }
+.row.fact .ru { text-align:right; color:var(--text); }
+.bar { flex:1 1 auto; height:7px; border-radius:4px; background:var(--panel);
+       overflow:hidden; border:1px solid var(--line); }
+.bar i { display:block; height:100%%; background:var(--accent); border-radius:4px;
+         transition:width 200ms ease; }
+.bar i.warm { background:var(--warn); }
+.bar i.hot { background:var(--warn); filter:saturate(1.5); }
+.row.meter .ru { flex:0 0 auto; text-align:right; min-width:24%%; }
+.lvl { text-transform:uppercase; letter-spacing:.06em; font-size:10px;
+       font-weight:700; padding:2px 7px; border-radius:5px;
+       background:var(--soft); color:var(--accent); font-style:normal; }
+.lvl.tight, .lvl.critical { color:var(--warn); }
+.note { color:var(--dim); font-size:12px; line-height:1.55; margin:14px 2px 0;
+        max-width:62ch; }
+
 .empty { text-align:center; color:var(--dim); padding:44px 16px; grid-column:1/-1; }
 .ei { font-size:26px; opacity:.5; margin-bottom:8px; }
 .eh { font-size:12px; margin-top:5px; opacity:.85; }
@@ -615,6 +754,25 @@ _DOC = """<!doctype html>
       if (el) { el.style.transition = 'opacity .12s'; el.style.opacity = '0';
                 setTimeout(function () { el.remove(); }, 120); }
       return this.send({action: 'pw_allow', url: origin});
+    },
+    confirmData: function (ev, kind, label) {
+      // Same two-click arming as confirmClear, and for the same reason: a
+      // window.confirm() inside a WebView blocks this embedder's main loop.
+      // Clearing cookies signs the user out of everything, so it gets the
+      // same treatment as erasing history.
+      ev.preventDefault();
+      var b = ev.currentTarget;
+      if (b.dataset.armed) {
+        b.textContent = 'Clearing…';
+        b.disabled = true;
+        return this.send({action: 'clear_data', title: kind});
+      }
+      b.dataset.armed = '1';
+      b.textContent = 'Click again to confirm';
+      setTimeout(function () {
+        delete b.dataset.armed; b.textContent = label;
+      }, 4000);
+      return false;
     },
     confirmClear: function () {
       // Deliberately not window.confirm(): a modal dialog inside a WebView

@@ -18,6 +18,9 @@ claudebrowser/
   extract.py   JavaScript injected into pages (read, click, fill, halo)
   agent.py     the in-browser tool-use loop behind Ctrl+G
   ai.py        Anthropic Messages API over urllib; auth.py picks the credential
+  resources.py THE RESOURCE POLICY -- when to wait, refuse, or drop a tab
+  storage.py   the web context: persistent cookies, disk cache, clearing
+  findbar.py   Ctrl+F, driving WebKit's per-view FindController
   tabnames.py  tab labelling (GTK-free so it is testable)
   urls.py      omnibox intent: navigate or search (GTK-free)
   passwords.py saved logins in the system keyring + the injected form script
@@ -30,10 +33,14 @@ tests/         unittest, no display needed
 ```bash
 ./cb                                        # run it
 ./cbctl health                              # is it up
+./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 177 tests, ~20s, no display
+python3 -m unittest discover -s tests       # 231 tests, ~27s, no display
 CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
 ```
+
+Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
+default 10), `CB_COOKIES` (`nothird`/`all`/`none`), `CB_ITP`, `CB_MEM_LIMIT`.
 
 There is no linter or type checker configured. `python3 -m py_compile` is the
 syntax gate.
@@ -63,6 +70,21 @@ syntax gate.
 - **Secrets go to the Secret Service, never to a file this project invents.** A
   password file of our own would need a master key, and the only place to put
   one is another file beside it.
+- **Page loads are queued, never parallel.** `Browser._admit` puts every
+  API-initiated load in a FIFO and runs one or two at a time. This is not
+  politeness — five simultaneous loads on two cores peak their memory in the
+  same second, and that is what froze the machine for twenty minutes. Anything
+  that navigates from the API goes through `_admit`, or it is outside the only
+  thing preventing a repeat.
+- **Only memory may refuse; CPU may only slow things down.** A developer laptop
+  idles at a load average of ten. A CPU-driven refusal means a browser that
+  never opens a tab again. See the long note in `resources.admit`.
+- **The browser owns its web context, and it is not the default one.**
+  `storage.make_context_once()` builds it with explicit data directories,
+  because a WebContext's data manager is fixed at construction and the default
+  one persists nothing. Never call `WebKit2.WebContext.get_default()` —
+  `WebView.new_with_user_content_manager()` does so internally, which is why
+  `Tab` uses the property constructor instead.
 - Named exports of intent in comments: explain *why*, especially where a choice
   looks arbitrary but encodes a real constraint.
 
@@ -112,6 +134,27 @@ syntax gate.
   mentions `claudebrowser` anywhere — even in a `cd` path — kills the shell
   running it (exit 144). Put the kill in its own call, with the pattern broken up
   (`[c]laudebrows`) and nothing else on the line that spells the name out.
+- **Swap *occupancy* is not memory pressure; the swap-in *rate* is.** A laptop
+  with a few days uptime sits at 70-80% swap used forever, because pages evicted
+  last week still count. The first version of `resources.py` read that as
+  pressure and discarded every background tab, repeatedly, on a healthy machine.
+  `pswpin` from `/proc/vmstat`, differenced between readings, is the live
+  signal — and `pswpin`, not `pgpgin`, which counts every ordinary file read.
+- **`set_memory_pressure_settings` is a *static* function on
+  WebsiteDataManager**, not a method — it configures every web process, not one
+  manager. Fetching it off the class and calling it with the settings object
+  passes the settings as `self`, which is what `perf.py` did inside a bare
+  `except Exception: pass` for as long as the file existed. The handler had
+  never once been installed. The boxed type also needs `.new()`; plain
+  `MemoryPressureSettings()` does not construct.
+- **`WebView.new_with_user_content_manager()` silently takes the default web
+  context.** So does `new_with_related_view`'s relative, transitively — which
+  means the *first* tab decides the whole window's cookie jar. Getting that one
+  constructor wrong opted the entire browser out of persistent storage while
+  every other line looked correct.
+- **A `Gtk.Window` key handler sees keys before the focused widget does.** The
+  find bar's own Escape binding never fires while `Browser._on_key` is
+  connected, so Escape for the find bar is handled there, ahead of the panel's.
 - **Screenshotting the chrome needs a cropped root grab.** `xwd -name` matches
   the legacy `WM_NAME`, which GTK does not set (it sets `_NET_WM_NAME`), and
   `xwd -id` on the toplevel misses popovers because a GTK popover is its own X
