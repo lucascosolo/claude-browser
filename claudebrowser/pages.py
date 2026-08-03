@@ -315,7 +315,8 @@ def _never_row(origin):
     }
 
 
-def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None):
+def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
+              light=None):
     """What the browser is holding: memory, and what is on disk.
 
     One page for both because they answer the same question -- "why is this
@@ -344,6 +345,13 @@ def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None):
         <div class="rows">
           %(tabs)s
         </div>
+      </section>
+      <section>
+        <h2>Lighter pages</h2>
+        <div class="rows">
+          %(light)s
+        </div>
+        <p class="note">%(light_note)s</p>
       </section>
       <section>
         <h2>Cookies &amp; cache</h2>
@@ -400,6 +408,21 @@ def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None):
             ("Limit for agent-opened tabs", machine.get("tab_ceiling", "—")),
             ("Loading right now", machine.get("loading", 0)),
         )),
+        # Reported rather than made switchable here, because it takes effect at
+        # web-process start: a button that appeared to toggle it would be lying
+        # about every tab already open. CB_LIGHT plus a restart is the honest
+        # shape, and this row is how you find out which way it is set.
+        "light": "".join(_fact(label, value) for label, value in (
+            ("Ask sites for a lighter page",
+             "on (Save-Data: on)" if (light or {}).get("enabled") else "off"),
+            ("Reduced motion",
+             "requested" if (light or {}).get("enabled") else "not requested"),
+        )),
+        "light_note": _e(
+            "Servers that honour Save-Data send smaller images and fewer fonts. "
+            "It rides on pages this browser loads for you, not on files a page "
+            "fetches for itself — WebKitGTK gives no way to reach those. "
+            "Set CB_LIGHT=0 and restart if a site serves you a degraded page."),
         "store": "".join(_fact(label, value) for label, value in (
             ("Cookie policy", {"all": "accept all",
                                "none": "reject all",

@@ -351,6 +351,16 @@ use. What's done about it:
 
 - **Ad/tracker blocking is on by default** (`CB_BLOCK=0` disables it). 82 rules
   compiled into WebKit's native content-blocker bytecode and cached on disk.
+- **Sites are asked for a lighter page** (`CB_LIGHT=0` disables it). Every page
+  the browser loads for you carries `Save-Data: on`, the standard client hint
+  that Cloudflare, Akamai, Google's transcoders and a good few CMSes read as
+  "send smaller images, fewer fonts, a lighter template". It rides on the pages
+  this browser navigates to, not on the files a page fetches for itself:
+  WebKitGTK's UI process only gets told a subresource request *was* sent, so
+  there is nowhere to add a header to it. The same switch asks for reduced
+  motion, which is the one media-feature preference this WebKit lets an app
+  assert — pages that respect it skip their animations, and animation is
+  per-frame work on the same two cores laying the page out.
 - **Tabs share one web process.** WebKit's default is one process per view,
   which on a swapping box is what makes a fourth tab hurt. Measured: opening
   three more tabs added **zero** web processes. Note `set_process_model()` is a
@@ -468,6 +478,7 @@ CB_BLOCK=1
 | `CB_BLOCK` | `0` turns the ad/tracker blocker off for a session. |
 | `CB_COOKIES` | `nothird` (default), `all`, or `none`. Third-party cookies are rejected by default; the ones this drops are mostly attached to loads the blocker already refuses. |
 | `CB_ITP` | `0` turns off tracking prevention. |
+| `CB_LIGHT` | On by default: asks sites for a cheaper page. Sends `Save-Data: on` with every page the browser loads for you, and asks for reduced motion so pages skip animations. `0`/`off` (then restart) if a site serves you a stripped-down version you did not want. |
 | `CB_MAX_TABS` | The ceiling on tabs an *agent* may open, default 10. Never applies to you. |
 | `CB_MEM_LIMIT` | MB per web process before WebKit starts shedding caches, default 512. |
 | `CB_PACE` | How slowly the agent moves so you can follow it. `1` (default), `0`/`off` for no pauses, up to `5` to slow it down. |
@@ -544,7 +555,7 @@ session eats it. It is a fallback, not a foundation.
 python3 -m unittest discover -s tests
 ```
 
-367 tests, no display or GTK bindings needed.
+388 tests, no display or GTK bindings needed.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the
@@ -578,6 +589,11 @@ mod-97, that the placeholders and counts are stable, that `CB_SCRUB=0` turns it
 off — and a list of ordinary prose (version strings, commit hashes, coordinates,
 numeric tables) that must come back untouched, because a scrubber with false
 positives rewrites the page out from under the answer.
+
+`test_light.py` covers `CB_LIGHT`: the spellings that turn it off, that a typo
+leaves it on, that the request handed to WebKit really carries `Save-Data: on`
+and nothing higher-entropy than that, and that `cb:data` says which way it is
+set. The signal wiring is not covered and cannot be — it needs a display.
 
 `test_reader.py` covers reader-mode option clamping, the reading-time estimate,
 and that the overlay never rewrites the page's own DOM; `test_pacing.py` covers

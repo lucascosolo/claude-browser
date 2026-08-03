@@ -276,6 +276,12 @@ class Browser(Gtk.Window):
         self.dark = dark
         self._apply_css(dark)
 
+        # Before any WebView exists: WebKit reads the GTK settings block once at
+        # web-process start as well as watching it, so flipping this after the
+        # first page is already laid out would be a re-layout for nothing.
+        for note in perf.tune_gtk(settings):
+            print("perf: %s" % note, flush=True)
+
         # One shared content manager. The console shim runs at document-start,
         # before page scripts, so it catches errors thrown during startup.
         # TOP_FRAME, not ALL_FRAMES: an ad-heavy page can carry dozens of
@@ -924,7 +930,7 @@ class Browser(Gtk.Window):
         """
         tab = self.current() or self.new_tab()
         self._begin_load(tab)
-        tab.view.load_uri(url if raw else normalize(url))
+        perf.load_url(tab.view, url if raw else normalize(url))
         if focus:
             tab.view.grab_focus()
         return tab
@@ -973,7 +979,9 @@ class Browser(Gtk.Window):
             return pages.data_page(palette, self.nonce, machine,
                                    self._storage_facts, storage.human,
                                    pagetext_info=(self.pagetext.stats()
-                                                  if self.pagetext else None))
+                                                  if self.pagetext else None),
+                                   light={"enabled": perf.light_enabled(),
+                                          "hints": perf.hint_headers()})
 
         if name == "passwords":
             if self.vault is None:
@@ -1185,7 +1193,10 @@ class Browser(Gtk.Window):
         self.notebook.set_show_tabs(len(self.tabs) > 1)
         if not background:
             self.notebook.set_current_page(index)
-        view.load_uri(normalize(url) if url else "about:blank")
+        if url:
+            perf.load_url(view, normalize(url))
+        else:
+            view.load_uri("about:blank")
         return tab
 
     def _tab_label(self, tab):
@@ -1587,7 +1598,7 @@ class Browser(Gtk.Window):
         tab.discarded = None
         tab.touch()
         self._begin_load(tab)
-        tab.view.load_uri(url)
+        perf.load_url(tab.view, url)
         self._relabel_tabs()
         return True
 
@@ -2386,7 +2397,7 @@ class Browser(Gtk.Window):
             tab.touch()
             tab.discarded = None
             self._begin_load(tab)
-            tab.view.load_uri(normalize(url))
+            perf.load_url(tab.view, normalize(url))
             self._await_load(tab, wait, done)
 
         self._admit(go, done)
@@ -2583,7 +2594,10 @@ class Browser(Gtk.Window):
               "tab_ceiling": resources.tab_ceiling(self.machine, MAX_AGENT_TABS),
               "discarded": sum(1 for s in states if s["discarded"]),
               "freeable": len(resources.pick_victims(states, len(self.tabs))),
-              "loading": sum(1 for t in self.tabs if t.loading)})
+              "loading": sum(1 for t in self.tabs if t.loading),
+              # So an agent reading a suspiciously thin page can tell whether we
+              # asked for it rather than blaming the site.
+              "light": perf.light_enabled()})
 
     @needs_tab
     def api_discard(self, tab, done):

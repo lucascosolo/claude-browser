@@ -39,7 +39,7 @@ tests/         unittest, no display needed
 ./cbctl health                              # is it up
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 367 tests, ~60s, no display
+python3 -m unittest discover -s tests       # 388 tests, ~60s, no display
 CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
 ```
 
@@ -47,7 +47,8 @@ Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
 default 10), `CB_COOKIES` (`nothird`/`all`/`none`), `CB_ITP`, `CB_MEM_LIMIT`,
 `CB_PACE` (agent pacing multiplier, default 1; `0`/`off` removes the pauses,
 higher slows the cursor down, clamped to 5), `CB_SCRUB` (outbound PII redaction,
-default on; `0`/`off` sends page text raw).
+default on; `0`/`off` sends page text raw), `CB_LIGHT` (ask servers for a
+cheaper page — `Save-Data: on` plus reduced motion, default on; `0`/`off`).
 
 There is no linter or type checker configured. `python3 -m py_compile` is the
 syntax gate.
@@ -264,6 +265,29 @@ syntax gate.
   at its start happily matches the last four digits of a phone number plus the
   first twelve of the card behind it, fails Luhn, and *hides the real card* by
   consuming the region — hence the trailing `(?![ -]\d)`.
+- **`WebKitWebResource` has `sent-request`, not `send-request`** — past tense,
+  no return value, fired after the bytes are gone. There is no way to modify an
+  outgoing request from the UI process in WebKitGTK 4.1. `send-request` is on
+  `WebKitWebPage`, which lives in the *web process extension* API and needs a C
+  shared library this project cannot build. So `perf.load_url` attaches
+  `Save-Data: on` to a `WebKitURIRequest` for loads the browser itself starts,
+  and subresources a page fetches for itself cannot carry it. Do not "fix" this
+  by intercepting `decide-policy` and re-issuing with `load_request`: that drops
+  the `Referer` WebKit would have set on a link click and turns a form POST into
+  a GET (a `WebKitURIRequest` has no body accessor), which breaks logins.
+- **WebKit 2.52 has no media-feature override, and `prefers-reduced-data` does
+  not exist in it.** `WebKitSettings` has no property for either; the 489-entry
+  `webkit_settings_get_all_features()` list has nothing matching "reduced" or
+  "motion"; and of the `prefers-*` strings in libwebkit2gtk-4.1 only
+  `color-scheme`, `contrast`, `dark-interface` and `reduced-motion` are present.
+  The single input to `prefers-reduced-motion` is the GTK setting
+  `gtk-enable-animations`, which the library watches (`notify::` on it sits in
+  the same forwarded settings block as `gtk-theme-name`), so `perf.tune_gtk`
+  sets it on the UI process's `Gtk.Settings` before the first WebView. The
+  page-side half of that is inferred from what the library contains, not
+  observed — confirming it needs a display. Never assert reduced motion with an
+  injected `animation: none !important` sheet instead: it fights the page's own
+  styles and breaks anything waiting on `animationend`.
 - **Screenshotting the chrome needs a cropped root grab.** `xwd -name` matches
   the legacy `WM_NAME`, which GTK does not set (it sets `_NET_WM_NAME`), and
   `xwd -id` on the toplevel misses popovers because a GTK popover is its own X
