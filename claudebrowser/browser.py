@@ -294,7 +294,7 @@ class Browser(Gtk.Window):
             gtk_settings
             and gtk_settings.get_property("gtk-application-prefer-dark-theme")
         ) else "light"
-        self.theme = style.resolve(theme or self.system_theme)
+        self.theme = self._theme_for(theme)
         self._apply_css(self.theme)
 
         # Before any WebView exists: WebKit reads the GTK settings block once at
@@ -425,6 +425,17 @@ class Browser(Gtk.Window):
         Gtk.main_quit()
 
     # -- construction -------------------------------------------------------
+
+    def _theme_for(self, wanted):
+        """The theme name to render, given what the setting asks for.
+
+        Only the literal "system" defers to the desktop. An unset CB_THEME is
+        not read as deference -- it means nobody has chosen, and the answer to
+        that is style.DEFAULT_THEME.
+        """
+        if (wanted or "").strip().lower() == "system":
+            return style.resolve(self.system_theme)
+        return style.resolve(wanted)
 
     def _apply_css(self, theme):
         # One provider, reloaded. It used to build a new one per call, which was
@@ -2978,7 +2989,7 @@ class Browser(Gtk.Window):
             self.persona_combo.set_active_id(personas.current())
         elif knob.key == "CB_THEME":
             wanted = settings.effective(knob)[0]
-            self.theme = style.resolve(wanted or self.system_theme)
+            self.theme = self._theme_for(wanted)
             self._apply_css(self.theme)
             # The Claude panel is not re-themed: it is a loaded document, and
             # reloading it would throw away the conversation in it. cb:settings

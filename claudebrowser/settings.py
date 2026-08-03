@@ -232,7 +232,7 @@ SETTINGS = (
     # -- Appearance ---------------------------------------------------------
     Setting(
         "CB_THEME", "Appearance", "Theme",
-        "dark, light or phosphor, overriding the system preference.",
+        "dark, light or phosphor; \"system\" follows the desktop instead.",
         "choice", "",
         "Applies now",
         "The window and the browser's own pages re-colour immediately. The "
@@ -240,9 +240,10 @@ SETTINGS = (
         "colours until the browser restarts.",
         # "Follow the desktop" can only ever mean dark or light -- a desktop has
         # no way to ask for phosphor, so that one has to be picked by name.
-        choices=(("", "Follow the desktop"), ("dark", "Dark"), ("light", "Light"),
-                 ("phosphor", "Phosphor (HUD)")),
-        canon=_choice_canon(("", "dark", "light", "phosphor"))),
+        choices=(("", "Phosphor (HUD) \u2014 default"), ("phosphor", "Phosphor (HUD)"),
+                 ("dark", "Dark"), ("light", "Light"),
+                 ("system", "Follow the desktop")),
+        canon=_choice_canon(("", "phosphor", "dark", "light", "system"))),
     Setting(
         "CB_LIGHT", "Appearance", "Ask sites for a lighter page",
         "Sends Save-Data: on with each page this browser loads, and asks for "

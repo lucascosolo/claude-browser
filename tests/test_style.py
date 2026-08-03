@@ -76,7 +76,7 @@ class Tokens(unittest.TestCase):
     def test_resolve_falls_back_rather_than_raising(self):
         """A typo in CB_THEME must not stop the browser from starting."""
         for junk in ("", None, "  ", "matrix", "DARKK"):
-            self.assertEqual(style.resolve(junk), "dark")
+            self.assertEqual(style.resolve(junk), style.DEFAULT_THEME)
         self.assertEqual(style.resolve(" Phosphor "), "phosphor")
 
     def test_is_dark_covers_the_stock_widgets(self):
@@ -214,4 +214,6 @@ class Motion(unittest.TestCase):
         of the other two."""
         self.assertNotIn(b"repeating-linear-gradient", style.css("dark"))
         self.assertLess(len(style.css("dark")), len(style.css("phosphor")))
-        self.assertEqual(style.css("dark"), style.css("nonsense"))
+        # Nonsense lands on the default, so compare dark against itself by
+        # name -- the point of the assertion is that dark is untouched.
+        self.assertEqual(style.css("dark"), style.css(" DARK "))

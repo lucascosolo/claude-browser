@@ -145,6 +145,12 @@ THEMES = {"dark": _DARK, "light": _LIGHT, "phosphor": _PHOSPHOR}
 #: In the order they are offered on cb:settings and on `--theme`.
 THEME_NAMES = ("dark", "light", "phosphor")
 
+# What an install with no opinion gets. Phosphor rather than the desktop's
+# dark/light, because this browser is not trying to disappear into the desktop
+# -- and "follow the desktop" stays one pick away on cb:settings for anyone who
+# would rather it did.
+DEFAULT_THEME = "phosphor"
+
 #: Which themes want the dark stock GTK widgets underneath (scrollbars, the
 #: file chooser, anything this sheet does not repaint).
 DARK_THEMES = ("dark", "phosphor")
@@ -744,11 +750,11 @@ def resolve(theme) -> str:
     """The name of the theme to use for `theme`.
 
     Accepts a name, or None/"" meaning "the caller has no opinion" -- which
-    lands on dark rather than raising, because a typo in `CB_THEME` must not be
-    able to stop the browser from starting.
+    lands on DEFAULT_THEME rather than raising, because a typo in `CB_THEME`
+    must not be able to stop the browser from starting.
     """
     name = (theme or "").strip().lower()
-    return name if name in THEMES else "dark"
+    return name if name in THEMES else DEFAULT_THEME
 
 
 def is_dark(theme) -> bool:
