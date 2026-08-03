@@ -141,6 +141,81 @@ window, .cb-root {{ background: {bg}; }}
 }}
 .cb-pwbar label {{ color: {text}; font-size: 0.94em; }}
 
+/* The find bar. Deliberately the same furniture as the password bar -- both are
+   transient strips that appear between the toolbar and the page, and a browser
+   that invents a new visual idiom per feature stops reading as one program. */
+.cb-findbar {{
+    background: {panel};
+    border-bottom: 1px solid {line};
+    padding: 6px 8px 6px 11px;
+}}
+/* `entry.cb-findentry`, not `.cb-findentry`: the stock theme styles `entry:focus`
+   and wins on specificity against a bare class, which paints the stock blue
+   focus border straight over the accent. Naming the element takes it back --
+   the same reason the omnibox spends a box-shadow rather than a border here. */
+entry.cb-findentry {{
+    background: {field};
+    color: {text};
+    border: 1px solid {line};
+    border-radius: 7px;
+    padding: 3px 9px;
+    min-height: 0;
+    outline: none;
+    caret-color: {accent};
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+}}
+entry.cb-findentry:focus {{
+    background: {field_focus};
+    border-color: {accent};
+    box-shadow: 0 0 0 3px alpha({accent}, 0.16);
+}}
+entry.cb-findentry selection {{ background: {accent}; color: {on_accent}; }}
+/* Nothing found: tint the box rather than pop a dialog. The answer is already
+   on screen and only needs to be legible. Has to beat the focus rule above,
+   because the entry is focused for the whole time it is showing a miss. */
+entry.cb-findentry.cb-find-miss,
+entry.cb-findentry.cb-find-miss:focus {{
+    color: {warn};
+    border-color: {warn};
+    box-shadow: 0 0 0 3px alpha({warn}, 0.16);
+}}
+.cb-findcount {{ color: {dim}; font-size: 0.86em; padding: 0 4px; }}
+.cb-findbtn {{
+    background: transparent;
+    background-image: none;
+    box-shadow: none;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 2px 5px;
+    min-height: 0;
+    min-width: 0;
+    color: {dim};
+}}
+.cb-findbtn:hover {{ color: {text}; background: {field_focus}; }}
+.cb-findtoggle {{
+    background: transparent;
+    background-image: none;
+    box-shadow: none;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 2px 8px;
+    min-height: 0;
+    color: {dim};
+    font-size: 0.86em;
+    font-weight: 600;
+}}
+.cb-findtoggle:hover {{ color: {text}; background: {field_focus}; }}
+.cb-findtoggle:checked {{
+    background: {accent_soft};
+    color: {accent};
+    border-color: {accent};
+}}
+
+/* A tab whose page was dropped to reclaim memory. Dimmed, not badged: it is
+   still that tab, and a marker would make an invisible optimisation look like
+   a failure. */
+.cb-tab-dim label {{ opacity: 0.55; }}
+
 /* background-image and box-shadow both have to be cleared explicitly: the stock
    theme paints its button bevel with a gradient image and an inset shadow, and
    setting only `background` leaves both of them showing through as a ghost

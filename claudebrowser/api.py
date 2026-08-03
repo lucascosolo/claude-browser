@@ -27,6 +27,15 @@ the user is looking at", which is what an agent almost always wants.
 
 TAB_HELP = "Tab id; omit for the focused tab."
 
+#: How long the control API waits on an operation that loads a page.
+#:
+#: Generous, because page loads are queued rather than run in parallel -- see
+#: Browser._admit. A request can legitimately spend a minute waiting its turn on
+#: a slow machine, and this has to outlast the browser's own queue expiry
+#: (QUEUE_TOTAL_S) or the caller gets "timed out" where the browser had a real
+#: reason ready to hand back.
+LOAD_TIMEOUT = 150
+
 
 class Param:
     """One argument to an operation.
@@ -141,31 +150,43 @@ OPS = [
                      cli="opt", default=False)],
        call=lambda c, a: ("api_open", (a["url"], _truthy(a.get("background"), False),
                                        _truthy(a.get("wait")))),
-       tab=False, timeout=90),
+       tab=False, timeout=LOAD_TIMEOUT),
 
     Op("navigate", "/navigate", "POST", "Navigate an existing tab to a URL and "
        "wait for the load.",
        params=[Param("url", required=True)],
        call=lambda c, a: ("api_navigate", (_tab(a), a["url"], _truthy(a.get("wait")))),
-       timeout=90),
+       timeout=LOAD_TIMEOUT),
 
     Op("back", "/back", "POST", "Go back one entry in the tab's history.",
        call=lambda c, a: ("api_history", (_tab(a), -1, _truthy(a.get("wait")))),
-       timeout=90),
+       timeout=LOAD_TIMEOUT),
 
     Op("forward", "/forward", "POST", "Go forward one entry in the tab's history.",
        call=lambda c, a: ("api_history", (_tab(a), 1, _truthy(a.get("wait")))),
-       timeout=90),
+       timeout=LOAD_TIMEOUT),
 
     Op("reload", "/reload", "POST", "Reload the tab and wait for the load.",
        call=lambda c, a: ("api_reload", (_tab(a), _truthy(a.get("wait")))),
-       timeout=90),
+       timeout=LOAD_TIMEOUT),
 
     Op("wait", "/wait", "POST", "Block until the tab's current load finishes.",
        call=lambda c, a: ("api_wait", (_tab(a),)), timeout=120),
 
     Op("close", "/close", "POST", "Close a tab.",
        call=lambda c, a: ("api_close", (_tab(a),))),
+
+    # The resource ops. `machine` is the one an agent should reach for after an
+    # open is refused: it says whether to wait, discard, or give up, instead of
+    # leaving retry-or-not to guesswork.
+    Op("machine", "/machine", "GET", "Report free memory, swap and CPU load, the "
+       "current tab limit, and how many tabs could be freed. Call this when an "
+       "open or navigate is refused for pressure.",
+       call=lambda c, a: ("api_machine", ()), tab=False),
+
+    Op("discard", "/discard", "POST", "Free a tab's memory but keep the tab; it "
+       "reloads on next use. Use this instead of closing a tab you still want.",
+       call=lambda c, a: ("api_discard", (_tab(a),))),
 
     Op("text", "/text", "GET", "Read the page as clean text, with nav/script/footer "
        "chrome stripped. Use this first when verifying what a page says.",
@@ -205,6 +226,20 @@ OPS = [
        "captured on the page. Call this when debugging why a page misbehaves.",
        params=[Param("pattern", help="Regex filter over message text.", cli="opt")],
        call=lambda c, a: ("api_console", (_tab(a), a.get("pattern")))),
+
+    # Cookies and caches. Reading is an MCP tool; clearing is not -- signing the
+    # user out of every site they use is not a step an agent should be able to
+    # take in pursuit of some other goal. `cbctl clear cookies` is one command
+    # away for a person who means it.
+    Op("storage", "/storage", "GET", "Report the cookie policy, how many domains "
+       "have cookies, and how much disk the cache is using.",
+       call=lambda c, a: ("api_storage", ()), tab=False),
+
+    Op("clear", "/clear", "POST", "Delete stored browsing data.",
+       params=[Param("kind", help="cache, cookies, storage, or all.",
+                     cli="optarg")],
+       call=lambda c, a: ("api_clear", (a.get("kind") or "cache",)),
+       tab=False, mcp=False, timeout=90),
 
     Op("screenshot", "/screenshot", "GET", "Save a PNG of the visible viewport to a "
        "path on disk.",
