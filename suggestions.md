@@ -9,8 +9,9 @@ those refusals lives in `CLAUDE.md` under *Architectures already rejected*, so
 it does not get re-proposed here every six months.
 
 Ideas that have since been built — reader mode, the page-text cache, `recall`
-full-text search, the visible agent cursor, the outbound PII scrubber — are
-documented in `README.md` and `CLAUDE.md` and are no longer suggestions.
+full-text search, the visible agent cursor, the outbound PII scrubber, playbooks,
+and Claude personas — are documented in `README.md` and `CLAUDE.md` and are no
+longer suggestions.
 
 ## Tab snapshot summaries
 
@@ -48,35 +49,8 @@ because a confirmation step on every question would be nagging) or triggered by
 size, and whether an edit to the preview is one-shot or remembered for that
 page.
 
-## Playbooks: record and replay command sequences
-
-`api.py` already describes every operation as data, and `cbctl` already turns
-that table into a CLI. A playbook is a saved list of those calls — open, fill,
-click, read — replayed against the live browser with the user's own session.
-
-The cheap version is a JSON file per playbook in the data directory, a `cbctl
-playbook record|run|list` subcommand family, and replay that goes through the
-same `_admit` queue every other API-initiated load does. Parameters are the
-interesting part: a recorded run hard-codes the URL and the search term it used,
-and a playbook worth keeping takes them as arguments.
-
-## Claude personas
-
-Ask, TL;DR and Research share one system prompt. A persona is a named prompt
-preset — Developer, Researcher, Critic, Translator — chosen from a pill in the
-Claude panel, changing tone and what the answer leads with.
-
-Small and self-contained: prompts live beside the existing ones, the selection
-is a panel control, and the current persona is part of the panel's state. Worth
-doing only if the four prompts genuinely differ; four labels over one prompt is
-a worse product than one honest mode.
-
 ## Smaller things, in rough order of value
 
-- **Keep-alive HTTPS connection to the API.** `ai.py` opens a fresh TLS
-  connection per request; a run of agent steps pays a handshake each time. One
-  pooled connection, plus a DNS/TLS preconnect at startup, is stdlib work with a
-  measurable latency win on a slow uplink.
 - **Read-later cache from what is already stored.** The page-text cache holds
   the prose of everything read; reader mode can already render an article. An
   offline "read later" view is mostly a `cb:` page over `pagetext`, not a new
@@ -94,3 +68,9 @@ a worse product than one honest mode.
 - **Lazy images and iframes.** A `loading="lazy"` pass and a low-quality
   placeholder for offscreen images, on hardware where a page's image decode is a
   real cost.
+
+- **Parameters for playbooks.** A recorded run hard-codes the URL and the search
+  term it used. A playbook worth keeping takes them as arguments, so
+  `playbook-run report --date 2026-08` is one playbook rather than thirty. The
+  recorder already knows which parameter each value came from; what is missing
+  is a way to name one and substitute it at replay.

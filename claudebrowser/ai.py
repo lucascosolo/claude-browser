@@ -28,7 +28,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from . import auth, scrub
+from . import auth, personas, scrub
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
@@ -620,11 +620,20 @@ def _page_block(page, limit=120_000, tally=None):
 
 
 def _stream(system, prompt):
-    """Shared streaming path. Yields text; never raises past NoKey."""
+    """Shared streaming path. Yields text; never raises past NoKey.
+
+    The active persona is composed in *here*, at the one point Ask, TL;DR and
+    Research all pass through, so a new text feature cannot forget it and no
+    caller can pass a system prompt the persona replaces: `personas.compose`
+    only ever appends to what it is given. The agent loop deliberately does not
+    come through here -- `agent.SYSTEM` is instructions for driving a browser
+    with tools, not an answering style, and layering "read this adversarially"
+    over it would change what the agent *does* rather than how it writes.
+    """
     payload = {
         "model": MODEL,
         "max_tokens": MAX_TOKENS,
-        "system": system,
+        "system": personas.compose(system),
         "stream": True,
         "messages": [{"role": "user", "content": prompt}],
     }

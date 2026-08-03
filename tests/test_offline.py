@@ -401,6 +401,9 @@ class TestApiRegistry(unittest.TestCase):
             "/console": {}, "/screenshot": {}, "/recall": {"q": "a"},
             "/machine": {}, "/discard": {}, "/storage": {},
             "/clear": {"kind": "pagetext"},
+            "/playbook/record": {"action": "status"}, "/playbook/list": {},
+            "/playbook/run": {"name": "login"}, "/playbook/delete": {"name": "login"},
+            "/persona": {},
         }
         # /health is served without touching the browser, so it has no builder.
         callable_routes = {op.route for op in self.api.OPS if op.call}

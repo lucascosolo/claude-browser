@@ -121,6 +121,23 @@ class Control:
         supplied = (handler.headers.get("authorization") or "").removeprefix("Bearer ")
         return supplied == self.token
 
+    def _record(self, op, args, payload):
+        """Offer one completed operation to the playbook recorder.
+
+        This is the single point every API-initiated operation passes through --
+        cbctl, cb-mcp and any HTTP caller all arrive here -- so a playbook picks
+        up a new op the moment it is added to api.OPS, with nothing to remember.
+        The recorder decides what is worth keeping; this only has to not fail.
+        """
+        recorder = getattr(self.browser, "recorder", None)
+        if recorder is None or not recorder.active:
+            return
+        try:
+            ok = not isinstance(payload, dict) or payload.get("ok", True)
+            recorder.observe(op.name, args, ok=bool(ok))
+        except Exception:
+            pass  # a recording must never be the thing that fails a request
+
     def _handle(self, handler, body):
         url = urlparse(handler.path)
         args = {k: v[0] for k, v in parse_qs(url.query).items()}
@@ -152,6 +169,8 @@ class Control:
         except Exception:
             return self._send(handler, 500,
                               {"ok": False, "error": traceback.format_exc(limit=4)})
+
+        self._record(op, args, payload)
 
         # /screenshot with no path answers with the PNG itself rather than JSON.
         if isinstance(payload, dict) and payload.get("ok") and payload.get("png"):

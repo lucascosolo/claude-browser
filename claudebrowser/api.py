@@ -270,6 +270,52 @@ OPS = [
                      cli="optarg")],
        call=lambda c, a: ("api_screenshot", (_tab(a), a.get("path"))),
        timeout=60),
+
+    # Playbooks: a saved, ordered list of the operations above. Nothing new is
+    # described here -- a playbook's steps are entries from this same table,
+    # which is why recording needs no per-op support and replay needs no
+    # interpreter. See playbooks.py.
+    Op("playbook-record", "/playbook/record", "POST",
+       "Start or stop recording the operations you perform into a named "
+       "playbook. Credential fields are never captured.",
+       params=[Param("action", required=True,
+                     help="start, stop, cancel or status."),
+               Param("name", cli="optarg",
+                     help="Playbook name; required for start.")],
+       call=lambda c, a: ("api_playbook_record", (a["action"], a.get("name"))),
+       tab=False),
+
+    Op("playbook-list", "/playbook/list", "GET",
+       "List saved playbooks with their step counts, and say whether a "
+       "recording is in progress.",
+       call=lambda c, a: ("api_playbook_list", ()), tab=False),
+
+    # Generous timeout: a playbook is several operations in series, and any of
+    # them may be a page load that queues behind others (see Browser._admit).
+    Op("playbook-run", "/playbook/run", "POST",
+       "Replay a saved playbook against the live browser, one step at a time.",
+       params=[Param("name", required=True, help="Playbook to replay.")],
+       call=lambda c, a: ("api_playbook_run", (a["name"],)),
+       tab=False, timeout=600),
+
+    # Not an MCP tool, for the same reason `clear` is not: deleting something
+    # the user recorded is not a step an agent should take in pursuit of some
+    # other goal.
+    Op("playbook-delete", "/playbook/delete", "POST", "Delete a saved playbook.",
+       params=[Param("name", required=True, help="Playbook to delete.")],
+       call=lambda c, a: ("api_playbook_delete", (a["name"],)),
+       tab=False, mcp=False),
+
+    # Not an MCP tool: the persona is the user's own preference about how the
+    # panel answers *them*, it is written to their settings file, and an agent
+    # driving the browser has no answer of its own coming out of that panel.
+    Op("persona", "/persona", "POST",
+       "Report the Claude panel's persona, or switch to another one.",
+       params=[Param("name", cli="optarg",
+                     help="off, developer, researcher, critic or translator; "
+                          "omit to report the current one.")],
+       call=lambda c, a: ("api_persona", (a.get("name"),)),
+       tab=False, mcp=False),
 ]
 
 BY_NAME = {op.name: op for op in OPS}

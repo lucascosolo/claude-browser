@@ -22,6 +22,8 @@ claudebrowser/
   resources.py THE RESOURCE POLICY -- when to wait, refuse, or drop a tab
   storage.py   the web context: persistent cookies, disk cache, clearing
   findbar.py   Ctrl+F, driving WebKit's per-view FindController
+  personas.py  named answering styles composed onto ai.py's prompts (GTK-free)
+  playbooks.py recorded op sequences: capture, validation, JSON store (GTK-free)
   tabnames.py  tab labelling (GTK-free so it is testable)
   urls.py      omnibox intent: navigate or search (GTK-free)
   reader.py    reader mode: article extraction + reading typography (GTK-free)
@@ -39,7 +41,7 @@ tests/         unittest, no display needed
 ./cbctl health                              # is it up
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 388 tests, ~60s, no display
+python3 -m unittest discover -s tests       # 449 tests, ~60s, no display
 CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
 ```
 
@@ -48,7 +50,8 @@ default 10), `CB_COOKIES` (`nothird`/`all`/`none`), `CB_ITP`, `CB_MEM_LIMIT`,
 `CB_PACE` (agent pacing multiplier, default 1; `0`/`off` removes the pauses,
 higher slows the cursor down, clamped to 5), `CB_SCRUB` (outbound PII redaction,
 default on; `0`/`off` sends page text raw), `CB_LIGHT` (ask servers for a
-cheaper page — `Save-Data: on` plus reduced motion, default on; `0`/`off`).
+cheaper page — `Save-Data: on` plus reduced motion, default on; `0`/`off`),
+`CB_PERSONA` (the Claude panel's answering style; `off` by default).
 
 There is no linter or type checker configured. `python3 -m py_compile` is the
 syntax gate.
@@ -121,6 +124,45 @@ syntax gate.
   not try names or street addresses at all, because a scrubber that mangles
   prose makes the answers stop matching the page and the user stops trusting
   them.
+- **A playbook is replayed input, and is validated against `api.py` before any
+  of it runs.** `playbooks.validate` resolves each step's op in the registry,
+  refuses the ones with no browser method (`/health`) and the playbook ops
+  themselves (no recursion), and checks every parameter against that op's
+  declared ones — so a file on disk can only ever reach an `api_*` method that
+  already exists with arguments it already accepts. Nothing is evaluated.
+  Validation is all-or-nothing: a bad fourth step is refused before the first
+  three have moved the browser somewhere nobody asked for. Replay then dispatches
+  through the *same* `op.call` builder the HTTP route uses, which is what keeps
+  its navigations inside `_admit`'s queue, and it runs strictly one step at a
+  time — each step starts from the previous step's `done` callback.
+- **Recording happens in `control._handle`, not per-op.** That is the one funnel
+  every API-initiated operation already passes through, so a new entry in
+  `api.OPS` is recordable the moment it exists. Failed operations are dropped
+  (a click on a selector that was not there is not part of the sequence), and
+  `tab` is never recorded — a tab id is valid for one session, so a hard-coded
+  one acts on whatever holds that id tomorrow.
+- **A credential is never written to a playbook, not even redacted.**
+  `playbooks.is_secret_step` matches the *selector* or the *script* — never the
+  value, because a pattern that has to read the value has already loaded the
+  secret into a variable someone then has to be careful with. The step is
+  dropped at capture time so no copy exists to leak, the count is reported, and
+  replay leans on the native autofill, which is the only path here allowed to
+  hold a secret.
+- **A persona is composed onto the base system prompt, never in place of it.**
+  `personas.compose` always starts from the base it is given and can only append
+  a paragraph, so no persona -- valid, mistyped or absent -- produces a prompt
+  without the instructions the browser depends on (answer from the page's text,
+  say so when the answer is not there). Composition happens inside `ai._stream`,
+  the one point Ask, TL;DR and Research all pass through, so a new text feature
+  cannot forget it. `agent.SYSTEM` deliberately stays outside: it is
+  instructions for driving a browser with tools, and an answering style layered
+  over it would change what the agent *does* rather than how it writes.
+- **`envfile.put` is the only writer of the settings file, and it refuses
+  `SECRET_KEYS`.** It rewrites the first uncommented assignment in place and
+  leaves comments, ordering and the commented-out template examples alone --
+  the file is the user's. A setter that could write `ANTHROPIC_API_KEY` would be
+  a route from an API call to the user's credential, which is why it raises
+  instead.
 - Named exports of intent in comments: explain *why*, especially where a choice
   looks arbitrary but encodes a real constraint.
 

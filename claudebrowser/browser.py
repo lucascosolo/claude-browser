@@ -20,8 +20,8 @@ gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  # noqa: E402
-               passwords, perf, reader, resources, scrub, storage, store, style,
-               tabnames, urls)
+               passwords, perf, personas, playbooks, reader, resources, scrub,
+               storage, store, style, tabnames, urls)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -322,6 +322,18 @@ class Browser(Gtk.Window):
             print("pagetext: disabled (%s)" % e, flush=True)
             self.pagetext = None
 
+        # Playbooks. Optional in the same way, and for the same reason: a home
+        # directory the browser cannot write to costs you saved sequences, not
+        # the browser. The recorder itself holds no disk state, so it exists
+        # even when the collection does not -- `stop` is the only step that
+        # needs a file.
+        self.recorder = playbooks.Recorder()
+        try:
+            self.playbooks = playbooks.Playbooks()
+        except Exception as e:
+            print("playbooks: disabled (%s)" % e, flush=True)
+            self.playbooks = None
+
         # Proves a script message came from one of our own pages. See pages.py:
         # the handler is on the shared content manager, so every page in the
         # browser can reach it, and only ours can produce this value.
@@ -523,6 +535,21 @@ class Browser(Gtk.Window):
             head.pack_start(btn, False, False, 0)
             self.mode_buttons[key] = btn
 
+        # How Claude answers, next to what it is being asked. A combo rather
+        # than more pills: five options would double the width of the mode row,
+        # and unlike the modes this is a setting you pick once.
+        self.persona_combo = Gtk.ComboBoxText()
+        self.persona_combo.get_style_context().add_class("cb-persona")
+        for key, name in personas.choices():
+            self.persona_combo.append(key, name)
+        self.persona_combo.set_active_id(personas.current())
+        self.persona_combo.set_tooltip_text(
+            "How Claude answers in this panel. Remembered across restarts; it "
+            "adds to the panel's instructions rather than replacing them.")
+        self.persona_combo.set_can_focus(False)
+        self.persona_combo.connect("changed", self._on_persona_changed)
+        head.pack_start(self.persona_combo, False, False, 4)
+
         self.status = Gtk.Label(label="")
         self.status.set_xalign(0)
         self.status.get_style_context().add_class("cb-status")
@@ -603,6 +630,22 @@ class Browser(Gtk.Window):
         box.set_no_show_all(True)
         box.hide()
         return box
+
+    def _on_persona_changed(self, combo):
+        """The panel's selector, writing straight through to the settings file.
+
+        Compared against what is on disk first, so setting the persona from the
+        API -- which updates this widget to match -- does not bounce back into a
+        second write of the value it just stored.
+        """
+        key = combo.get_active_id()
+        if not key or key == personas.current():
+            return
+        try:
+            personas.remember(key)
+        except (OSError, ValueError) as e:
+            return self._flash("could not save the persona: %s" % e)
+        self._set_status("persona: %s" % personas.label(key), "ok")
 
     def _on_panel_policy(self, _view, decision, kind):
         """Send a link clicked in an answer to a tab, never to the panel."""
@@ -2670,3 +2713,182 @@ class Browser(Gtk.Window):
         if kind == "pagetext":
             return done({"ok": True, "cleared": kind})
         storage.clear(self.context, kind, done)
+
+    def api_persona(self, name, done):
+        """Report the Claude panel's persona, or switch to it.
+
+        No `name` is a read, which is what makes one op enough: `cbctl persona`
+        says which one is active and `cbctl persona critic` changes it. The
+        value is written to the settings file, so it survives a restart the same
+        way every other preference here does.
+        """
+        if name in (None, ""):
+            return done({"ok": True, **personas.describe()})
+        try:
+            key = personas.remember(name)
+        except ValueError as e:
+            return done({"ok": False, "error": str(e), **personas.describe()})
+        except OSError as e:
+            return done({"ok": False,
+                         "error": "could not write the settings file: %s" % e})
+        # The panel is the other place this value is visible; leaving it showing
+        # the old persona would make the setting look like it had not taken.
+        self.persona_combo.set_active_id(key)
+        done({"ok": True, **personas.describe()})
+
+    # -- playbooks ----------------------------------------------------------
+    # Recording happens in control.py, at the one point every API-initiated
+    # operation passes through. What lives here is the half that needs tabs:
+    # replaying a validated sequence, one step at a time.
+
+    def _no_playbooks(self, done):
+        if self.playbooks is None:
+            done({"ok": False, "error": "playbooks are disabled (the data "
+                                        "directory could not be opened)"})
+            return True
+        return False
+
+    def api_playbook_record(self, action, name, done):
+        action = (action or "").strip().lower()
+
+        if action == "status":
+            return done({"ok": True, **self.recorder.status()})
+
+        if action == "start":
+            if self.recorder.active:
+                return done({"ok": False,
+                             "error": "already recording %r -- stop or cancel "
+                                      "that first" % self.recorder.name})
+            if self._no_playbooks(done):
+                return None
+            try:
+                started = self.recorder.start(name)
+            except playbooks.PlaybookError as e:
+                return done({"ok": False, "error": str(e)})
+            return done({"ok": True, "recording": started,
+                         "note": "every operation from here until "
+                                 "`playbook-record stop` is captured; "
+                                 "credential fields are skipped"})
+
+        if action == "cancel":
+            dropped = self.recorder.cancel()
+            return done({"ok": True, "cancelled": dropped})
+
+        if action == "stop":
+            if not self.recorder.active:
+                return done({"ok": False, "error": "not recording"})
+            book, steps, skipped = self.recorder.stop()
+            if self._no_playbooks(done):
+                return None
+            if not steps:
+                return done({"ok": False, "skipped_secrets": skipped,
+                             "error": "nothing replayable was recorded, so %r "
+                                      "was not saved" % book})
+            try:
+                self.playbooks.save(book, steps, skipped)
+            except (playbooks.PlaybookError, OSError) as e:
+                return done({"ok": False, "error": str(e)})
+            return done({"ok": True, "saved": book, "steps": len(steps),
+                         "ops": [s["op"] for s in steps],
+                         "skipped_secrets": skipped,
+                         # Said plainly rather than left to be discovered: a
+                         # login playbook that silently dropped its password
+                         # step would look broken on the first replay.
+                         **({"note": "%d credential field(s) were not recorded; "
+                                     "the browser's own autofill supplies those "
+                                     "on replay" % skipped} if skipped else {})})
+
+        done({"ok": False, "error": "unknown action %r; use start, stop, cancel "
+                                    "or status" % action})
+
+    def api_playbook_list(self, done):
+        if self._no_playbooks(done):
+            return None
+        done({"ok": True, "playbooks": self.playbooks.summaries(),
+              "recording": self.recorder.status()})
+
+    def api_playbook_delete(self, name, done):
+        if self._no_playbooks(done):
+            return None
+        try:
+            gone = self.playbooks.delete(name)
+        except OSError as e:
+            return done({"ok": False, "error": str(e)})
+        if not gone:
+            return done({"ok": False, "error": "no playbook named %r" % (name,)})
+        done({"ok": True, "deleted": name})
+
+    def api_playbook_run(self, name, done):
+        """Replay a saved playbook, strictly one step at a time.
+
+        Two rules shape this loop.
+
+        **Everything is validated before anything runs.** The file is replayed
+        input: an op name is checked against the registry and its parameters
+        against that op's declared ones, so a playbook can only ever reach an
+        `api_*` method that already exists with arguments that op already
+        accepts. Nothing is evaluated, and a bad fourth step is refused before
+        the first three have moved the browser somewhere nobody asked for.
+
+        **Steps run in series, and the loads among them still queue.** Each step
+        starts only when the previous one has called back, and the navigating
+        ops reach `_admit` exactly as they would over HTTP -- so a six-page
+        playbook is six queued loads, not six simultaneous ones. Firing them at
+        once is the thing that froze the machine for twenty minutes.
+        """
+        if self._no_playbooks(done):
+            return None
+        book = self.playbooks.get(name)
+        if book is None:
+            return done({"ok": False, "error": "no playbook named %r" % (name,),
+                         "playbooks": self.playbooks.names()})
+        try:
+            steps = playbooks.validate(book.get("steps"))
+        except playbooks.PlaybookError as e:
+            return done({"ok": False,
+                         "error": "%s cannot be replayed: %s" % (name, e)})
+
+        results = []
+        finished = [False]
+
+        def finish(payload):
+            # `done` exactly once, however the run ends -- a second call would
+            # put a payload nobody is waiting for onto the control queue.
+            if finished[0]:
+                return
+            finished[0] = True
+            done(payload)
+
+        def run(index):
+            if index >= len(steps):
+                return finish({"ok": True, "playbook": name,
+                               "steps": results})
+            op, params = steps[index]
+            try:
+                method, call_args = op.call(self, dict(params))
+            except Exception as e:
+                return finish({"ok": False, "playbook": name, "steps": results,
+                               "error": "step %d (%s) could not be built: %s"
+                                        % (index + 1, op.name, e)})
+
+            def after(payload):
+                payload = payload if isinstance(payload, dict) else {}
+                ok = payload.get("ok", True)
+                results.append({"step": index + 1, "op": op.name,
+                                "ok": bool(ok),
+                                **({"error": payload["error"]}
+                                   if payload.get("error") else {})})
+                if not ok:
+                    return finish({
+                        "ok": False, "playbook": name, "steps": results,
+                        "error": "step %d (%s) failed: %s"
+                                 % (index + 1, op.name,
+                                    payload.get("error") or "no reason given")})
+                # Through an idle rather than straight on: an op that answers
+                # synchronously would otherwise recurse once per step, and the
+                # main loop gets a chance to paint between steps.
+                GLib.idle_add(lambda: (run(index + 1), GLib.SOURCE_REMOVE)[1])
+
+            getattr(self, method)(*call_args, after)
+
+        run(0)

@@ -220,6 +220,20 @@ at, and shrinks itself rather than squeezing the page out of a short window.
 | `Ctrl+Shift+K` | **Full height** | Grow the console to the whole window, and back. The divider above it resizes by hand. |
 | `Ctrl+G` | **Command** | Give Claude a goal and it drives the browser — navigating, reading, clicking — in the window you're watching, on your own logged-in session. `Stop` cancels mid-run. |
 
+**Personas.** A drop-down beside the mode pills switches how the panel answers:
+*Developer* leads with the command or identifier and quotes code verbatim,
+*Researcher* separates what the page states from what it implies and says what
+evidence a claim rests on, *Critic* leads with the weakest part of the argument,
+*Translator* answers in your language and gives the original wording alongside
+its rendering. *No persona* is the default.
+
+A persona is added to the panel's own instructions, never a replacement for
+them — answers stay grounded in the page's text either way. The choice is
+remembered in `~/.config/claude-browser/env` as `CB_PERSONA`, and
+`cbctl persona` reports it (`cbctl persona critic` switches). It applies to Ask,
+TL;DR and Research; Command is a tool-driving loop, not an answering style, so
+it is left alone.
+
 The command bar is the control API turned inward: the same navigate/read/click
 primitives an external agent gets over HTTP, handed to a tool-use loop inside
 the browser. It won't submit forms or change account state unless the goal
@@ -297,9 +311,9 @@ claude mcp add -s user browser -- /path/to/claude-browser/cb-mcp
 
 That registers `browser_open`, `browser_text`, `browser_markdown`, `browser_links`,
 `browser_find`, `browser_click`, `browser_fill`, `browser_eval`, `browser_console`,
-`browser_screenshot`, `browser_reader`, `browser_recall`, and the navigation tools
-— 23 in all, generated from the same table as the HTTP routes, so the two cannot
-disagree.
+`browser_screenshot`, `browser_reader`, `browser_recall`, `browser_playbook-run`,
+and the navigation tools — 26 in all, generated from the same table as the HTTP
+routes, so the two cannot disagree.
 
 **You do not need to start the browser first.** The MCP server launches it on
 the first tool call and waits for it to come up (`CB_AUTOSTART=0` opts out).
@@ -322,6 +336,38 @@ the first tool call and waits for it to come up (`CB_AUTOSTART=0` opts out).
 `cbctl` exits non-zero when the browser reports a failure, so `cbctl click .go &&
 cbctl text` does the right thing.
 
+### Playbooks: record a sequence, replay it later
+
+A sequence worth repeating — open the dashboard, sign in, click through to the
+report — can be recorded once and replayed by name.
+
+```bash
+./cbctl playbook-record start morning     # everything from here is captured
+./cbctl open https://dash.example.com
+./cbctl click '#reports'
+./cbctl playbook-record stop              # saves it as "morning"
+
+./cbctl playbook-list
+./cbctl playbook-run morning
+./cbctl playbook-delete morning
+```
+
+Recording watches the control API, so it captures whatever drives it — `cbctl`,
+the MCP tools, or a raw `curl`. Failed operations are left out, and tab ids are
+never recorded: every step replays against the focused tab, so a playbook still
+works tomorrow.
+
+**Credentials are never recorded.** A `fill` into a password, OTP or API-key
+field is dropped at capture time rather than written to disk and hidden later,
+and the reply says how many were skipped. On replay the browser's own autofill
+supplies them, which is the only path here allowed to hold a secret.
+
+Playbooks live in `~/.local/share/claude-browser/playbooks.json` — plain JSON, so
+you can read, edit, diff and copy them. Replay validates every step against the
+API registry before running any of them, and the page loads among them go into
+the same one-at-a-time queue as every other API-initiated load, so a six-page
+playbook is six queued loads rather than six simultaneous ones.
+
 ### Over HTTP
 
 ```bash
@@ -339,6 +385,9 @@ curl -s 127.0.0.1:8765/open -d '{"url":"https://example.com"}'
 | `/reader` | POST | strip the page to its article, and back |
 | `/recall` | GET | search the text of pages already read |
 | `/console` `/screenshot` | GET | debug the page |
+| `/playbook/record` `/playbook/run` `/playbook/delete` | POST | record and replay a sequence |
+| `/playbook/list` | GET | what is saved |
+| `/persona` | POST | report or switch the panel's persona |
 
 Navigation routes block until the load finishes, so an agent can `open` then `text`
 without polling. Pass `wait=false` to return immediately. Every route takes an
@@ -481,6 +530,7 @@ CB_BLOCK=1
 | `CB_LIGHT` | On by default: asks sites for a cheaper page. Sends `Save-Data: on` with every page the browser loads for you, and asks for reduced motion so pages skip animations. `0`/`off` (then restart) if a site serves you a stripped-down version you did not want. |
 | `CB_MAX_TABS` | The ceiling on tabs an *agent* may open, default 10. Never applies to you. |
 | `CB_MEM_LIMIT` | MB per web process before WebKit starts shedding caches, default 512. |
+| `CB_PERSONA` | How the Claude panel answers: `off` (default), `developer`, `researcher`, `critic`, `translator`. The panel's own selector writes this line. |
 | `CB_PACE` | How slowly the agent moves so you can follow it. `1` (default), `0`/`off` for no pauses, up to `5` to slow it down. |
 | `CB_SCRUB` | `0`/`off` sends page text to Claude exactly as it appears. On by default: email addresses, phone numbers, card and IBAN numbers, SSNs and account numbers are replaced with `[email]`, `[card]` and friends before anything leaves the machine, and the panel says how many of each it removed. |
 | `CB_HOME`, `CB_PORT`, `CB_TOKEN`, `CB_THEME`, `CB_GPU`, `CB_WEBGL` | as before. |
