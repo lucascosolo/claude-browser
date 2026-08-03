@@ -31,6 +31,16 @@ HOME = os.environ.get("CB_HOME", "cb:home")
 # "e", "exa", "exampl.c" -- names that do not exist, several per navigation.
 PREFETCH_DELAY_MS = 300
 
+# The omnibox's page-text search, on the same reasoning as the DNS prefetch
+# above: an FTS5 query is far more expensive than the history lookup beside it,
+# so it waits for a pause in typing and never runs for a prefix short enough to
+# match half the index. Four characters is roughly where a query stops being a
+# prefix of everything; the results are appended after the history matches and
+# capped, so the ordinary suggestions for a short word keep the top of the list.
+RECALL_DELAY_MS = 260
+RECALL_MIN_CHARS = 4
+RECALL_SUGGESTIONS = 4
+
 # What the hamburger holds: (heading, ((icon, label, accelerator, action), ...)).
 # Claude comes first because it is the reason this browser exists; everything
 # below it is ordinary browser furniture. Accelerators are shown rather than
@@ -895,6 +905,8 @@ class Browser(Gtk.Window):
         completion.connect("match-selected", self._on_suggestion)
         self.omnibox.set_completion(completion)
         self._prefetch_id = None
+        self._recall_id = None
+        self._recall_serial = 0
         self._warmer = urls.HostWarmer(self._prefetch_dns)
         self.omnibox.connect("changed", self._on_omnibox_changed)
 
@@ -933,11 +945,12 @@ class Browser(Gtk.Window):
 
     def _on_omnibox_changed(self, entry):
         self._schedule_prefetch(entry)
-        if self.store is None or not entry.has_focus():
+        if not entry.has_focus():
             return
         text = entry.get_text().strip()
         self._suggest_model.clear()
-        if len(text) < 1:
+        self._schedule_recall(text)
+        if self.store is None or len(text) < 1:
             return
         for row in self.store.suggest(text, limit=8):
             title = GLib.markup_escape_text(row["title"] or "")
@@ -946,6 +959,64 @@ class Browser(Gtk.Window):
                        % (title, url)) if title else url
             self._suggest_model.append(
                 [display, row["url"], "★" if row.get("bookmark") else ""])
+
+    def _schedule_recall(self, text):
+        """Search the text of read pages a beat after typing stops.
+
+        Bumping the serial on every keystroke is what makes a late answer safe
+        to apply: a query that returns after another character was typed is
+        answering a question nobody is asking any more, and appending it would
+        put rows in the popup that do not match the box.
+        """
+        if self._recall_id is not None:
+            GLib.source_remove(self._recall_id)
+            self._recall_id = None
+        self._recall_serial += 1
+        if not self.pagetext or not self.pagetext.available:
+            return
+        if len(text) < RECALL_MIN_CHARS:
+            return
+        import threading
+
+        serial = self._recall_serial
+
+        def fire():
+            self._recall_id = None
+            # Off the main loop: this is a disk read through an index, on a
+            # machine chosen for being slow, with a keystroke waiting to be
+            # painted. pagetext keeps one connection per thread, so reading here
+            # does not disturb its writer.
+            threading.Thread(target=self._recall_worker, args=(text, serial),
+                             daemon=True).start()
+            return GLib.SOURCE_REMOVE
+
+        self._recall_id = GLib.timeout_add(RECALL_DELAY_MS, fire)
+
+    def _recall_worker(self, text, serial):
+        try:
+            hits = self.pagetext.search(text, limit=RECALL_SUGGESTIONS)
+        except Exception:
+            return  # a suggestion that failed is not worth taking the box down
+        GLib.idle_add(self._show_recall, text, serial, hits)
+
+    def _show_recall(self, text, serial, hits):
+        """Append page-text hits below the history matches already in the model."""
+        if serial != self._recall_serial or self.omnibox.get_text().strip() != text:
+            return GLib.SOURCE_REMOVE
+        seen = {row[1] for row in self._suggest_model}
+        for hit in hits:
+            if hit["url"] in seen:
+                continue  # already offered as a title or URL match
+            title = GLib.markup_escape_text(hit["title"] or hit["url"])
+            snippet = GLib.markup_escape_text(hit["snippet"] or hit["url"])
+            self._suggest_model.append([
+                "<b>%s</b>  <span size='small' alpha='60%%'>%s</span>"
+                % (title, snippet),
+                hit["url"],
+                # A different glyph from the bookmark star, in the column that
+                # already exists to say what kind of match a row is.
+                "¶"])
+        return GLib.SOURCE_REMOVE
 
     def _on_suggestion(self, _completion, model, treeiter):
         url = model[treeiter][1]
@@ -1060,7 +1131,8 @@ class Browser(Gtk.Window):
         if name == "history":
             rows = self.store.history(term or None)
             marked = {r["url"] for r in self.store.bookmarks()}
-            return pages.history_page(palette, self.nonce, rows, term, marked)
+            return pages.history_page(palette, self.nonce, rows, term, marked,
+                                      fulltext=self._text_matches(term))
         if name == "bookmarks":
             return pages.bookmarks_page(palette, self.nonce,
                                         self.store.bookmarks(term or None), term)
@@ -1070,6 +1142,19 @@ class Browser(Gtk.Window):
                 dict(t.info(), current=(t is current)) for t in self.tabs])
         return pages.home(palette, self.nonce, self.store.bookmarks(limit=12),
                           self.store.history(limit=12), self.store.counts())
+
+    def _text_matches(self, term, limit=8):
+        """What a cb:history query matched in the *text* of pages, if anything.
+
+        Empty rather than loud when there is no page-text store or this sqlite3
+        was built without FTS5: cb:history is history's page, and its search box
+        should not start reporting on a feature the user never asked for.
+        """
+        if not self.pagetext or not self.pagetext.available:
+            return []
+        if len((term or "").strip()) < RECALL_MIN_CHARS:
+            return []
+        return self.pagetext.search(term, limit=limit, highlight=True)
 
     def _on_ui_message(self, _manager, result):
         """Actions posted by cb: pages. Every one is nonce-checked first."""

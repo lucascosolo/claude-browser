@@ -26,6 +26,8 @@ import html
 import json
 import time
 
+from . import pagetext
+
 NAV = (
     ("cb:home", "Home", "M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"),
     ("cb:deck", "Deck", "M3 5h8v6H3zm10 0h8v6h-8zM3 13h8v6H3zm10 0h8v6h-8z"),
@@ -216,9 +218,44 @@ def home(palette, nonce, bookmarks, recent, counts):
     return shell("Home", palette, nonce, "cb:home", body)
 
 
-def history_page(palette, nonce, rows, query="", marked=()):
+def _snippet_html(text):
+    """Render an FTS5 snippet, with its matched terms marked up.
+
+    Escaped first and marked up second, always in that order: the snippet is
+    prose from a visited page, and the only thing separating a real match from
+    a page that wrote `<mark>` into its own body is that the control characters
+    pagetext.py delimits with cannot survive being typed into HTML.
+    """
+    return (_e(text)
+            .replace(pagetext.HL_OPEN, "<mark>")
+            .replace(pagetext.HL_CLOSE, "</mark>"))
+
+
+def _text_hit(url, title, snippet):
+    letter, hue = _mark(url)
+    return """
+    <a class="row hit" href="%(url)s">
+      <span class="mark sm" style="--h:%(hue)d">%(letter)s</span>
+      <span class="ht">
+        <span class="rt">%(title)s</span>
+        <span class="hs">%(snippet)s</span>
+      </span>
+      <span class="ru">%(host)s</span>
+    </a>""" % {
+        "url": _e(url), "hue": hue, "letter": _e(letter),
+        "title": _e(title or _host(url)), "host": _e(_host(url)),
+        "snippet": _snippet_html(snippet),
+    }
+
+
+def history_page(palette, nonce, rows, query="", marked=(), fulltext=()):
+    """History, and -- when the page was loaded with a query -- what that query
+    matched in the *text* of pages, which titles and URLs alone cannot find."""
     marked = set(marked)
-    if not rows:
+    fulltext = list(fulltext)
+    if not rows and fulltext:
+        body = ""
+    elif not rows:
         body = _empty("&#8635;", "No history" if not query else "Nothing matches “%s”"
                       % html.escape(query), "")
     else:
@@ -235,10 +272,15 @@ def history_page(palette, nonce, rows, query="", marked=()):
                                row["url"] in marked, row["visits"]))
         chunks.append("</div>")
         body = "".join(chunks)
+    if fulltext:
+        body += ('<h2>Found in page text <em>%d</em></h2><div class="rows ft">%s</div>'
+                 % (len(fulltext), "".join(
+                     _text_hit(h.get("url") or "", h.get("title") or "",
+                               h.get("snippet") or "") for h in fulltext)))
     body += ('<div class="footer"><button class="danger" '
              'onclick="cbui.confirmClear()">Clear all history</button></div>')
     return shell("History", palette, nonce, "cb:history", body,
-                 search=("Search history…", query))
+                 search=("Search history — Enter searches page text", query))
 
 
 def bookmarks_page(palette, nonce, rows, query=""):
@@ -844,6 +886,18 @@ h2 .more:hover { text-decoration:underline; }
       overflow:hidden; text-overflow:ellipsis; }
 .rw { flex:0 0 auto; font-size:11px; color:var(--dim); }
 
+/* full-text hits: two lines, because the snippet is the answer to "why did this
+   page match?" and a one-line row would ellipsize exactly that away. */
+.row.hit { align-items:flex-start; padding:9px 10px; }
+.ht { min-width:0; flex:1 1 auto; display:flex; flex-direction:column; gap:2px; }
+.row.hit .rt { max-width:100%%; }
+.hs { font-size:12px; color:var(--dim); line-height:1.45;
+      display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+      overflow:hidden; }
+.hs mark { background:var(--soft); color:var(--text); border-radius:3px;
+           padding:0 2px; }
+.row.hit .ru { flex:0 0 auto; max-width:30%%; }
+
 /* A saved password renders as dots until it is asked for; `.shown` is the only
    state in which a secret is in this document at all. */
 .pw { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
@@ -1066,12 +1120,16 @@ _DOC = """<!doctype html>
   }
 
   // Filtering is local: re-rendering from Python on every keystroke would mean
-  // a full page load per character.
+  // a full page load per character. Enter is the exception -- searching the text
+  // of pages is a database query, so it costs one navigation, deliberately.
   var q = document.getElementById('q');
   if (q) {
     var apply = function () {
       var needle = q.value.toLowerCase();
-      document.querySelectorAll('.tile, .row').forEach(function (el) {
+      // .hit rows are server-rendered answers to the submitted query; the
+      // needle being typed now is not what matched them, and a substring test
+      // against a snippet would hide results the user just asked for.
+      document.querySelectorAll('.tile, .row:not(.hit)').forEach(function (el) {
         var hit = el.textContent.toLowerCase().indexOf(needle) !== -1 ||
                   (el.getAttribute('href') || '').toLowerCase().indexOf(needle) !== -1;
         el.style.display = hit ? '' : 'none';
@@ -1087,6 +1145,13 @@ _DOC = """<!doctype html>
     };
     q.addEventListener('input', apply);
     if (q.value) apply();
+    q.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter') return;
+      if ((location.href || '').toLowerCase().indexOf('cb:history') !== 0) return;
+      cbui.send({action: 'go',
+                 url: 'cb:history' + (q.value.trim()
+                        ? '?q=' + encodeURIComponent(q.value.trim()) : '')});
+    });
   }
 
   document.addEventListener('keydown', function (e) {

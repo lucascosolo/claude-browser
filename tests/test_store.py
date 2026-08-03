@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from claudebrowser import pages, store, style  # noqa: E402
+from claudebrowser import pages, pagetext, store, style  # noqa: E402
 
 
 class StoreTest(unittest.TestCase):
@@ -174,6 +174,42 @@ class PageRenderTest(unittest.TestCase):
         html = pages.bookmarks_page(self.palette, self.nonce, [])
         self.assertIn("No bookmarks", html)
         self.assertIn("Ctrl", html, "should say how to make one")
+
+    def test_full_text_hits_are_their_own_section_with_the_snippet(self):
+        """The snippet is the whole point: it says why a page with an unrelated
+        title came back for this query."""
+        html = pages.history_page(
+            self.palette, self.nonce, self.rows(), "otters", fulltext=[
+                {"url": "https://b.example/wildlife", "title": "Field notes",
+                 "snippet": "the %sotters%s were fishing" % (pagetext.HL_OPEN,
+                                                             pagetext.HL_CLOSE)}])
+        self.assertIn("Found in page text", html)
+        self.assertIn("<mark>otters</mark>", html)
+        self.assertIn("https://b.example/wildlife", html)
+        self.assertNotIn(pagetext.HL_OPEN, html, "the markers are not left in")
+
+    def test_a_page_without_a_query_has_no_full_text_section(self):
+        self.assertNotIn("Found in page text",
+                         pages.history_page(self.palette, self.nonce, self.rows()))
+
+    def test_full_text_hits_show_when_the_history_list_is_empty(self):
+        """Matching only in the body is exactly the case the title filter misses,
+        so it must not be answered with "nothing matches"."""
+        html = pages.history_page(self.palette, self.nonce, [], "otters", fulltext=[
+            {"url": "https://b.example/wildlife", "title": "Field notes",
+             "snippet": "otters"}])
+        self.assertIn("Found in page text", html)
+        self.assertNotIn("Nothing matches", html)
+
+    def test_a_snippet_cannot_inject_markup(self):
+        """Snippet text is prose from a visited page, and it is the one string
+        on this page rendered as markup rather than escaped."""
+        hostile = '<img src=x onerror="alert(1)"><mark>fake</mark>'
+        html = pages.history_page(self.palette, self.nonce, [], "x", fulltext=[
+            {"url": "https://b.example/x", "title": "X", "snippet": hostile}])
+        self.assertNotIn("<img src=x", html)
+        self.assertIn("&lt;img", html)
+        self.assertNotIn("<mark>fake", html)
 
     def test_site_marks_are_stable_and_host_derived(self):
         self.assertEqual(pages._mark("https://github.com/a"),

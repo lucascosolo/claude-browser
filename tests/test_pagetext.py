@@ -172,6 +172,30 @@ class SearchTest(unittest.TestCase):
         # The store is intact afterwards.
         self.assertTrue(self.p.search("otters"))
 
+    def test_snippets_are_plain_text_unless_highlighting_is_asked_for(self):
+        """The CLI and MCP answers are read as text; markers in them would be
+        noise on every line."""
+        plain = self.p.search("otters")[0]["snippet"]
+        self.assertNotIn(pagetext.HL_OPEN, plain)
+        self.assertNotIn(pagetext.HL_CLOSE, plain)
+
+    def test_highlighting_wraps_the_matched_term(self):
+        snippet = self.p.search("otters", highlight=True)[0]["snippet"]
+        self.assertIn(pagetext.HL_OPEN, snippet)
+        self.assertIn(pagetext.HL_CLOSE, snippet)
+        marked = snippet.split(pagetext.HL_OPEN)[1].split(pagetext.HL_CLOSE)[0]
+        self.assertIn("tter", marked.lower())
+
+    def test_a_page_cannot_forge_a_highlight_marker(self):
+        """The delimiters are what tells pages.py which run of characters is a
+        real match. A body that contains them would be rendering its own."""
+        self.p.record("https://a.example/forge", "Forge",
+                      "wombats %spwned%s wombats" % (pagetext.HL_OPEN,
+                                                     pagetext.HL_CLOSE))
+        hit = self.p.search("wombats", highlight=True)[0]
+        self.assertNotIn(pagetext.HL_OPEN + "pwned", hit["snippet"])
+        self.assertIn("pwned", hit["snippet"], "the words themselves stay")
+
     def test_a_forgotten_page_stops_matching(self):
         self.p.forget("https://a.example/rocks")
         self.assertEqual(self.p.search("granite"), [])
