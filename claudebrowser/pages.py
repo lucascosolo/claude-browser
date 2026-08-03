@@ -168,9 +168,13 @@ def shell(title, palette, nonce, active, body, search=None):
             '<input id="q" class="filter" type="search" placeholder="%s" value="%s" '
             'autocomplete="off">' % (_e(search[0]), _e(search[1])))
 
+    # The HUD is concatenated before the single %-format pass rather than
+    # formatted on its own: a value substituted by % is not rescanned, so its
+    # %(accent)s would reach the document as literal text.
+    sheet = _CSS + (_HUD_CSS if palette.get("name") == "phosphor" else "")
     return _DOC % {
         "title": _e(title),
-        "css": _CSS % palette,
+        "css": sheet % palette,
         "rail": rail,
         "head": _e(title),
         "search": searchbox,
@@ -185,9 +189,12 @@ def home(palette, nonce, bookmarks, recent, counts):
     """A start page that is a dashboard, not a blank rectangle."""
     n_history, n_marks = counts
 
+    # `ai` on the three that start Claude: this page's only agent controls, and
+    # the ink that means "Claude" is not the ink that means "focus".
     actions = "".join(
-        '<button class="qa" onclick="cbui.send({action:%s})">'
-        '<b>%s</b><span>%s</span></button>' % (_js(a), _e(label), _e(sub))
+        '<button class="qa%s" onclick="cbui.send({action:%s})">'
+        '<b>%s</b><span>%s</span></button>'
+        % (" ai" if a.startswith("claude:") else "", _js(a), _e(label), _e(sub))
         for a, label, sub in (
             ("claude:tldr", "TL;DR", "Summarize a page"),
             ("claude:agent", "Command", "Let Claude drive"),
@@ -903,6 +910,11 @@ _CSS = """
   --bg:%(bg)s; --card:%(bar)s; --panel:%(panel)s; --line:%(line)s; --text:%(text)s;
   --dim:%(dim)s; --accent:%(accent)s; --soft:%(accent_soft)s; --on:%(on_accent)s;
   --ok:%(ok)s; --warn:%(warn)s; --field:%(field)s;
+  /* The rest of the contract, so this sheet can say "Claude" (--agent) without
+     borrowing the chrome's focus colour, and can draw structure (--edge) with
+     something other than the load-bearing 1px rule. */
+  --edge:%(edge)s; --agent:%(agent)s; --agent-soft:%(agent_soft)s;
+  --mono:%(mono)s;
 }
 * { box-sizing:border-box; }
 html,body { margin:0; height:100%%; }
@@ -910,6 +922,14 @@ body {
   background:var(--bg); color:var(--text);
   font:14px/1.5 system-ui,-apple-system,"Segoe UI",Cantarell,sans-serif;
   display:flex; min-height:100%%;
+  /* The static scanline the chrome carries, at 3%% (`08` is the alpha byte).
+     `grid` equals `bg` in dark and light, so there this is the surface painted
+     over itself and resolves to nothing -- one cached gradient, no branch, and
+     and never animated, because a background that repaints forever
+     is the one thing this browser exists not to do. Written against the raw token because a hex
+     alpha suffix cannot be appended to a var(). */
+  background-image:repeating-linear-gradient(
+    to bottom, %(grid)s08 0, %(grid)s08 1px, transparent 1px, transparent 3px);
 }
 ::selection { background:var(--accent); color:var(--on); }
 
@@ -959,11 +979,19 @@ header h1 { font-size:20px; font-weight:650; margin:0; letter-spacing:-.01em; }
 .qa b { font-size:13px; font-weight:620; }
 .qa span { font-size:11.5px; color:var(--dim); }
 .qa:hover { border-color:var(--accent); background:var(--soft); }
+/* The three actions that start Claude carry the agent ink, not the chrome
+   accent. In dark and light the two tokens are the same coral, so this changes
+   nothing there and everything in phosphor -- which is the point of the split:
+   "Claude is doing something" must never be re-read as "this has focus". */
+.qa.ai b { color:var(--agent); }
+.qa.ai:hover { border-color:var(--agent); background:var(--agent-soft); }
 
 section { margin-bottom:30px; }
 h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim);
      font-weight:700; margin:0 0 11px; display:flex; align-items:center; gap:8px; }
-h2 em { font-style:normal; font-weight:500; color:var(--line); }
+/* --dim, not --line: a count beside a heading is text you are meant to read,
+   and --line is a hairline colour that sits near 1:1 against the surface. */
+h2 em { font-style:normal; font-weight:500; color:var(--dim); }
 h2 .more { margin-left:auto; color:var(--accent); text-decoration:none;
            font-size:11px; letter-spacing:.04em; }
 h2 .more:hover { text-decoration:underline; }
@@ -1147,6 +1175,130 @@ kbd { background:var(--panel); border:1px solid var(--line); border-bottom-width
   .main { padding:18px 15px 50px; }
   .rt { max-width:100%%; } .ru { display:none; }
 }
+
+/* Every transition on this page is a one-shot on interaction -- a border
+   lighting on hover, a row fading as it is deleted -- and none of them is
+   allowed to survive a stated preference against motion. This is the live
+   branch on this machine, not a courtesy: WebKitGTK maps
+   `prefers-reduced-motion` onto GTK's `gtk-enable-animations`, and
+   perf.tune_gtk turns that off whenever CB_LIGHT is on, which is the default.
+   `!important` because the JS in _DOC sets `style.transition` inline when it
+   removes a row, and an inline declaration outranks any rule that is not. */
+@media (prefers-reduced-motion:reduce) {
+  * { transition:none !important; animation:none !important;
+      scroll-behavior:auto !important; }
+}
+"""
+
+# ---------------------------------------------------------------------------
+# The HUD layer, appended for the phosphor theme only -- the same arrangement
+# style.py uses for the chrome, so the two halves of the browser are read and
+# edited the same way, and so dark and light keep exactly the pages they had.
+#
+# Every rule below is geometry or type. Not one of them introduces an ink: the
+# colours are the tokens the base sheet already declared, each already held to
+# its contrast floor by tests/test_style.py. What "HUD" means here, in the same
+# terms as the chrome:
+#
+#   * square corners, everywhere, without exception.
+#   * bracketed slots instead of boxes. A field is held between two 2px uprights
+#     that light on focus, matching the omnibox exactly.
+#   * registration marks. Two corner brackets per surface, diagonally opposite;
+#     four would just be a second border.
+#   * micro-labels: monospaced, uppercase, tracked hard. Applied only to the
+#     legends -- headings, badges, counters. The titles, hosts, snippets and
+#     explanations under them stay proportional, because they are what the
+#     instrument is *showing*, not what it is labelled with.
+#   * one glow, on focus. 1px hard edge plus bloom, which is the CRT tell, and
+#     it happens on interaction rather than on a timer.
+# ---------------------------------------------------------------------------
+_HUD_CSS = """
+/* A radius is the loudest 2010s-app tell there is; a HUD is drawn with a
+   plotter. This is the single largest part of the difference. */
+.railbtn, .filter, .bigbar, .qa, .tile, .row, .card, .mark, .act, .pbname,
+.pbbtn, .rec, .badge, .lvl, .eff, .sin, .notice, .bar, .bar i, .pw.shown,
+.hs mark, kbd, .footer button { border-radius:0; }
+
+/* Structure is drawn in --edge; --line stays the load-bearing rule it is. */
+.rail { border-right:1px solid %(edge)s; }
+.tile, .row, .card, .rec.off { border-color:%(edge)s; }
+.mark { border-color:%(edge)s; }
+
+/* ---- type: legends are engraved, content is not ---- */
+.railbtn, h1, h2, .day, .badge, .lvl, .eff, .rw, .pbbtn, .footer button,
+.qa b, kbd, .curl { font-family:%(mono)s; }
+h1 { text-transform:uppercase; letter-spacing:.16em; font-size:17px;
+     font-weight:600; }
+/* Brackets around the page name: the cheapest way to say "this is a readout",
+   and it needs no extra element in the document. */
+h1::before { content:"["; color:%(accent)s; margin-right:7px; }
+h1::after { content:"]"; color:%(accent)s; margin-left:7px; }
+header { border-bottom:1px solid %(edge)s; padding-bottom:13px; }
+h2, .day { letter-spacing:.2em; font-size:11px; }
+h2 { border-bottom:1px solid %(edge)s; padding-bottom:7px; }
+.badge, .lvl, .eff { letter-spacing:.14em; }
+.railbtn { text-transform:uppercase; letter-spacing:.1em; font-size:9.5px; }
+.railbtn.on { box-shadow:inset 2px 0 0 %(accent)s; }
+
+/* ---- registration marks ---- */
+.tile, .card, .qa, .rec, .notice { position:relative; }
+.tile::before, .tile::after, .card::before, .card::after,
+.qa::before, .qa::after, .rec::before, .rec::after,
+.notice::before, .notice::after {
+  content:""; position:absolute; width:6px; height:6px;
+  border:1px solid %(edge)s; pointer-events:none;
+}
+.tile::before, .card::before, .qa::before, .rec::before, .notice::before {
+  top:-1px; left:-1px; border-right:none; border-bottom:none;
+}
+.tile::after, .card::after, .qa::after, .rec::after, .notice::after {
+  bottom:-1px; right:-1px; border-left:none; border-top:none;
+}
+.tile:hover::before, .tile:hover::after,
+.card:hover::before, .card:hover::after,
+.qa:hover::before, .qa:hover::after { border-color:%(accent)s; }
+.card.cur::before, .card.cur::after { border-color:%(accent)s; }
+/* The Claude quick actions keep their amber marks even under the hover rule
+   above, which would otherwise repaint them cyan the moment the pointer lands
+   on the one control on this page that starts the agent. */
+.qa.ai::before, .qa.ai::after,
+.qa.ai:hover::before, .qa.ai:hover::after { border-color:%(agent)s; }
+.qa.ai:hover { box-shadow:0 0 10px -2px %(agent)s66; }
+
+/* ---- fields as bracketed slots, exactly as the omnibox is ---- */
+.filter, .bigbar, .pbname, .sin {
+  border:1px solid %(line)s;
+  border-left:2px solid %(edge)s;
+  border-right:2px solid %(edge)s;
+  font-family:%(mono)s;
+}
+.filter:focus, .bigbar:focus, .pbname:focus, .sin:focus {
+  border-color:%(line)s;
+  border-left-color:%(accent)s; border-right-color:%(accent)s;
+  box-shadow:0 0 0 1px %(accent)s73, 0 0 10px %(accent)s4d;
+}
+.bigbar { padding:15px 18px; }
+
+/* ---- controls read as switch positions: a hairline that lights ---- */
+.pbbtn, .footer button, .qa { border-color:%(line)s; }
+.pbbtn:hover, .footer button:hover, .tile:hover, .card:hover, .qa:hover {
+  border-color:%(accent)s; box-shadow:0 0 10px -2px %(accent)s66;
+}
+.pbbtn.danger:hover, .footer .danger:hover {
+  border-color:%(warn)s; box-shadow:0 0 10px -2px %(warn)s66;
+}
+.pbbtn.on { box-shadow:0 0 10px -2px %(accent)s66; }
+/* The hover lift is the one motion left; a HUD does not float. */
+.tile:hover, .card:hover { transform:none; }
+.railbtn:hover { background:%(field_focus)s; }
+
+/* ---- readouts ---- */
+.bar { border-color:%(edge)s; background:%(field)s; height:9px; }
+.rec .dot { border-radius:0; box-shadow:0 0 8px %(warn)s; }
+.rec { box-shadow:0 0 14px -4px %(accent)s80; }
+.card.cur { box-shadow:0 0 0 1px %(accent)s, 0 0 14px -3px %(accent)s80; }
+.card.priv { border-style:dashed; }
+kbd { border-bottom-width:1px; border-color:%(edge)s; }
 """
 
 _DOC = """<!doctype html>

@@ -20,22 +20,28 @@ The page exposes a tiny JS API the Python side drives:
 
 import json
 
+#: Where the phosphor overrides are spliced into the sheet. A comment rather
+#: than a %-key so the slot is inert in the two themes that do not use it.
+_HUD_SLOT = "/*@hud@*/"
+
 
 def page(palette):
-    """The panel document. Colours are interpolated so it matches the GTK
-    chrome exactly in both themes."""
-    return _TEMPLATE % {
-        "bg": palette["panel"],
-        "card": palette["bar"],
-        "line": palette["line"],
-        "text": palette["text"],
-        "dim": palette["dim"],
-        "accent": palette["accent"],
-        "accent_soft": palette["accent_soft"],
-        "on_accent": palette["on_accent"],
-        "ok": palette["ok"],
-        "warn": palette["warn"],
-    }
+    """The panel document, in the theme the chrome is wearing.
+
+    The whole palette goes in, not a hand-picked subset. This used to rebuild
+    the dict key by key, which meant every token added to style.py -- `edge`,
+    `grid`, `agent`, `mono` -- silently stopped at this function and the panel
+    drifted out of the theme it was supposed to be part of. The only two
+    remapped names are the ones the template calls something else: the panel's
+    page surface is the chrome's `panel`, and a card sits on the chrome's `bar`.
+    """
+    tokens = dict(palette, bg=palette["panel"], card=palette["bar"])
+    # The HUD text is spliced in *before* the single %-format pass, not
+    # formatted separately and injected as a value: a value substituted by %
+    # is not rescanned, so its own %(accent)s would reach the document raw.
+    sheet = _TEMPLATE.replace(
+        _HUD_SLOT, _HUD if palette.get("name") == "phosphor" else "")
+    return sheet % tokens
 
 
 def call(fn, *args):
@@ -55,6 +61,12 @@ _TEMPLATE = r"""<!doctype html>
     --bg: %(bg)s; --card: %(card)s; --line: %(line)s; --text: %(text)s;
     --dim: %(dim)s; --accent: %(accent)s; --accent-soft: %(accent_soft)s;
     --on-accent: %(on_accent)s; --ok: %(ok)s; --warn: %(warn)s;
+    /* The rest of the contract. `agent` is the one that earns its keep here:
+       almost everything in this panel *is* Claude working, so the ink that
+       means that has to be reachable rather than approximated with --accent. */
+    --edge: %(edge)s; --grid: %(grid)s; --field: %(field)s;
+    --agent: %(agent)s; --agent-soft: %(agent_soft)s; --on-agent: %(on_agent)s;
+    --mono: %(mono)s;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%%; }
@@ -64,6 +76,16 @@ _TEMPLATE = r"""<!doctype html>
     font: 13.5px/1.55 system-ui, -apple-system, "Segoe UI", Cantarell, sans-serif;
     padding: 10px 12px 14px;
     overflow-x: hidden;
+    /* The same static scanline the chrome carries, and the same trick: the ink
+       is `grid` at 3%% (the `08` is the alpha byte), and `grid` equals `bg` in
+       dark and light -- so there the gradient is the surface painted over
+       itself at 3%%, which is exactly nothing, and needs no branch. Written
+       against the raw token rather than var(--grid) because a hex alpha suffix
+       cannot be appended to a var(). Never animated, because a permanently repainting
+       background on two cores is a frame budget spent on decoration. */
+    background-image: repeating-linear-gradient(
+      to bottom, %(grid)s08 0, %(grid)s08 1px,
+      transparent 1px, transparent 3px);
   }
 
   /* Empty state: the panel should explain itself, not sit blank. */
@@ -74,16 +96,21 @@ _TEMPLATE = r"""<!doctype html>
     border-radius: 5px; padding: 1px 5px; font: 11px/1 monospace; color: var(--text);
   }
 
+  /* A card is Claude answering, so the spine is the agent ink rather than the
+     chrome accent -- the same amber as the cursor it draws into the page, and
+     the same rule as everywhere else: chrome state is cyan/coral, Claude state
+     is this. It stays agent-inked until `done()` restyles it to an outcome,
+     which makes "still working" and "finished" a colour rather than a caption.
+     Cards no longer animate in -- what was a 160ms keyframe per card is a
+     repaint per card on a machine this exists to spare. */
   .card {
     background: var(--card);
     border: 1px solid var(--line);
-    border-left: 3px solid var(--accent);
+    border-left: 3px solid var(--agent);
     border-radius: 10px;
     padding: 9px 12px 10px;
     margin: 0 0 9px;
-    animation: rise .16s ease-out;
   }
-  @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
 
   .card.error { border-left-color: var(--warn); }
   .card.ok    { border-left-color: var(--ok); }
@@ -104,7 +131,11 @@ _TEMPLATE = r"""<!doctype html>
   /* The body is rendered markdown, so block spacing is the elements' own; a
      pre-wrap body would double every gap. Only <pre> keeps literal whitespace. */
   .body { word-wrap: break-word; overflow-wrap: anywhere; }
-  .body:empty::after { content: "…"; color: var(--dim); }
+  /* The streaming tell: a card whose body has not received its first chunk
+     yet. A block cursor in the agent ink rather than an ellipsis, because it
+     says *which* program is about to write here, and it is one static glyph
+     rather than a blinking one. */
+  .body:empty::after { content: "\2588"; color: var(--agent); }
   .body > :first-child { margin-top: 0; }
   .body > :last-child { margin-bottom: 0; }
   .body p { margin: 0 0 7px; }
@@ -141,20 +172,36 @@ _TEMPLATE = r"""<!doctype html>
 
   .meta { margin-top: 7px; font-size: 11.5px; color: var(--dim); }
 
-  /* Agent steps: compact chips so a long run stays scannable. */
+  /* Agent steps: compact chips so a long run stays scannable. The one still
+     running is Claude working, so it lights in the agent ink; the ones behind
+     it are history and stay quiet. */
   .steps { margin-top: 7px; display: flex; flex-direction: column; gap: 3px; }
   .step {
-    font: 11.5px/1.45 monospace;
+    font: 11.5px/1.45 var(--mono);
     color: var(--dim);
     padding: 2px 8px;
-    border-left: 2px solid var(--accent-soft);
+    border-left: 2px solid var(--agent-soft);
   }
-  .step.active { color: var(--accent); border-left-color: var(--accent); }
+  .step.active { color: var(--agent); border-left-color: var(--agent); }
 
+  /* Generic `monospace`, not the --mono chain: this is Claude's own code, which
+     is answer content, and the chain is reserved for chrome labels. */
   code, pre { font-family: monospace; font-size: 12.5px; }
   pre { background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
         padding: 8px 10px; overflow-x: auto; }
   a { color: var(--accent); }
+
+  /* Nothing in this panel animates on a loop, but the two places a transition
+     could arrive are the drop-out in pages.py and any future hover; honouring
+     the preference is the contract, and here it is reachable -- WebKitGTK maps
+     `prefers-reduced-motion` onto GTK's `gtk-enable-animations`, which
+     perf.tune_gtk turns off whenever CB_LIGHT is on. That is the default, so
+     on this machine this block is the live branch, not the exception. */
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important;
+        scroll-behavior: auto !important; }
+  }
+/*@hud@*/
 </style>
 <div id="root"></div>
 <script>
@@ -396,6 +443,52 @@ _TEMPLATE = r"""<!doctype html>
   };
 })();
 </script>
+"""
+
+
+# ---------------------------------------------------------------------------
+# The panel's half of the HUD, appended for phosphor only -- the same shape as
+# style.py's `_HUD` and for the same reason: dark and light keep exactly the
+# panel they had, so picking phosphor is a visible choice rather than a silent
+# redesign of the other two.
+#
+# The rules here are geometry and type, never colour. Every ink is already
+# decided by the token contract and has already been held to its ratio; what
+# changes is that corners go square, cards gain registration marks, and the
+# labels above them read as engraved rather than typeset.
+# ---------------------------------------------------------------------------
+_HUD = """
+  .card, .hint kbd, pre, .body code, .hs, .pw { border-radius: 0; }
+  .card { border-color: %(edge)s; border-left-width: 2px; position: relative; }
+
+  /* Registration marks: two per card, diagonally opposite. Four would read as
+     a second border; two read as a mark on an instrument. Pseudo-elements, so
+     nothing is added to the DOM the streaming path has to walk. */
+  .card::before, .card::after {
+    content: ""; position: absolute; width: 6px; height: 6px;
+    border: 1px solid %(edge)s; pointer-events: none;
+  }
+  .card::before { top: -1px; right: -1px; border-left: none; border-bottom: none; }
+  .card::after { bottom: -1px; right: -1px; border-left: none; border-top: none; }
+  .card.ok::before, .card.ok::after { border-color: %(ok)s; }
+  .card.error::before, .card.error::after { border-color: %(warn)s; }
+
+  /* The card title is a legend, not a sentence: monospaced and tracked out.
+     The body under it keeps the proportional face -- it is prose, and prose set
+     in monospace is a costume, not a design. */
+  .card h3 {
+    font-family: %(mono)s;
+    font-size: 10px;
+    letter-spacing: .22em;
+  }
+  .meta { font-family: %(mono)s; letter-spacing: .06em; font-size: 11px; }
+  .step { letter-spacing: .04em; }
+  /* The running step gets the one glow in the panel, in the agent ink -- at a
+     glance, colour and bloom together say the machine is waiting on Claude. */
+  .step.active { box-shadow: -2px 0 8px -2px %(agent)s99; }
+
+  .hint { font-family: %(mono)s; font-size: 12px; line-height: 1.7; }
+  .hint kbd { border-bottom-width: 1px; border-color: %(edge)s; }
 """
 
 
