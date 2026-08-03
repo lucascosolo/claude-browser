@@ -41,7 +41,9 @@ CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch 
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
-default 10), `CB_COOKIES` (`nothird`/`all`/`none`), `CB_ITP`, `CB_MEM_LIMIT`.
+default 10), `CB_COOKIES` (`nothird`/`all`/`none`), `CB_ITP`, `CB_MEM_LIMIT`,
+`CB_PACE` (agent pacing multiplier, default 1; `0`/`off` removes the pauses,
+higher slows the cursor down, clamped to 5).
 
 There is no linter or type checker configured. `python3 -m py_compile` is the
 syntax gate.
@@ -135,6 +137,11 @@ syntax gate.
   mentions `claudebrowser` anywhere — even in a `cd` path — kills the shell
   running it (exit 144). Put the kill in its own call, with the pattern broken up
   (`[c]laudebrows`) and nothing else on the line that spells the name out.
+- **The agent's pacing pauses are only safe on the worker thread.** `agent.py`
+  sleeps between steps so the cursor in `extract.HALO` can be seen travelling to
+  its target and pressing on it. `Agent.run` only ever runs under the thread
+  `Browser.run_agent` starts — the same reason `call_sync` is safe there. Move
+  that loop onto the main loop and the pauses freeze the whole window.
 - **Swap *occupancy* is not memory pressure; the swap-in *rate* is.** A laptop
   with a few days uptime sits at 70-80% swap used forever, because pages evicted
   last week still count. The first version of `resources.py` read that as

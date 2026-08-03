@@ -16,6 +16,8 @@ Two design choices worth stating:
 """
 
 import json
+import os
+import time
 
 from . import ai, extract
 
@@ -24,6 +26,46 @@ PAGE_CHARS = 15_000     # per read_page result fed back to the model
 RESULT_CHARS = 20_000   # hard ceiling on any single tool result
 TOTAL_RESULT_CHARS = 120_000  # ceiling across the whole run
 REPEAT_LIMIT = 3        # identical tool calls before we call it a loop
+
+# -- pacing ------------------------------------------------------------------
+#
+# An unpaced step lands in a few milliseconds: the page jumps and the answer
+# appears, with nothing in between to watch. These pauses buy the choreography
+# in extract.py time to be seen -- the cursor travelling to a link, dipping on
+# the click -- at a cost of well under a second per acting step.
+#
+# They are slept on the agent's worker thread, never on the GTK main loop.
+# Agent.run() only ever runs under the thread Browser.run_agent starts (the
+# same rule that makes Browser.call_sync safe), so a sleep here stalls this
+# loop and nothing else; sleeping on the main loop would freeze the window.
+PACE_ENV = "CB_PACE"
+PACE_MAX = 5.0          # a typo like CB_PACE=1000 should not hang the run
+STEP_S = 0.10                                                  # between steps
+HOVER_S = (extract.SCROLL_SETTLE_MS + extract.TRAVEL_MS) / 1000.0  # point -> act
+ACT_S = 0.15                                                   # after acting
+
+
+def pace_scale(raw=None):
+    """Read CB_PACE into a multiplier on every pause. Unset means 1.0 (on).
+
+    Anything unparseable is treated as the default rather than as zero: the
+    knob exists to slow the agent down or turn the show off deliberately, and a
+    typo should not silently remove the visual feedback the user asked for.
+    """
+    if raw is None:
+        raw = os.environ.get(PACE_ENV, "")
+    raw = (raw or "").strip().lower()
+    if raw in ("", "1", "on", "yes", "true"):
+        return 1.0
+    if raw in ("0", "off", "no", "false"):
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 1.0
+    if value != value:      # NaN compares unequal to itself
+        return 1.0
+    return max(0.0, min(PACE_MAX, value))
 
 SYSTEM = """You are driving a real web browser on the user's behalf. The window \
 is visible to them and uses their existing logins and cookies.
@@ -121,15 +163,27 @@ class Agent:
     """Runs the tool loop. `call` marshals onto the GTK thread and blocks;
     `emit` renders a line of progress for the user."""
 
-    def __init__(self, call, emit):
+    def __init__(self, call, emit, pace=None):
         self.call = call
         self.emit = emit
         self.cancelled = False
         self.spent = 0          # characters of tool output fed back so far
         self.seen = {}          # (tool, args) -> count, for loop detection
+        self.pace = pace_scale() if pace is None else float(pace)
 
     def cancel(self):
         self.cancelled = True
+
+    def delay_for(self, seconds):
+        """Seconds this run should actually pause for a nominal `seconds`."""
+        return max(0.0, seconds * self.pace)
+
+    def _pause(self, seconds):
+        # Cancelled runs skip the theatre: the user asked it to stop, so the
+        # only thing left to be visible about is stopping.
+        delay = self.delay_for(seconds)
+        if delay > 0 and not self.cancelled:
+            time.sleep(delay)
 
     # -- tool implementations ----------------------------------------------
 
@@ -163,13 +217,25 @@ class Agent:
                 links = dict(links, links=links["links"][:120], truncated=True)
             return links
         if name == "click":
+            # Hover first, then click: two evals with a pause between them,
+            # because a page cannot tell us when its smooth scroll and the
+            # cursor's transition have finished.
+            aim = self._eval(extract.point(args["selector"]))
+            if isinstance(aim, dict) and aim.get("ok"):
+                self._pause(HOVER_S)
             out = self._eval(extract.click(args["selector"]))
+            self._pause(ACT_S)
             # A click often starts a navigation; give it a moment so the next
             # read_page sees the new page rather than the old one.
             self.call("api_wait", None, timeout=60)
             return out
         if name == "type_text":
-            return self._eval(extract.fill(args["selector"], args["value"]))
+            aim = self._eval(extract.point(args["selector"]))
+            if isinstance(aim, dict) and aim.get("ok"):
+                self._pause(HOVER_S)
+            out = self._eval(extract.fill(args["selector"], args["value"]))
+            self._pause(ACT_S)
+            return out
         return {"error": "unknown tool %r" % name}
 
     # -- the loop -----------------------------------------------------------
@@ -228,6 +294,9 @@ class Agent:
                 if not block.get("id"):
                     continue  # malformed block; nothing to answer
                 self.emit("  → %s\n" % _describe(name, args))
+                # A beat between the line appearing and the page moving, so the
+                # two read as cause and effect rather than one event.
+                self._pause(STEP_S)
 
                 # Loop detection. Without it a model that keeps re-reading the
                 # same page burns the step budget and the user's money making

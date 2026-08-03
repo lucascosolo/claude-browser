@@ -100,6 +100,14 @@ HTML = r"""JSON.stringify({url: location.href, html: document.documentElement.ou
 TITLE = r"""JSON.stringify({url: location.href, title: document.title})"""
 
 
+# How long the page-side choreography takes, in milliseconds. agent.py reads
+# these to pace its own steps, so the native side and the page agree on timing
+# instead of each guessing at the other's.
+SCROLL_SETTLE_MS = 260   # smooth scrollIntoView -> element at rest
+TRAVEL_MS = 320          # cursor transition from wherever it was to the target
+PRESS_MS = 140           # the click "press" dip, before it springs back
+
+
 # A visible pulse wherever the agent just acted.
 #
 # Claude driving a page you are watching is unnerving when the page moves on its
@@ -110,7 +118,12 @@ TITLE = r"""JSON.stringify({url: location.href, title: document.title})"""
 # Deliberately self-contained and idempotent -- it is prepended to snippets that
 # run many times in one page's life, and it must never depend on a stylesheet,
 # a font, or anything the page could have removed.
-HALO = r"""
+#
+# It also carries the persistent cursor: the halo says "something happened
+# here", the cursor says "this is where Claude is about to act". Both live in
+# one snippet because every acting script needs both, and one guarded IIFE is
+# cheaper to prepend than two.
+_HALO_SRC = r"""
 (function () {
   if (window.__cbHalo) return;
   window.__cbHalo = function (x, y) {
@@ -141,8 +154,89 @@ HALO = r"""
     var r = el.getBoundingClientRect();
     window.__cbHalo(r.left + r.width / 2, r.top + r.height / 2);
   };
+
+  // The cursor itself. One element for the page's whole life, looked up by
+  // attribute rather than kept in a variable: a same-document navigation or a
+  // framework that rewrites document.body throws the node away while this
+  // closure survives, and stashing a detached node would leave an invisible
+  // cursor with no way to notice.
+  window.__cbCursorEl = function () {
+    var el = document.querySelector('[data-cb-cursor]');
+    if (el && el.parentNode) return el;
+    el = document.createElement('div');
+    el.setAttribute('data-cb-cursor', '1');
+    // aria-hidden keeps it out of extract.TEXT and MARKDOWN, both of which
+    // drop hidden subtrees -- the cursor must never read back as page content.
+    el.setAttribute('aria-hidden', 'true');
+    el.style.cssText = [
+      'position:fixed', 'left:0', 'top:0', 'width:22px', 'height:22px',
+      'margin:-11px 0 0 -11px', 'border-radius:50%',
+      'pointer-events:none',              // never steals a real user's click
+      'z-index:2147483647', 'opacity:0',
+      'border:2px solid rgba(255,255,255,.85)',
+      'background:radial-gradient(circle,rgba(217,119,87,1) 0%,' +
+        'rgba(217,119,87,.85) 55%,rgba(217,119,87,.25) 100%)',
+      'box-shadow:0 0 14px 5px rgba(217,119,87,.75),0 1px 3px rgba(0,0,0,.4)',
+      'transform:translate(0px,0px) scale(1)',
+      // The travel itself: the point of the cursor is that you can follow it,
+      // so it eases to the target rather than appearing on it.
+      'transition:transform __TRAVEL__ms cubic-bezier(.3,.7,.2,1),opacity .2s ease-out'
+    ].join(';');
+    (document.body || document.documentElement).appendChild(el);
+    return el;
+  };
+
+  // press=true dips the cursor and lets it spring back, so a click reads as a
+  // click and not as the cursor merely arriving.
+  window.__cbCursorTo = function (x, y, press) {
+    try {
+      var el = window.__cbCursorEl();
+      var to = function (s) { el.style.transform =
+        'translate(' + x + 'px,' + y + 'px) scale(' + s + ')'; };
+      el.style.opacity = '1';
+      to(press ? 0.55 : 1);
+      if (press) setTimeout(function () { try { to(1); } catch (e) {} }, __PRESS__);
+    } catch (e) {}
+  };
+  window.__cbCursorAt = function (el, press) {
+    if (!el || !el.getBoundingClientRect) return;
+    var r = el.getBoundingClientRect();
+    window.__cbCursorTo(r.left + r.width / 2, r.top + r.height / 2, press);
+  };
+
+  // Centred and smooth, with a fallback: scrollIntoView's options-object form
+  // is ignored by anything that only implements the boolean argument.
+  window.__cbScrollTo = function (el) {
+    try { el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' }); }
+    catch (e) { try { el.scrollIntoView(); } catch (e2) {} }
+  };
 })();
 """
+
+HALO = (_HALO_SRC.replace("__TRAVEL__", str(TRAVEL_MS))
+                 .replace("__PRESS__", str(PRESS_MS)))
+
+def point(selector: str) -> str:
+    """Scroll the match into view and send the cursor to it, without acting.
+
+    Run before click/fill so the user sees where the click is going to land
+    before it lands. Cheap to run on its own: it changes nothing about the page
+    except the scroll position.
+    """
+    return (
+        HALO +
+        "(function(){var e=document.querySelector(%s);"
+        "if(!e)return JSON.stringify({ok:false,error:'no match'});"
+        "window.__cbScrollTo(e);"
+        # The rect is read from the timeout, not now. A smooth scroll is still
+        # animating when this function returns, so measuring here would aim the
+        # cursor at where the element *was* -- the same ordering trap the halo
+        # hits, one animation later.
+        "setTimeout(function(){window.__cbCursorAt(e,false);},%d);"
+        "return JSON.stringify({ok:true,tag:e.tagName.toLowerCase()});})()"
+        % (_js_str(selector), SCROLL_SETTLE_MS)
+    )
+
 
 def click(selector: str) -> str:
     """Click the first match. Reports whether anything was actually hit --
@@ -151,9 +245,12 @@ def click(selector: str) -> str:
         HALO +
         "(function(){var e=document.querySelector(%s);"
         "if(!e)return JSON.stringify({ok:false,error:'no match'});"
+        # Instant, not smooth: point() has usually centred this already, and
+        # when it has not, the halo and the cursor must land on a settled rect
+        # in the same turn -- there is no second measurement here.
         "e.scrollIntoView({block:'center'});"
         # After scrollIntoView, so the halo lands on where the element ended up.
-        "window.__cbHaloAt(e);e.click();"
+        "window.__cbHaloAt(e);window.__cbCursorAt(e,true);e.click();"
         "return JSON.stringify({ok:true,tag:e.tagName.toLowerCase()});})()"
         % _js_str(selector)
     )
@@ -167,6 +264,7 @@ def fill(selector: str, value: str) -> str:
         "(function(){var e=document.querySelector(%s);"
         "if(!e)return JSON.stringify({ok:false,error:'no match'});"
         "e.scrollIntoView({block:'center'});window.__cbHaloAt(e);"
+        "window.__cbCursorAt(e,true);"
         "e.focus();e.value=%s;"
         "e.dispatchEvent(new Event('input',{bubbles:true}));"
         "e.dispatchEvent(new Event('change',{bubbles:true}));"
