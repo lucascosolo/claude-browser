@@ -254,6 +254,9 @@ class StubBrowser:
 
     def stop(self):
         self.server.shutdown()
+        # shutdown() only stops serve_forever; the listening socket stays open
+        # and the run ended on a `ResourceWarning: unclosed socket`.
+        self.server.server_close()
 
 
 class TestCli(unittest.TestCase):

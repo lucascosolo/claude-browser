@@ -41,8 +41,7 @@ tests/         unittest, no display needed
 ./cbctl health                              # is it up
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 449 tests, ~60s, no display
-CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
+CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 542 tests, ~8s, no display
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
@@ -53,8 +52,15 @@ default on; `0`/`off` sends page text raw), `CB_LIGHT` (ask servers for a
 cheaper page — `Save-Data: on` plus reduced motion, default on; `0`/`off`),
 `CB_PERSONA` (the Claude panel's answering style; `off` by default).
 
-There is no linter or type checker configured. `python3 -m py_compile` is the
-syntax gate.
+`CB_AUTOSTART=0` is not optional: `test_offline.py` runs `cbctl` and `cb-mcp` as
+real subprocesses, and `client.py` autostarts the browser by default — without
+it a test run opens a window.
+
+There is no linter or type checker configured. `python3 -m py_compile
+claudebrowser/*.py` is the syntax gate, and it is *not* redundant with the
+suite: `browser.py`, `control.py`, `findbar.py` and `__main__.py` need a display
+and so are never imported by any test. On everything else the suite is the
+stronger gate; on those four, py_compile is the only one there is.
 
 ## The rules that matter
 

@@ -20,6 +20,10 @@ class StoreTest(unittest.TestCase):
         # background=False: an in-memory database cannot be shared across
         # threads, so each connection would otherwise get its own empty copy.
         self.s = store.Store(":memory:", background=False)
+        # Handed back at the end: nothing closed these, so a run finished on a
+        # wall of `ResourceWarning: unclosed database` that a real leak could
+        # have hidden in.
+        self.addCleanup(self.s.close)
 
     def test_visits_accumulate_on_one_row(self):
         for _ in range(3):

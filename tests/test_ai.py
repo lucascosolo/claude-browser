@@ -188,11 +188,20 @@ class ApiRequestTest(unittest.TestCase):
         """It must raise, not yield the message as if it were an answer --
         yielding made a failure render as a normal card with status "done"."""
         self.patch([http_error(500, "boom")])
+        # `_stream` calls `_open` without a sleep, so the backoff is the real
+        # one. Replace it on the module for the length of this test -- and put
+        # it back: this used to assign `ai.time.sleep`, which is `time.sleep`
+        # itself, so it silently disabled sleeping for every test that ran
+        # afterwards and never restored it.
+        real_sleep = ai.time.sleep
         ai.time.sleep = lambda *_: None
+        self.addCleanup(setattr, ai.time, "sleep", real_sleep)
         with self.assertRaises(ai.ApiError) as caught:
             list(ai._stream("sys", "prompt"))
         self.assertIn("server error (500)", str(caught.exception))
         self.assertIn("transient", str(caught.exception))
+        self.assertEqual(self.calls, ai.MAX_RETRIES + 1,
+                         "a 500 is transient: the whole retry budget is spent")
 
 
 class FakeRaw:
@@ -471,6 +480,12 @@ class ErrorMessageTest(unittest.TestCase):
     """The API's own message is often one useless word -- a rate-limited
     subscription literally returns {"message": "Error"} -- so these messages
     have to carry the meaning themselves."""
+
+    def setUp(self):
+        # `_describe_error` consults the settings file to decide what advice to
+        # give about a rejected key, so without this the assertions below read
+        # whatever is in the developer's real ~/.config/claude-browser/env.
+        hide_real_settings_file(self)
 
     def describe(self, status, body, label):
         return ai._describe_error(status, body, label)[0]
@@ -817,7 +832,11 @@ class AgentTest(unittest.TestCase):
         ai.tool_turn = fake
 
     def make(self):
-        return agent.Agent(self.browser, self.output.append)
+        # pace=0: these assert what the loop *does*, never how long it lingers.
+        # Left at the default the step/hover/act pauses are slept for real, and
+        # the two multi-step cases below alone cost ~3s a run. The pacing
+        # arithmetic itself is covered by tests/test_pacing.py:Delays.
+        return agent.Agent(self.browser, self.output.append, pace=0)
 
     def text(self):
         return "".join(self.output)

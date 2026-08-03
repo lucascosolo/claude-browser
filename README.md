@@ -608,10 +608,17 @@ session eats it. It is a fallback, not a foundation.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests
+CB_AUTOSTART=0 python3 -m unittest discover -s tests
 ```
 
-388 tests, no display or GTK bindings needed.
+542 tests, about 8 seconds, no display needed. `CB_AUTOSTART=0` matters:
+`test_offline.py` runs `cbctl` and `cb-mcp` as real subprocesses, and those
+launch the browser on demand unless told not to.
+
+Nothing here needs a screen, a network, or your real `~/.config/claude-browser`.
+One file is the exception to "no GTK bindings": `test_light.py` builds a real
+`WebKitURIRequest` to check the client hints ride on it, because a stand-in
+could drift from the type WebKit actually gets handed.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the

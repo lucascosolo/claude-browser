@@ -20,6 +20,20 @@ from claudebrowser import ai, envfile, personas  # noqa: E402
 
 
 class TestComposition(unittest.TestCase):
+    def setUp(self):
+        # `compose(base, None)` means "whatever persona is currently set",
+        # which `current()` reads from the settings file. Left alone, these
+        # assertions are decided by the developer's real
+        # ~/.config/claude-browser/env -- anyone who has picked "critic" on
+        # cb:data once fails the None case below.
+        original = envfile.config_path
+        envfile.config_path = lambda: Path("/nonexistent/claude-browser/env")
+        self.addCleanup(setattr, envfile, "config_path", original)
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop(personas.SETTING, None)
+
     def test_the_base_prompt_survives_every_persona(self):
         for key in personas.keys():
             composed = personas.compose(ai.SYSTEM, key)

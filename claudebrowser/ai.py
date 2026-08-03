@@ -405,11 +405,18 @@ def _error_body(resp):
         resp.close()
 
 
-def _open(payload, timeout=600, sleep=time.sleep):
+def _open(payload, timeout=600, sleep=None):
     """POST with bounded retries, trying each credential in turn.
 
     `sleep` is injectable so tests can exercise the retry path without waiting.
+    It defaults to None rather than to `time.sleep` directly because a default
+    argument is bound once, at def time: with `sleep=time.sleep` in the
+    signature, the callers that do not pass one (`_stream`, `tool_turn`) held a
+    reference no test could ever replace, and the one test that tried spent the
+    full backoff budget sleeping for real on every run.
     """
+    if sleep is None:
+        sleep = time.sleep
     try:
         options = auth.candidates()
     except auth.NoCredential as e:
