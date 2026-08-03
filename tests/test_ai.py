@@ -150,6 +150,40 @@ class ApiRequestTest(unittest.TestCase):
             ai._open({"model": "m"}, sleep=self.slept.append)
         self.assertIn("network error", str(caught.exception))
 
+    def test_a_pre_send_failure_still_spends_the_whole_retry_budget(self):
+        """Nothing reached Anthropic, so trying again is free of duplicate
+        billing -- this is the behaviour the phase split must not disturb."""
+        self.patch([ConnectionResetError("closed before we finished writing")])
+        with self.assertRaises(ai.ApiError):
+            ai._open({"model": "m"}, sleep=self.slept.append)
+        self.assertEqual(self.calls, ai.MAX_RETRIES + 1)
+
+    def test_a_delivered_failure_is_attempted_exactly_once(self):
+        """The inner retry refuses to re-send a delivered request; the outer
+        backoff loop must refuse too, or the fix is cosmetic and the user is
+        billed up to MAX_RETRIES + 1 times for one question."""
+        self.patch([ai._Delivered(http.client.RemoteDisconnected("mid-flight"))])
+        with self.assertRaises(ai.ApiError) as caught:
+            ai._open({"model": "m"}, sleep=self.slept.append)
+        self.assertEqual(self.calls, 1, "a delivered request must never be re-sent")
+        self.assertEqual(self.slept, [], "and no backoff before giving up")
+        self.assertIn("connection lost", str(caught.exception))
+        self.assertIn("already have been processed", str(caught.exception))
+
+    def test_a_delivered_failure_does_not_fall_through_to_the_next_credential(self):
+        """Trying the next credential is another full send of a request that
+        may already have been billed on the first one."""
+        ai.os.environ["CB_AUTH"] = ""
+        original = ai.auth.candidates
+        ai.auth.candidates = lambda: [({"x-api-key": "a"}, "api key"),
+                                      ({"x-api-key": "b"}, "second key")]
+        self.addCleanup(setattr, ai.auth, "candidates", original)
+        self.patch([ai._Delivered(http.client.RemoteDisconnected("mid-flight"))])
+        with self.assertRaises(ai.ApiError) as caught:
+            ai._open({"model": "m"}, sleep=self.slept.append)
+        self.assertEqual(self.calls, 1)
+        self.assertTrue(caught.exception.delivered)
+
     def test_stream_raises_so_the_panel_can_mark_it_failed(self):
         """It must raise, not yield the message as if it were an answer --
         yielding made a failure render as a normal card with status "done"."""
@@ -188,11 +222,12 @@ class FakeConn:
 
     serial = 0
 
-    def __init__(self, timeout=None, fail=None, raw=None):
+    def __init__(self, timeout=None, fail=None, raw=None, fail_response=None):
         FakeConn.serial += 1
         self.id = FakeConn.serial
         self.timeout = timeout
-        self.fail = fail
+        self.fail = fail                    # raised while writing the request
+        self.fail_response = fail_response  # raised from getresponse()
         self.raw = raw or FakeRaw()
         self.requests = []
         self.closed = False
@@ -204,6 +239,9 @@ class FakeConn:
         self.requests.append((method, path, headers))
 
     def getresponse(self):
+        if self.fail_response is not None:
+            failure, self.fail_response = self.fail_response, None
+            raise failure
         return self.raw
 
     def close(self):
@@ -332,14 +370,51 @@ class StaleRetryTest(unittest.TestCase):
     def setUp(self):
         self.made = []
 
-    def pool(self, failures):
-        """`failures` is one entry per connection handed out, or None."""
+    def pool(self, failures, response_failures=()):
+        """`failures` is one entry per connection handed out, or None.
+
+        `response_failures` is the same list for the getresponse() phase, so a
+        test can say exactly *when* the socket died.
+        """
+        def at(seq, index):
+            return seq[index] if index < len(seq) else None
+
         def connect(timeout):
             index = len(self.made)
-            conn = FakeConn(timeout, fail=failures[index] if index < len(failures) else None)
+            conn = FakeConn(timeout, fail=at(failures, index),
+                            fail_response=at(response_failures, index))
             self.made.append(conn)
             return conn
         return ai._Pool(connect)
+
+    def test_a_write_phase_failure_on_a_reused_connection_is_retried(self):
+        """Nothing reached Anthropic, so re-sending costs nothing."""
+        pool = self.pool([http.client.RemoteDisconnected("closed"), None])
+        first, _ = pool.take(60)
+        pool.give_back(first)
+        resp = ai._request(b"{}", {}, 60, pool=pool)
+        self.assertEqual(len(self.made), 2)
+        self.assertIs(resp._conn, self.made[1])
+
+    def test_a_getresponse_failure_on_a_reused_connection_is_not_retried(self):
+        """The body already reached Anthropic, which may have run and *billed*
+        the inference before the socket died. A retry is a duplicate paid call,
+        so this must surface instead."""
+        pool = self.pool([None, None],
+                         response_failures=[http.client.RemoteDisconnected("mid-flight")])
+        first, _ = pool.take(60)
+        pool.give_back(first)
+        with self.assertRaises(ai._Delivered) as caught:
+            ai._request(b"{}", {}, 60, pool=pool)
+        self.assertIsInstance(caught.exception.cause, http.client.RemoteDisconnected)
+        self.assertEqual(len(self.made), 1, "no second copy of a request already sent")
+        self.assertTrue(self.made[0].closed)
+
+    def test_delivered_still_satisfies_the_old_except_clauses(self):
+        """Callers that predate the distinction must degrade, not crash."""
+        exc = ai._Delivered(http.client.RemoteDisconnected("x"))
+        self.assertIsInstance(exc, OSError)
+        self.assertIsInstance(exc, http.client.HTTPException)
 
     def test_stale_reused_connection_is_retried_on_a_fresh_one(self):
         pool = self.pool([http.client.RemoteDisconnected("closed"), None])

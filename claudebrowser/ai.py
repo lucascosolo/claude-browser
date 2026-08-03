@@ -95,6 +95,9 @@ class ApiError(Exception):
     """A request failed in a way retrying did not fix."""
 
     auth_failure = False
+    # Set when the request was fully delivered before the failure, so no layer
+    # above may send it again. See `_Delivered`.
+    delivered = False
 
 
 def api_key():
@@ -301,6 +304,27 @@ _STALE_ERRORS = (
 )
 
 
+class _Delivered(OSError, http.client.HTTPException):
+    """The request was fully sent, and *then* the connection died.
+
+    This is the phase that must never be retried, at any layer. The whole body
+    already reached Anthropic, which may have received, run and **billed** the
+    inference before the socket broke -- so a second attempt buys a second paid
+    call and no better chance of an answer. The write phase raises the *same*
+    exception types (a keep-alive socket closed while idle looks identical), so
+    the type cannot carry this distinction and a separate class has to.
+
+    It inherits from both OSError and HTTPException so it still satisfies every
+    `except` clause the old flat failure did: any caller that does not know
+    about the distinction degrades to the previous behaviour rather than
+    letting an unhandled exception escape.
+    """
+
+    def __init__(self, cause):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 def _is_stale(exc, reused):
     """Did a *reused* connection die before the server could answer?
 
@@ -309,6 +333,9 @@ def _is_stale(exc, reused):
     -- and opening one more socket to hear it again only delays the message the
     user needs. A timeout is excluded for a different reason: the server may
     well still be working on the request, so a second copy is a second bill.
+
+    Phase is *not* checked here: `_request` raises `_Delivered` before it ever
+    consults this function, so by construction only pre-send failures reach it.
     """
     if not reused:
         return False
@@ -317,33 +344,54 @@ def _is_stale(exc, reused):
     return isinstance(exc, _STALE_ERRORS)
 
 
-def _send(conn, body, headers, pool):
+def _send(conn, body, headers, pool, sent=None):
+    """POST and take the response.
+
+    `sent` is an optional one-element list used as an out-parameter recording
+    which phase we reached: it is set True once the request body is fully
+    written, so a caller catching an exception can tell a write-phase failure
+    (safe to retry) from a getresponse-phase one (not safe -- `_Delivered`).
+    """
     conn.request("POST", API_PATH, body=body, headers=headers)
+    if sent is not None:
+        sent[0] = True
     return _Response(conn.getresponse(), conn, pool)
 
 
 def _request(body, headers, timeout, pool=None):
     """POST once over a pooled connection, retrying a stale socket exactly once.
 
-    Retrying is only sound here because the request is an idempotent POST of a
-    whole payload and *nothing of the response has been handed to anyone yet*:
-    the retry sits between sending the request and returning the response, so a
-    stream that has already yielded text can never be silently restarted.
+    Retrying is only sound here because *nothing of the response has been handed
+    to anyone yet* -- the retry sits between sending the request and returning
+    the response, so a stream that has already yielded text can never be
+    silently restarted -- and because it is scoped to failures that happened
+    before the body was fully written, where the server cannot have processed
+    anything.
     """
     pool = pool or _POOL
     conn, reused = pool.take(timeout)
+    sent = [False]
     try:
-        return _send(conn, body, headers, pool)
+        return _send(conn, body, headers, pool, sent)
     except Exception as e:
         pool.discard(conn)
+        # Phase first, and before any other judgement: once the body is out,
+        # no layer above may try again. Re-raising as _Delivered is what stops
+        # _open_with's backoff loop from doing exactly what this guard just
+        # prevented one level down.
+        if sent[0]:
+            raise _Delivered(e) from e
         if not _is_stale(e, reused):
             raise
 
     conn, _reused = pool.take(timeout, fresh=True)
+    sent = [False]
     try:
-        return _send(conn, body, headers, pool)
-    except Exception:
+        return _send(conn, body, headers, pool, sent)
+    except Exception as e:
         pool.discard(conn)
+        if sent[0]:
+            raise _Delivered(e) from e
         raise      # a fresh connection failing is a real failure; no third try
 
 
@@ -378,6 +426,11 @@ def _open(payload, timeout=600, sleep=time.sleep):
             return _open_with(payload, credential, label, timeout, sleep,
                               retries=MAX_RETRIES if final else 0)
         except ApiError as e:
+            if e.delivered:
+                # Falling through to the next credential would re-send a
+                # request that may already have been billed on this one. The
+                # cheapest correct answer is to stop.
+                raise first or e
             if final:
                 # Report the *first* credential's failure, not the last. If the
                 # preferred credential is the one the user configured, that is
@@ -404,6 +457,19 @@ def _open_with(payload, credential, label, timeout, sleep, retries=MAX_RETRIES):
     for attempt in range(retries + 1):
         try:
             response = _request(body, headers, timeout)
+        except _Delivered as e:
+            # Ordered before the two clauses below, both of which would
+            # otherwise catch this: the request reached Anthropic and may have
+            # been processed and billed, so the retry budget must not be spent
+            # on a duplicate. Fail now, and say why in terms the panel can show.
+            error = ApiError(
+                "[connection lost] The request reached Anthropic but the reply "
+                "never arrived (%s).\n\nIt was not retried automatically, "
+                "because the request may already have been processed and "
+                "charged for. Ask again if you want another attempt."
+                % (e.cause,))
+            error.delivered = True
+            raise error
         except http.client.HTTPException as e:
             if attempt < retries:
                 sleep(min((2 ** attempt) + random.random(), 30))

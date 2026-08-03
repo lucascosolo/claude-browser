@@ -213,6 +213,28 @@ syntax gate.
   and retrying it only delays the message. The retry is safe exclusively because
   it sits between sending the request and returning the response, so a stream
   that has already yielded text can never be silently restarted.
+- **That retry is scoped to the write phase, and collapsing it back into a
+  blanket retry costs real money.** `_send` flips a `sent` flag once
+  `conn.request()` has written the whole body, and `_is_stale` refuses once it
+  is set. The two phases raise the *same* exceptions, so the type tells you
+  nothing: a `RemoteDisconnected` from `conn.request()` is a keep-alive socket
+  the server closed while idle and nothing was processed, while the identical
+  one from `getresponse()` means the full body already reached Anthropic, which
+  may have received, run and **billed** the inference before the connection
+  died. Re-sending that duplicates a paid inference call — the same reason
+  urllib3 keeps POST out of its default retry set. The phase is the thing that
+  determines safety; do not "simplify" this into inspecting exception types.
+- **There are three layers that would retry, and the phase has to be visible to
+  all of them.** Scoping only the inner retry was cosmetic: `_open_with`'s
+  backoff loop catches `OSError`/`HTTPException` and would have re-sent the same
+  delivered request up to `MAX_RETRIES` times, and `_open` falls through to the
+  *next credential* on any `ApiError`, which is another full send. So a
+  post-send failure is re-raised from `_request` as `_Delivered` (subclassing
+  both `OSError` and `HTTPException`, so any older `except` still catches it
+  rather than letting it escape); `_open_with` catches that *before* its two
+  retry clauses and converts it to an `ApiError` with `delivered = True`; and
+  `_open` stops on that flag instead of trying the next credential. Adding a
+  fourth retry layer means teaching it the same thing.
 - **The omnibox "changed" signal is one keystroke, not one intent.** DNS
   preconnect debounces (`PREFETCH_DELAY_MS`) *and* dedupes by host
   (`urls.HostWarmer`), because neither alone is enough: without the pause,
