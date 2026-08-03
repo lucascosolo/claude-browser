@@ -54,6 +54,7 @@ MENU_SECTIONS = (
         ("user-bookmarks-symbolic", "Bookmarks", "Ctrl+Shift+O", "cb:bookmarks"),
         ("document-open-recent-symbolic", "History", "Ctrl+H", "cb:history"),
         ("dialog-password-symbolic", "Saved logins", "", "cb:passwords"),
+        ("media-playback-start-symbolic", "Playbooks", "", "cb:playbooks"),
     )),
     ("This page", (
         ("edit-find-symbolic", "Find on page", "Ctrl+F", "find"),
@@ -63,7 +64,8 @@ MENU_SECTIONS = (
         ("drive-harddisk-symbolic", "Cookies & cache", "", "cb:data"),
     )),
 )
-INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history", "cb:data")
+INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history", "cb:data",
+            "cb:playbooks")
 # console.* is not exposed to the embedder in webkit2gtk, so we shim it in the
 # page at document-start and read the ring buffer back out with JS later.
 CONSOLE_SHIM = """
@@ -1038,6 +1040,17 @@ class Browser(Gtk.Window):
             return pages.passwords_page(palette, self.nonce, self.vault.entries(),
                                         never=self.vault.never_list())
 
+        # Playbooks live in their own file, so like the two above they render
+        # whether or not the history database opened. When even that file could
+        # not be reached `self.playbooks` is None and the page says so rather
+        # than raising into the scheme handler.
+        if name == "playbooks":
+            return pages.playbooks_page(
+                palette, self.nonce,
+                self.playbooks.summaries() if self.playbooks else [],
+                recording=self.recorder.status(),
+                available=self.playbooks is not None)
+
         if self.store is None:
             return pages.shell(
                 name.title(), palette, self.nonce, "cb:" + name,
@@ -1120,6 +1133,11 @@ class Browser(Gtk.Window):
                 self._flash("Lighter pages on — from the next page load"
                             if wanted else "Lighter pages off")
                 self._reload_internal()
+        elif action.startswith("pb_"):
+            # `title` carries the playbook name, for the same reason clear_data
+            # puts the kind there: the message shape is fixed at
+            # {action, url, title}.
+            self._playbook_action(action, title)
         elif action == "clear_history" and self.store:
             self.store.clear_history()
             self.store.flush()
@@ -2768,6 +2786,51 @@ class Browser(Gtk.Window):
                                         "directory could not be opened)"})
             return True
         return False
+
+    def _playbook_action(self, action, name):
+        """One button on cb:playbooks, answered by the api_* method behind it.
+
+        The page gets no path of its own: `pb_run` hands the name to
+        `api_playbook_run`, which validates the file and chains the steps
+        through the queue exactly as the HTTP route would. A replay loop written
+        for the page would be the copy that drifts. Everything ends in a
+        re-render, because every one of these changes what the page shows.
+        """
+        def steps(n):
+            n = int(n or 0)
+            return "%d step%s" % (n, "" if n == 1 else "s")
+
+        def landed(result):
+            result = result if isinstance(result, dict) else {}
+            if not result.get("ok"):
+                self._flash(result.get("error") or "that did not work")
+            elif action == "pb_start":
+                self._flash("Recording %s" % (result.get("recording") or name))
+            elif action == "pb_stop":
+                self._flash("Saved %s — %s" % (result.get("saved") or name,
+                                               steps(result.get("steps"))))
+            elif action == "pb_cancel":
+                self._flash("Recording discarded" if result.get("cancelled")
+                            else "Nothing was being recorded")
+            elif action == "pb_delete":
+                self._flash("Deleted %s" % (result.get("deleted") or name))
+            else:
+                self._flash("%s finished — %s"
+                            % (name, steps(len(result.get("steps") or []))))
+            self._reload_internal()
+
+        if action == "pb_start":
+            self.api_playbook_record("start", name, landed)
+        elif action in ("pb_stop", "pb_cancel"):
+            self.api_playbook_record(action[3:], None, landed)
+        elif action == "pb_delete":
+            self.api_playbook_delete(name, landed)
+        elif action == "pb_run":
+            # Said before the first step rather than only after the last: a
+            # replay can spend a minute in the load queue, and a button that
+            # goes quiet for that long reads as one that did nothing.
+            self._flash("Running %s…" % name)
+            self.api_playbook_run(name, landed)
 
     def api_playbook_record(self, action, name, done):
         action = (action or "").strip().lower()

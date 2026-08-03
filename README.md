@@ -170,6 +170,7 @@ Claude panel's visual language. A slim icon rail moves between them.
 | `cb:bookmarks` | Everything saved, filterable. |
 | `cb:history` | Grouped by day, filterable, with per-entry delete and a two-step clear. |
 | `cb:passwords` | **Saved logins**, plus the sites you told it never to ask about. |
+| `cb:playbooks` | **Recorded sequences**, what each one does, and a Run and a two-step Delete for every one. Starting and stopping a recording lives here too, so a capture left running is visible rather than invisible. |
 | `cb:data` | **Memory, swap, CPU and disk** — what the resource guard is seeing, how many tabs it has freed, how much page text is cached for `recall`, and two-step buttons to clear the cache, the cookies, the cached page text, or everything. |
 
 Tiles carry a **site mark** — a letter on a colour hashed from the hostname —
@@ -352,8 +353,13 @@ report — can be recorded once and replayed by name.
 ./cbctl playbook-delete morning
 ```
 
+The same four things are on **`cb:playbooks`** (menu → Library → Playbooks):
+what is saved and what each one does, a Run and a two-step Delete per playbook,
+and the start/stop of a recording with the number of steps captured so far.
+
 Recording watches the control API, so it captures whatever drives it — `cbctl`,
-the MCP tools, or a raw `curl`. Failed operations are left out, and tab ids are
+the MCP tools, or a raw `curl` — and *not* browsing by hand, which is why the
+page says so where you start one. Failed operations are left out, and tab ids are
 never recorded: every step replays against the focused tab, so a playbook still
 works tomorrow.
 

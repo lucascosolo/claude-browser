@@ -34,6 +34,8 @@ NAV = (
     ("cb:passwords", "Logins",
      "M6 10V7a6 6 0 1 1 12 0v3h1a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1"
      " 0 0 1 1-1zm2 0h8V7a4 4 0 0 0-8 0z"),
+    ("cb:playbooks", "Playbooks",
+     "M4 6h10M4 12h7M4 18h7M15 12.5l6 3.5-6 3.5z"),
     ("cb:data", "Data",
      "M12 3c4.97 0 9 1.34 9 3s-4.03 3-9 3-9-1.34-9-3 4.03-3 9-3zM3 9c0 1.66 4.03 3 9 3"
      "s9-1.34 9-3v4c0 1.66-4.03 3-9 3s-9-1.34-9-3zm0 6c0 1.66 4.03 3 9 3s9-1.34 9-3v4"
@@ -313,6 +315,123 @@ def _never_row(origin):
     </div>""" % {
         "hue": hue, "letter": _e(letter), "origin": _e(origin), "jo": _js(origin),
     }
+
+
+def playbooks_page(palette, nonce, books, recording=None, available=True):
+    """Saved sequences, and whether one is being recorded right now.
+
+    The recording banner is at the top rather than in the footer because a
+    recording that was left running is the failure mode worth catching: every
+    operation until it is stopped goes into the file, and the only place that is
+    visible is here.
+    """
+    if not available:
+        return shell("Playbooks", palette, nonce, "cb:playbooks", _empty(
+            "&#9654;", "Playbooks are unavailable",
+            "They are a file beside the browser's database, and that directory "
+            "could not be opened."))
+
+    body = _recorder_bar(recording or {})
+    if books:
+        body += '<div class="rows">%s</div>' % "".join(
+            _book_row(b) for b in books)
+    else:
+        body += _empty("&#9654;", "No playbooks yet",
+                       "Start a recording above, drive the browser through the "
+                       "sequence, then save it.")
+    return shell("Playbooks", palette, nonce, "cb:playbooks", body)
+
+
+def _recorder_bar(status):
+    """Either what is being captured, or the field that starts a capture.
+
+    The note says out loud that hand-driving the browser records nothing: the
+    capture point is the control API, so a user who starts a recording here and
+    then clicks around by hand would otherwise save an empty playbook and have
+    to guess why.
+    """
+    if status.get("recording"):
+        steps = int(status.get("steps") or 0)
+        skipped = int(status.get("skipped_secrets") or 0)
+        return """
+    <div class="rec">
+      <span class="dot"></span>
+      <span class="rt">Recording %(name)s</span>
+      <span class="ru">%(steps)d step%(plural)s captured%(skipped)s</span>
+      <button class="pbbtn" onclick="return cbui.send({action:'pb_stop'})"
+              title="Stop recording and save it under this name">Save</button>
+      <button class="pbbtn danger" onclick="return cbui.send({action:'pb_cancel'})"
+              title="Stop recording and throw it away">Discard</button>
+    </div>
+    <p class="note">%(note)s</p>""" % {
+            "name": "&ldquo;%s&rdquo;" % _e(status.get("name") or ""),
+            "steps": steps,
+            "plural": "" if steps == 1 else "s",
+            "skipped": (" &middot; %d credential field%s skipped"
+                        % (skipped, "" if skipped == 1 else "s")) if skipped else "",
+            "note": _e(
+                "The count is from when this page was drawn; reload to see it "
+                "again. Credential fields are never written to the file — the "
+                "browser's own autofill supplies those on replay."),
+        }
+
+    return """
+    <div class="rec off">
+      <input id="pbname" class="pbname" type="text" autocomplete="off"
+             spellcheck="false" placeholder="Name for a new recording">
+      <button class="pbbtn" onclick="return cbui.pbstart(event)">Start recording</button>
+    </div>
+    <p class="note">%s</p>""" % _e(
+        "A recording captures the operations Claude and cbctl perform — opening "
+        "pages, clicking, filling fields. Browsing by hand is not captured, so "
+        "drive the browser through the sequence the way you want it replayed.")
+
+
+def _book_row(book):
+    name = book.get("name") or ""
+    steps = int(book.get("steps") or 0)
+    letter = next((c for c in name if c.isalnum()), "?").upper()
+    return """
+    <div class="row book">
+      <span class="mark sm" style="--h:%(hue)d">%(letter)s</span>
+      <span class="rt">%(name)s</span>
+      <span class="ru">%(what)s</span>
+      <span class="rw">%(steps)d step%(plural)s%(when)s</span>
+      <button class="pbbtn" onclick="return cbui.pbrun(event, %(jn)s)"
+              title="Replay this playbook">Run</button>
+      <button class="pbbtn danger" onclick="return cbui.pbdrop(event, %(jn)s)"
+              title="Delete this playbook">Delete</button>
+    </div>""" % {
+        "hue": _hue(name), "letter": _e(letter), "name": _e(name),
+        "what": _e(_what_it_does(book.get("ops") or [])),
+        "steps": steps, "plural": "" if steps == 1 else "s",
+        "when": (" &middot; saved %s" % _e(_ago(book["created"])))
+                if book.get("created") else "",
+        "jn": _js(name),
+    }
+
+
+def _what_it_does(ops, limit=6):
+    """The op sequence as one readable line.
+
+    Only the op names are available here -- `summaries()` deliberately does not
+    hand out the parameters, which is where the URLs and selectors are -- so the
+    line says the shape of the sequence rather than its targets. Runs are
+    collapsed, because "click, click, click" reads as a stutter where
+    "click x3" reads as a count.
+    """
+    groups = []
+    for op in ops:
+        label = str(op or "?")
+        if groups and groups[-1][0] == label:
+            groups[-1][1] += 1
+        else:
+            groups.append([label, 1])
+    shown = ["%s%s" % (label, "" if n == 1 else " ×%d" % n)
+             for label, n in groups[:limit]]
+    if len(groups) > limit:
+        shown.append("…")
+    return " → ".join(shown) or "nothing to replay"
 
 
 def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
@@ -692,6 +811,29 @@ h2 .more:hover { text-decoration:underline; }
 .row.login:hover .act { opacity:1; }
 .rows + h2 { margin-top:26px; }
 
+/* cb:playbooks. The recording banner is loud on purpose: a capture left running
+   keeps recording everything the API does, and this page is the only place that
+   fact is visible. Its buttons are always shown for the same reason the ones on
+   cb:passwords are -- they are what the page is for. */
+.rec { display:flex; align-items:center; gap:11px; border-radius:11px;
+       padding:11px 12px; margin-bottom:6px;
+       border:1px solid var(--accent); background:var(--soft); }
+.rec.off { border-color:var(--line); background:var(--card); }
+.rec .dot { flex:0 0 auto; width:9px; height:9px; border-radius:50%%;
+            background:var(--warn); }
+.rec .rt { font-weight:620; max-width:none; }
+.pbname { flex:1 1 auto; min-width:0; background:var(--field); color:var(--text);
+          border:1px solid var(--line); border-radius:8px; padding:7px 12px;
+          font:13px system-ui,sans-serif; }
+.pbname:focus { outline:none; border-color:var(--accent); }
+.pbbtn { flex:0 0 auto; background:var(--card); color:var(--text); cursor:pointer;
+         border:1px solid var(--line); border-radius:7px; padding:4px 11px;
+         font:12px system-ui,sans-serif; }
+.pbbtn:hover { border-color:var(--accent); }
+.pbbtn.danger:hover { border-color:var(--warn); color:var(--warn); }
+.pbbtn[disabled] { opacity:.55; cursor:default; }
+.rec + .note { margin-top:8px; }
+
 .day { font-size:11.5px; text-transform:uppercase; letter-spacing:.07em;
        color:var(--dim); font-weight:700; margin:22px 0 8px; }
 .rows { display:flex; flex-direction:column; gap:4px; }
@@ -834,6 +976,43 @@ _DOC = """<!doctype html>
                 setTimeout(function () { el.remove(); }, 120); }
       return this.send({action: 'pw_allow', url: origin});
     },
+    pbstart: function (ev) {
+      ev.preventDefault();
+      var box = document.getElementById('pbname');
+      var name = box ? box.value.trim() : '';
+      // Refused here rather than round-tripped: an empty name comes back from
+      // clean_name as an error flash, which reads as a bug in the button.
+      if (!name) { if (box) box.focus(); return false; }
+      return this.send({action: 'pb_start', title: name});
+    },
+    pbrun: function (ev, name) {
+      ev.preventDefault();
+      // A replay walks pages one step at a time and can take a while. Disabling
+      // the button is what stops a second click starting a second walk over the
+      // same tab.
+      var b = ev.currentTarget;
+      b.disabled = true;
+      b.textContent = 'Running…';
+      return this.send({action: 'pb_run', title: name});
+    },
+    pbdrop: function (ev, name) {
+      // Armed like the clear buttons, and never a modal dialog -- one inside a
+      // WebView blocks this embedder's main loop. Deleting a playbook is not
+      // undoable, so it takes two clicks.
+      ev.preventDefault();
+      var b = ev.currentTarget;
+      if (b.dataset.armed) {
+        b.disabled = true;
+        b.textContent = 'Deleting…';
+        return this.send({action: 'pb_delete', title: name});
+      }
+      b.dataset.armed = '1';
+      b.textContent = 'Click again';
+      setTimeout(function () {
+        delete b.dataset.armed; b.textContent = 'Delete';
+      }, 4000);
+      return false;
+    },
     confirmData: function (ev, kind, label) {
       // Same two-click arming as confirmClear, and for the same reason: a
       // window.confirm() inside a WebView blocks this embedder's main loop.
@@ -875,6 +1054,14 @@ _DOC = """<!doctype html>
       if (e.key === 'Enter' && go.value.trim()) {
         cbui.send({action: 'go', url: go.value.trim()});
       }
+    });
+  }
+
+  var pbname = document.getElementById('pbname');
+  if (pbname) {
+    pbname.focus();
+    pbname.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { cbui.pbstart(e); }
     });
   }
 
