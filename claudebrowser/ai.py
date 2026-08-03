@@ -28,7 +28,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from . import auth, personas, scrub
+from . import auth, personas, scrub, vpn
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
@@ -176,7 +176,48 @@ def _proxy_for(host):
         return None  # a proxy we cannot parse is not worth failing the request over
 
 
+def transport_route():
+    """A name for the path the next connection will take.
+
+    "direct", or the VPN proxy it will tunnel through. `_Pool` keys its idle
+    sockets on this: a connection opened before VPN Mode was turned on is not
+    interchangeable with one opened after it, and handing the old one back out
+    would put the next question on the path the user has just asked the browser
+    to stop using -- with nothing in the answer to say so.
+    """
+    return vpn.transport_key()
+
+
+def reset_transport():
+    """Drop every pooled connection, because the route changed.
+
+    Called by the window whenever VPN Mode is engaged or turned off. The keying
+    above already stops a mismatched socket from being reused; this closes them
+    instead of leaving them parked until the idle timeout, which matters in the
+    direction that matters -- a live socket to Anthropic from the user's own
+    address, sitting open, after they asked for it not to be.
+    """
+    _POOL.close_all()
+
+
 def _new_connection(timeout):
+    # VPN Mode wins over the environment's https_proxy. It is a deliberate,
+    # visible choice made in this window; https_proxy is ambient configuration
+    # that may well be the thing the user is trying to get out from behind.
+    tunnel, refusal = vpn.api_route()
+    if refusal:
+        # Unreachable through `_open`, which refuses before a socket is ever
+        # asked for. It is here anyway because this function is where a socket
+        # is *made*: a future caller that skipped the gate above would otherwise
+        # get a direct connection out of it, which is the one answer that must
+        # not be available from this code path at all.
+        raise ApiError(refusal)
+    if tunnel is not None:
+        # Same CONNECT mechanism as the branch below -- see vpn.open_tunnel for
+        # why the certificate is still checked against api.anthropic.com.
+        return vpn.open_tunnel(tunnel, API_HOST, API_PORT, timeout,
+                               context=_ssl_context())
+
     proxy = _proxy_for(API_HOST)
     if proxy:
         # HTTPSConnection sends CONNECT in the clear and *then* wraps TLS, so
@@ -204,11 +245,12 @@ class _Pool:
     """
 
     def __init__(self, connect=_new_connection, max_idle=MAX_IDLE,
-                 idle_timeout=IDLE_TIMEOUT, clock=time.monotonic):
+                 idle_timeout=IDLE_TIMEOUT, clock=time.monotonic, route=None):
         self._connect = connect
         self._max_idle = max_idle
         self._idle_timeout = idle_timeout
         self._clock = clock
+        self._route = route or transport_route
         self._idle = []          # (connection, parked_at), oldest first
         self._lock = threading.Lock()
 
@@ -217,16 +259,29 @@ class _Pool:
 
         Every connection handed out here must come back through `give_back` or
         `discard`, or it is a leaked socket.
+
+        A socket is only reusable while the route is the one it was opened on --
+        see `transport_route`. The route is stamped on the connection rather
+        than on the parked entry because the mode can change while a request is
+        in flight, and what matters is the path this socket actually took, not
+        the path the browser would take now.
         """
+        want = self._route()
         while not fresh:
             with self._lock:
                 if not self._idle:
                     break
                 conn, parked = self._idle.pop()   # newest first: most likely alive
-            if self._clock() - parked <= self._idle_timeout:
+            if (getattr(conn, "_cb_route", None) == want
+                    and self._clock() - parked <= self._idle_timeout):
                 return conn, True
             _shut(conn)
-        return self._connect(timeout), False
+        conn = self._connect(timeout)
+        try:
+            conn._cb_route = want
+        except AttributeError:
+            pass      # a connection that will not be labelled is never reused
+        return conn, False
 
     def give_back(self, conn):
         """Return a connection whose response was fully consumed."""
@@ -445,6 +500,16 @@ def _open(payload, timeout=600, sleep=None):
     """
     if sleep is None:
         sleep = time.sleep
+
+    # Before the credential is even chosen, and before any socket exists. VPN
+    # Mode covers this request or the request does not happen: sending it
+    # direct would leak both the question and the fact that the tunnel the user
+    # asked for is not working. The panel renders this as a failed card, which
+    # is the honest outcome -- see vpn.State.route for the three cases.
+    _proxy, refusal = vpn.api_route()
+    if refusal:
+        raise ApiError(refusal)
+
     try:
         options = auth.candidates()
     except auth.NoCredential as e:

@@ -38,7 +38,13 @@ from pathlib import Path
 #: shadowed by an inherited variable, which is the whole point above; and it is
 #: not handed to child processes -- the control API server, a spawned helper, a
 #: crash reporter -- none of which have any business holding the user's API key.
-SECRET_KEYS = frozenset({"ANTHROPIC_API_KEY"})
+#: CB_VPN_PROXY belongs here for the same two reasons, and it is easy to miss
+#: why: it is a URL, but the URL embeds the proxy's password (WebKit's
+#: NetworkProxySettings takes credentials no other way -- see vpn.py). A proxy
+#: URL in os.environ is a password in os.environ, inherited by every child
+#: process, and a proxy URL a settings control could write is a password an
+#: API call could rewrite.
+SECRET_KEYS = frozenset({"ANTHROPIC_API_KEY", "CB_VPN_PROXY"})
 
 
 def config_dir():

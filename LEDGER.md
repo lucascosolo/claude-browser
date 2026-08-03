@@ -137,5 +137,79 @@ a URI with embedded credentials.
   IP the host itself owns is never forwarded and so never reaches `DOCKER-USER`.
   Caveat to carry into the docs: connection *failures* are logged with the
   hostname; successful browsing is not logged at all.
-- Chunk 4 (VPN client) is **blocked** on chunk 3 — both own `browser.py`,
-  `api.py`, `settings.py`, `pages.py`.
+- Chunk 3 **done**, committed as `21ae95a`. **617 tests pass** (576 + 41),
+  `py_compile` clean — verified by me, not only reported. Every HIGH and MEDIUM
+  finding in `AUDIT.md` is addressed. Deliberately not fixed: **L1** (`cb:tabs`
+  renders private URLs) — that deck is *how you switch to a private tab*, it is
+  in-memory only, and the audit classes it as shoulder-surfing. **M5** needed no
+  action (clean bill of health).
+  Design notes worth keeping: privacy now only travels downhill
+  (`storage.child_is_private` can add it, never remove it); a tab id the playbook
+  recorder cannot resolve answers *private*, i.e. it fails closed; the new
+  settings use an `_only_on_words` truth function so a typo keeps the private
+  answer rather than dropping the guard.
+- Chunk 4 dispatched — VPN client. Was blocked on chunk 3: both own `browser.py`,
+  `api.py`, `settings.py`, `pages.py`, so they could never run together.
+
+## Chunk 6 — perceived speed and feel (user asked for this mid-session)
+
+Hardware re-confirmed, because it decides every trade below: **Celeron N3060, 2
+cores @1.6GHz, 3.8GB RAM, Braswell graphics, and no swap configured at all**
+(`swapon --show` is empty). `perf.py`'s conservative defaults are therefore
+*correct* and must not be loosened — smooth scrolling and WebGL stay off. The
+wins available are the ones that cost no CPU.
+
+Findings, all measured or probed, not guessed:
+
+1. **Every navigation flashes white.** `set_background_color` is applied to the
+   Claude panel (browser.py:670) and to no page view, so WebKit paints its
+   default white between commit and first paint. On the default phosphor theme
+   that is the single most jarring thing about using the browser. Free to fix.
+2. **Autoplay is allowed.** `media-playback-requires-user-gesture` defaults to
+   **False** and `perf.tune_view` never sets it. An autoplaying video on a news
+   page can hold both cores on this machine. Biggest *real* CPU win left.
+3. **No hover prefetch.** DNS is warmed while typing in the omnibox
+   (`urls.HostWarmer`) but there is no `mouse-target-changed` handler, so a link
+   the pointer is resting on pays full DNS latency on click. Must inherit the
+   privacy gates: not in a private tab, not while VPN Mode is on (local
+   resolution would defeat the tunnel).
+4. **`Tab.scroll` is a dead field** — set to `0` at browser.py:277 and never read
+   or written again. So a tab discarded under memory pressure reloads to the top
+   and loses your reading position. Capturing and restoring it makes discards
+   nearly invisible, which is exactly the "feel" complaint.
+5. **Startup is ~7.8s of imports** (`python3 -X importtime`). Most is
+   unavoidable — the WebKit2 typelib alone is ~2.6s, Gtk+Gdk ~1.4s. But
+   `claudebrowser.agent` costs 0.83s cumulative and pulls in `ai` (0.81s) and
+   `http.client` (0.36s), none of which is needed until the user actually asks
+   for something. **Note the self-inflicted part:** chunk 3 put
+   `private_ai_enabled()` / `PRIVATE_REFUSAL` in `ai.py`, and `api_tabs` calls
+   it — so an ordinary tab listing now drags `http.client` and `ssl` in. Move
+   those two names to a GTK-free home and `agent`/`ai` become lazy imports.
+6. **Back/forward swipe gestures** (`enable-back-forward-navigation-gestures`)
+   default False and are free to enable.
+
+Rejected after probing: `enable-mediasource` and `enable-webaudio` stay on —
+disabling them breaks streaming video and site audio, which is a correctness
+regression sold as a speed win.
+
+Chunk 6 owns `perf.py`, `extract.py`, `browser.py`, `settings.py`, `style.py`,
+`tests/**` — so it **overlaps chunk 4 almost completely and must follow it.**
+
+## Still to do
+
+- Chunk 5 — docs. `CLAUDE.md` says "all 19 of them" settings; it is 21 after
+  chunk 3 and will be 23 after chunk 4, and the new knobs are undocumented there.
+  The "opt-in VPS backend" entry under *Architectures already rejected* must be
+  rewritten to record that it was reopened deliberately, on the user's explicit
+  instruction, and narrowed to a transport proxy.
+- Hand-verification on the real display (`:0`), which no unit test can reach:
+  1. `storage.apply_policy` really flipping `itp_enabled` and the accept policy on
+     a live ephemeral manager.
+  2. `download-started` firing for a download from an ephemeral view, and the
+     cancel actually landing.
+  3. Popup inheritance end to end — an OAuth-style `window.open` from a private
+     tab arriving as a private tab, with the badge.
+  4. `cb:private` and `cb:vpn` rendering in all three themes.
+  5. `tab.view.destroy()` in `close_tab` warning-free over a close/reopen cycle.
+  6. VPN Mode on: exit IP shown matches `162.35.172.112`, and a private tab opened
+     while VPN Mode is on is *also* proxied (the two features must compose).

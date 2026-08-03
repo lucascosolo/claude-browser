@@ -21,7 +21,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  # noqa: E402
                passwords, perf, personas, playbooks, reader, resources, scrub,
-               settings, storage, store, style, tabnames, urls)
+               settings, storage, store, style, tabnames, urls, vpn)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -76,12 +76,57 @@ MENU_SECTIONS = (
         ("view-paged-symbolic", "Reader mode", "Ctrl+Alt+R", "reader"),
     )),
     ("Machine", (
+        # A toggle rather than a link to cb:vpn, because the thing people want
+        # from this row is the switch; the pill in the bar and the menu row's
+        # own name are how you get to the page.
+        ("network-vpn-symbolic", "VPN Mode", "Ctrl+Alt+V", "vpn"),
         ("drive-harddisk-symbolic", "Cookies & cache", "", "cb:data"),
         ("preferences-system-symbolic", "Settings", "", "cb:settings"),
     )),
 )
 INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history", "cb:data",
-            "cb:playbooks", "cb:settings")
+            "cb:playbooks", "cb:settings", "cb:vpn")
+
+#: The leak a proxy cannot close, and the only one of the three candidates that
+#: is real on this build.
+#:
+#: WebRTC gathers ICE candidates straight off the host's interfaces and hands
+#: them to page JavaScript. It is UDP and the tunnel is TCP, so there is nothing
+#: to proxy it through -- off is the only available answer, and the cost (no
+#: video calls in this browser while the mode is on) is stated on cb:vpn rather
+#: than hidden. It happens to already default to False in WebKitGTK 2.52, which
+#: is exactly why it is pinned here: a default is not a guarantee, and
+#: `perf.tune_view` or a later WebKit could turn it on without anything in this
+#: file noticing.
+#:
+#: The other two were probed on this build and deliberately left out, so nobody
+#: adds them back believing they do something:
+#:
+#:   `enable-dns-prefetching` is deprecated -- its getter always returns FALSE.
+#:   Pages get no prefetch here at all. The DNS lookup that *does* happen from
+#:   this machine is the browser's own `context.prefetch_dns` off the omnibox,
+#:   and that one is guarded directly in `_prefetch_dns`, where it can be.
+#:
+#:   `enable-hyperlink-auditing` is deprecated too, and worse: the setter is a
+#:   documented no-op that logs a warning per call and the getter keeps
+#:   answering True. Setting it would print a line per tab and change nothing.
+#:   It is also not the leak it looks like -- an `<a ping>` is an ordinary HTTP
+#:   request from the network process, so while VPN Mode is on it goes through
+#:   the proxy with everything else. It is a privacy nuisance, not an address
+#:   disclosure, and this mode is about the address.
+#:
+#: Saved and restored per view rather than set once: a browser that permanently
+#: disabled WebRTC because the user tried VPN Mode in March would be changing a
+#: setting it was never asked to change.
+VPN_VIEW_SETTINGS = {
+    "enable-webrtc": False,
+}
+
+#: Schemes a blocked navigation is still allowed to reach. None of them is a
+#: network request: cb: is served by this process, and the rest are the page's
+#: own bytes. Without this the block would also swallow the way out of it --
+#: cb:vpn is where the Turn Off button lives.
+VPN_LOCAL_SCHEMES = ("cb:", "about:", "file:", "data:", "blob:", "javascript:")
 # console.* is not exposed to the embedder in webkit2gtk, so we shim it in the
 # page at document-start and read the ring buffer back out with JS later.
 CONSOLE_SHIM = """
@@ -206,6 +251,23 @@ def needs_tab(method):
 
 
 
+def _route_through_vpn(target):
+    """Put one WebContext or WebsiteDataManager behind the VPN proxy.
+
+    A no-op returning False when the mode is off, so every caller can invoke it
+    unconditionally instead of asking first and then doing the same check again
+    a line later. Raises when the mode is engaged and the proxy did not apply --
+    a target that silently stayed direct is the failure this feature exists to
+    prevent, so it has to reach someone who will go to `failed` over it.
+    """
+    state = vpn.STATE
+    proxy = state.proxy if state.engaged else None
+    if proxy is None:
+        return False
+    storage.apply_proxy(target, proxy.uri(), vpn.IGNORE_HOSTS)
+    return True
+
+
 class Tab:
     """A web view plus the bookkeeping the API needs: a stable id, and the list
     of callbacks waiting for this tab's current load to finish."""
@@ -239,6 +301,24 @@ class Tab:
             except Exception as e:
                 print("storage: private tab kept WebKit's defaults (%s)" % e,
                       flush=True)
+            # And VPN Mode, here rather than in new_tab, because *here* is
+            # before this view has navigated anywhere -- the proxy has to be on
+            # the manager before its first request, not after it.
+            #
+            # This is the one place VPN Mode and private mode have to meet. A
+            # private view has an ephemeral WebsiteDataManager of its own, and a
+            # proxy set on the context does not reach it: with only the context
+            # configured, "open a private tab" would be the documented way to
+            # browse around VPN Mode, which is the exact inverse of what someone
+            # who turned both on is asking for. The failure is recorded rather
+            # than printed -- new_tab escalates it, because a private tab that
+            # could not be put behind the proxy must not quietly become the one
+            # tab that browses direct.
+            self.vpn_error = None
+            try:
+                _route_through_vpn(self.view.get_website_data_manager())
+            except Exception as e:
+                self.vpn_error = str(e)
         elif related is not None:
         # Creating a view "related" to an existing one puts both in the same web
         # process. This is the only mechanism that still works for that in
@@ -275,6 +355,12 @@ class Tab:
         self.used = time.monotonic()
         self.discarded = None
         self.scroll = 0
+        # The WebKitSettings values VPN Mode overrode on this view, so turning
+        # the mode off can put back what was there rather than what this file
+        # guesses the defaults are. None means "not hardened".
+        self.vpn_saved = None
+        if not private:
+            self.vpn_error = None
 
     def touch(self):
         self.used = time.monotonic()
@@ -429,6 +515,14 @@ class Browser(Gtk.Window):
         self._bind_keys()
         self._start_guard()
 
+        # Before the first tab exists, so no view is ever created outside the
+        # mode the settings file asked for. The exit check that follows runs on
+        # a worker thread and the window does not wait for it: while it is in
+        # flight the proxy is already applied, so the first page load is
+        # tunnelled or it fails -- it is never direct.
+        if vpn.enabled():
+            self._vpn_engage()
+
         self.connect("destroy", self._on_destroy)
         for url in (urls or [HOME]):
             self.new_tab(url)
@@ -532,6 +626,18 @@ class Browser(Gtk.Window):
                                           lambda *_: self.toggle_bookmark())
         self.btn_star.get_style_context().add_class("cb-star")
         right.pack_start(self.btn_star, False, False, 0)
+
+        # The VPN indicator. Hidden while the mode is off -- a chrome that
+        # permanently reserves space for a feature nobody is using is how a
+        # one-bar browser stops being one. `no_show_all` is what keeps it hidden
+        # through the window's own show_all().
+        self.vpn_pill = Gtk.Button()
+        self.vpn_pill.set_relief(Gtk.ReliefStyle.NONE)
+        self.vpn_pill.set_can_focus(False)
+        self.vpn_pill.set_no_show_all(True)
+        self.vpn_pill.get_style_context().add_class("cb-vpnpill")
+        self.vpn_pill.connect("clicked", lambda *_: self._open_internal("cb:vpn"))
+        right.pack_start(self.vpn_pill, False, False, 0)
         right.pack_start(
             self._icon_button("tab-new-symbolic", "New tab (Ctrl+T)",
                               lambda *_: self.new_tab(HOME)), False, False, 0)
@@ -893,6 +999,13 @@ class Browser(Gtk.Window):
             # anyone's fingers already know.
             ("r", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK):
                 self.toggle_reader,
+            # Ctrl+Alt+V for the same reason reader mode is Ctrl+Alt+R: the
+            # Ctrl+Shift row is full, and Ctrl+Shift+V is "paste and match
+            # style" in every browser and editor anyone has used. A window-level
+            # handler sees keys before the focused widget, so taking that one
+            # would silently break paste in the omnibox and in every page.
+            ("v", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK):
+                self.toggle_vpn,
             ("h", Gdk.ModifierType.CONTROL_MASK):
                 lambda: self._open_internal("cb:history"),
             ("o", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
@@ -978,7 +1091,17 @@ class Browser(Gtk.Window):
         Deprecated upstream in 2.46 with nothing to replace it in the 4.1 API,
         so it is called defensively: on a build without it the browser simply
         does not preconnect, which is exactly where it was before.
+
+        Not called at all while VPN Mode is engaged. `prefetch_dns` resolves
+        from *here* -- it is a lookup the context makes on its own behalf, not a
+        request that goes through the proxy -- so warming a host would tell the
+        local resolver, and whoever it forwards to, every name the user typed
+        while believing their lookups were leaving from somewhere else. Cheaper
+        page loads are not worth the one thing the mode is for. The check is
+        here rather than at the two call sites so a third one cannot forget it.
         """
+        if vpn.STATE.engaged:
+            return
         try:
             self.context.prefetch_dns(host)
         except (AttributeError, TypeError, GLib.Error):
@@ -1218,6 +1341,13 @@ class Browser(Gtk.Window):
         if name == "private":
             return pages.private_page(palette, self.nonce)
 
+        # Answered before the store check for the strongest version of that
+        # reason: when VPN Mode has failed this is the only page the browser
+        # will load, and it carries the button that turns the mode off. It must
+        # not be able to depend on anything that can be broken.
+        if name == "vpn":
+            return pages.vpn_page(palette, self.nonce, vpn.snapshot())
+
         if name == "passwords":
             if self.vault is None:
                 return pages.passwords_page(palette, self.nonce, [], available=False)
@@ -1337,6 +1467,13 @@ class Browser(Gtk.Window):
             # {action, url, title}, and a fourth field would be one every other
             # sender has to ignore. A reset has no value at all.
             self._change_setting(url, None if action == "reset_setting" else title)
+        elif action.startswith("vpn_"):
+            # vpn_on / vpn_off / vpn_check, from the buttons on cb:vpn. The
+            # state it wants rather than a flip, on the same reasoning as
+            # set_light: a cb:vpn tab left open while the mode changed
+            # elsewhere would otherwise toggle against something it is no
+            # longer showing.
+            self._vpn_action(action[4:])
         elif action.startswith("pb_"):
             # `title` carries the playbook name, for the same reason clear_data
             # puts the kind there: the message shape is fixed at
@@ -1460,7 +1597,17 @@ class Browser(Gtk.Window):
         view = tab.view
 
         perf.tune_view(view)
+        if vpn.STATE.engaged:
+            self._vpn_harden(tab)
+        if tab.vpn_error:
+            # Set by Tab.__init__ when a private view's own session could not be
+            # put behind the proxy. Escalated rather than logged: the tab exists
+            # and is about to load something, and the only honest response is
+            # for the whole mode to be failed so that load is refused.
+            self._vpn_broke("a private tab could not be put behind the proxy "
+                            "(%s)" % tab.vpn_error)
 
+        view.connect("decide-policy", self._on_policy, tab)
         view.connect("load-changed", self._on_load, tab)
         view.connect("load-failed", self._on_fail, tab)
         view.connect("notify::title", lambda *_: (self._retitle(tab), self._refresh(tab)))
@@ -1954,7 +2101,7 @@ class Browser(Gtk.Window):
         if note and self.panel.get_visible() and not self.panel_busy:
             self._set_status("machine busy — %s" % note, "warn")
 
-    def _admit(self, then, done):
+    def _admit(self, then, done, url=None):
         """Queue a page load until the machine has room for it.
 
         This is the fix for the reported bug, and it is a *queue* rather than a
@@ -1975,6 +2122,27 @@ class Browser(Gtk.Window):
         going to resolve: a queue that is already deep, and memory that stays
         exhausted for a full wait.
         """
+        # Before the queue, because this refusal is not going to resolve by
+        # waiting. Every API-initiated navigation passes through here, so this
+        # is where a caller gets told in JSON rather than watching a load fail
+        # in a window it cannot see; the decide-policy handler covers the same
+        # ground for links and for back/forward.
+        #
+        # `url` is what makes cb:vpn still reachable from the API while the mode
+        # is failed -- the same exemption the policy handler makes, for the same
+        # reason: the page that says why nothing is loading, and holds the
+        # button that turns the mode off, must not be behind the block. An
+        # unknown url is treated as remote, because the conservative reading is
+        # the one that cannot leak.
+        if vpn.STATE.blocks_navigation and not (
+                url or "").lower().startswith(VPN_LOCAL_SCHEMES):
+            return done({"ok": False, "vpn": vpn.snapshot(),
+                         "error": "refused: VPN Mode is on and its proxy is not "
+                                  "working (%s). Nothing is loaded from this "
+                                  "machine's own address instead -- fix the "
+                                  "proxy, or turn VPN Mode off with `cbctl vpn "
+                                  "off`." % (vpn.STATE.reason or "no reason recorded")})
+
         if len(self._queue) >= MAX_QUEUED_LOADS:
             return done({
                 "ok": False, "machine": self.machine.as_dict(),
@@ -2212,6 +2380,7 @@ class Browser(Gtk.Window):
             "private": lambda: self.new_tab(PRIVATE_HOME, private=True),
             "find": self.findbar.open,
             "reader": self.toggle_reader,
+            "vpn": self.toggle_vpn,
         }[key]()
 
     # -- saved logins -------------------------------------------------------
@@ -2812,7 +2981,9 @@ class Browser(Gtk.Window):
             self._begin_load(tab)
             self._await_load(tab, wait, done)
 
-        self._admit(go, done)
+        # Normalized, because that is what will actually be loaded: "cb:vpn"
+        # and a search term have to be judged as the addresses they become.
+        self._admit(go, done, normalize(url))
 
     @needs_tab
     def api_navigate(self, tab, url, wait, done):
@@ -2823,7 +2994,7 @@ class Browser(Gtk.Window):
             perf.load_url(tab.view, normalize(url))
             self._await_load(tab, wait, done)
 
-        self._admit(go, done)
+        self._admit(go, done, normalize(url))
 
     @needs_tab
     def api_history(self, tab, direction, wait, done):
@@ -3206,6 +3377,12 @@ class Browser(Gtk.Window):
             # The panel's selector is the other place this is visible; leaving it
             # on the old persona makes the setting look like it did not take.
             self.persona_combo.set_active_id(personas.current())
+        elif knob.key == vpn.SETTING:
+            # The switch on cb:settings is the same switch as the menu entry,
+            # so it has to do the same work -- writing the line and leaving the
+            # window unproxied would be a setting that only takes effect next
+            # launch while claiming to apply now.
+            self._vpn_set(vpn.enabled())
         elif knob.key == "CB_THEME":
             wanted = settings.effective(knob)[0]
             self.theme = self._theme_for(wanted)
@@ -3213,6 +3390,333 @@ class Browser(Gtk.Window):
             # The Claude panel is not re-themed: it is a loaded document, and
             # reloading it would throw away the conversation in it. cb:settings
             # says so rather than letting it look like a rendering bug.
+
+    # -- VPN Mode -----------------------------------------------------------
+    # The policy is in vpn.py, which is GTK-free and therefore testable. What
+    # lives here is the half that has to touch WebKit: applying the proxy to the
+    # context and to every private tab's own session, closing the leaks a proxy
+    # cannot close, running the exit check off the main loop, and refusing to
+    # load anything once it has failed.
+    #
+    # Everything below moves the mode in exactly one direction at a time, and
+    # nothing but `_vpn_disengage` ever reaches `off`. That is the property the
+    # feature is worth having for: a failure that quietly resumed loading pages
+    # from the user's own address would be worse than no VPN Mode at all,
+    # because the indicator would still say it was working.
+
+    def toggle_vpn(self):
+        """The menu entry, Ctrl+Alt+V, and the pill's other half.
+
+        Writes the preference first, then acts on it, so the state of the window
+        and the state of the settings file cannot disagree. A settings file that
+        cannot be written is reported and the toggle still happens -- refusing
+        to change the mode because a preference could not be saved would be the
+        wrong half to give up.
+        """
+        wanted = not vpn.STATE.engaged
+        try:
+            settings.apply(vpn.SETTING, "1" if wanted else "0")
+        except (OSError, ValueError) as e:
+            self._flash("VPN Mode changed, but not saved: %s" % e)
+        self._vpn_set(wanted)
+
+    def _vpn_action(self, name):
+        """One button on cb:vpn. `check` re-runs the whole engage, because
+        re-applying the proxy and re-proving it is what "check" has to mean --
+        a check that only re-read a cached answer would be theatre."""
+        if name == "off":
+            return self._vpn_set(False)
+        if name in ("on", "check"):
+            return self._vpn_set(True)
+
+    def _vpn_set(self, wanted, then=None):
+        if wanted:
+            return self._vpn_engage(then)
+        return self._vpn_disengage(then)
+
+    def _vpn_engage(self, then=None):
+        """Apply the proxy everywhere, then go and prove it from outside.
+
+        The order matters. The proxy is on the context and on every private
+        session *before* the check runs, so the window is never in a state where
+        it believes it is proxied and is not. The reverse -- check first, apply
+        after -- would leave a gap in which a page load went direct, which is
+        the entire failure this is guarding against.
+        """
+        proxy, error = vpn.configured()
+        if proxy is None:
+            return self._vpn_refuse(error, then)
+        if not proxy.tunnels:
+            return self._vpn_refuse(
+                "VPN Mode needs an http:// proxy. WebKit would accept %s://, "
+                "but the exit check and the Claude API tunnel are both an HTTP "
+                "CONNECT, so the mode could not be verified and Claude would "
+                "have to be refused -- and \"on, unverified\" is the one state "
+                "this must not have." % proxy.scheme, then)
+
+        attempt = vpn.STATE.engage(proxy)
+        # Every pooled socket to Anthropic was opened on the old route. They are
+        # already unusable (ai keys the pool on the route), but leaving a live
+        # connection from the user's own address parked open after they asked
+        # for it not to be is not a thing to do on a technicality.
+        ai.reset_transport()
+        try:
+            _route_through_vpn(self.context)
+            for tab in self.tabs:
+                if tab.private:
+                    _route_through_vpn(tab.view.get_website_data_manager())
+        except Exception as e:
+            return self._vpn_verdict(attempt, None, "", proxy.redact(e), then)
+
+        for tab in self.tabs:
+            self._vpn_harden(tab)
+        self._vpn_paint()
+        self._reload_internal()
+        self._vpn_probe(attempt, proxy, then)
+
+    def _vpn_disengage(self, then=None):
+        """Turn the mode off. The only path back to `off`, and it is a person's.
+
+        Restoring the default proxy is a failure path's opposite: it happens
+        because someone asked for it, never because something broke.
+        """
+        vpn.STATE.disengage()
+        ai.reset_transport()
+        for target in [self.context] + [t.view.get_website_data_manager()
+                                        for t in self.tabs if t.private]:
+            try:
+                storage.clear_proxy(target)
+            except Exception as e:
+                # Best-effort in this direction only: a session left on the
+                # proxy after the mode is off is a nuisance, not a leak.
+                print("vpn: could not restore the default proxy (%s)" % e,
+                      flush=True)
+        for tab in self.tabs:
+            self._vpn_relax(tab)
+        self._vpn_paint()
+        self._reload_internal()
+        self._flash("VPN Mode off")
+        if then:
+            then(vpn.snapshot())
+
+    def _vpn_refuse(self, reason, then=None):
+        """The mode was asked for and cannot start at all. Fails, never off."""
+        vpn.STATE.refuse(reason)
+        self._vpn_paint()
+        self._reload_internal()
+        self._flash("VPN Mode failed")
+        if then:
+            then(vpn.snapshot())
+
+    def _vpn_broke(self, reason):
+        """Something that should have been behind the proxy was not.
+
+        Called from the tab path, where there is no `then` and no caller to
+        answer -- the whole mode goes to failed and the next navigation is
+        refused with the reason on cb:vpn.
+        """
+        if vpn.STATE.fail(vpn.STATE.attempt, reason):
+            self._vpn_paint()
+            self._flash("VPN Mode failed")
+
+    def _vpn_probe(self, attempt, proxy, then=None):
+        """Ask an outside service, through the proxy, what address it sees.
+
+        On a worker thread, always: this is up to three TLS handshakes over a
+        network hop, and running it on the main loop would freeze the window for
+        exactly as long as a broken proxy takes to not answer. The verdict comes
+        back through GLib.idle_add -- the same bridge control.on_main_loop uses
+        in the other direction, and the only way a thread may reach GTK here.
+        """
+        import threading
+
+        def landed(fn):
+            GLib.idle_add(lambda: (fn(), GLib.SOURCE_REMOVE)[1])
+
+        def work():
+            try:
+                exit_ip, service = vpn.probe_exit_ip(proxy)
+            except Exception as e:
+                reason = proxy.redact(str(e) or type(e).__name__)
+                landed(lambda: self._vpn_verdict(attempt, None, "", reason, then))
+            else:
+                landed(lambda: self._vpn_verdict(attempt, exit_ip, service, "",
+                                                 then))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _vpn_verdict(self, attempt, exit_ip, service, reason, then=None):
+        """What the exit check found, back on the main loop.
+
+        `then` is called whether or not the result was still wanted, because it
+        belongs to one API request and that request needs exactly one answer.
+        The *state* is only moved when the attempt token still matches -- a
+        check started before the user toggled the mode must not report on a
+        proxy that is no longer the one in use.
+        """
+        if exit_ip:
+            moved = vpn.STATE.verified(attempt, exit_ip, service)
+            note = "VPN Mode on — the world sees %s" % exit_ip
+        else:
+            moved = vpn.STATE.fail(
+                attempt, "the exit check did not get an address back: %s" % reason)
+            note = "VPN Mode failed — the exit could not be verified"
+        if moved:
+            self._vpn_paint()
+            self._reload_internal()
+            self._flash(note)
+        if then:
+            then(vpn.snapshot())
+
+    def _vpn_harden(self, tab):
+        """Close the leaks a proxy cannot close, on one view.
+
+        The previous values are kept so turning the mode off restores what was
+        there rather than what this file believes the defaults to be. A build
+        without one of the properties simply does not get that one: there is
+        nothing to fall back to, and refusing to start VPN Mode over a missing
+        WebKit setting would trade a real protection for a smaller one.
+        """
+        if tab.vpn_saved is not None:
+            return                        # already hardened; do not re-save
+        view_settings = tab.view.get_settings()
+        saved = {}
+        for name, value in VPN_VIEW_SETTINGS.items():
+            try:
+                saved[name] = view_settings.get_property(name)
+                view_settings.set_property(name, value)
+            except (TypeError, AttributeError):
+                saved.pop(name, None)
+        tab.vpn_saved = saved
+
+    def _vpn_relax(self, tab):
+        if tab.vpn_saved is None:
+            return
+        view_settings = tab.view.get_settings()
+        for name, value in tab.vpn_saved.items():
+            try:
+                view_settings.set_property(name, value)
+            except (TypeError, AttributeError):
+                pass
+        tab.vpn_saved = None
+
+    def _vpn_paint(self):
+        """The pill. Off is invisible; the other three each look different."""
+        state = vpn.STATE
+        ctx = self.vpn_pill.get_style_context()
+        for name in ("wait", "bad"):
+            ctx.remove_class(name)
+        if not state.engaged:
+            return self.vpn_pill.hide()
+
+        if state.mode == vpn.ON:
+            # The address, not the word "on". A mode that says "on" is asking
+            # to be believed; one that shows the address an outside service
+            # reported is showing its work.
+            self.vpn_pill.set_label("VPN %s" % (state.exit_ip or "on"))
+            self.vpn_pill.set_tooltip_text(
+                "VPN Mode: pages and Claude requests go through %s, and an "
+                "outside service reached through it reported %s. It does not "
+                "cover other applications or WebRTC — open cb:vpn."
+                % (state.proxy.safe() if state.proxy else "the proxy",
+                   state.exit_ip))
+        elif state.mode == vpn.CONNECTING:
+            ctx.add_class("wait")
+            self.vpn_pill.set_label("VPN …")
+            self.vpn_pill.set_tooltip_text(
+                "VPN Mode: the proxy is applied and the browser is checking "
+                "what the outside world sees before it will say it is on.")
+        else:
+            ctx.add_class("bad")
+            self.vpn_pill.set_label("VPN FAILED")
+            self.vpn_pill.set_tooltip_text(
+                "VPN Mode failed: %s\n\nPage loads are refused rather than "
+                "sent from this machine's own address. Open cb:vpn."
+                % (state.reason or "no reason recorded"))
+        self.vpn_pill.show()
+
+    def _on_policy(self, _view, decision, kind, tab):
+        """Refuse a navigation while VPN Mode is failed.
+
+        WebKit's own funnel, which is why it is here rather than at the six
+        Python call sites that start a load: a link click, a redirect and a
+        back/forward all arrive through this signal and through nothing else
+        the browser owns.
+
+        `ignore()` and not a re-issued request. CLAUDE.md's warning about
+        decide-policy is about re-issuing a load with `load_request`, which
+        drops the Referer and turns a form POST into a GET; refusing outright
+        has none of that, because nothing is sent at all.
+        """
+        if not vpn.STATE.blocks_navigation:
+            return False
+        if kind not in (WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+                        WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION):
+            # A response or a subresource: whatever it belongs to was already
+            # allowed, and there is nowhere useful to put a message.
+            return False
+        try:
+            uri = decision.get_navigation_action().get_request().get_uri() or ""
+        except Exception:
+            return False
+        if uri.lower().startswith(VPN_LOCAL_SCHEMES):
+            return False
+
+        decision.ignore()
+        self._flash("VPN Mode failed — that page was not loaded")
+        current = (tab.view.get_uri() or "").lower()
+        if not current.startswith("cb:vpn"):
+            # From an idle, not from inside the decision: starting a load while
+            # WebKit is still deciding about another one is how you get a
+            # navigation that half-happens. cb: is on the allowed list above, so
+            # this cannot recurse.
+            GLib.idle_add(lambda: (tab.view.load_uri("cb:vpn"),
+                                   GLib.SOURCE_REMOVE)[1])
+        return True
+
+    def api_vpn(self, action, done):
+        """Report VPN Mode, or turn it on or off.
+
+        Shaped like api_persona and api_settings: no action is a read, which is
+        what lets one op serve `cbctl vpn` and `cbctl vpn on`. Turning it on
+        does not answer until the exit check has a verdict -- the whole value of
+        this op to a script is the address the outside world actually reported,
+        and "connecting, poll me" would push that work onto every caller.
+        """
+        name = (action or "").strip().lower()
+        if name in ("", "status", "state"):
+            return done({"ok": True, **vpn.snapshot()})
+        if name not in ("on", "off", "check"):
+            return done({"ok": False, "error": "vpn takes on, off or check "
+                                               "(or nothing, to report)",
+                         **vpn.snapshot()})
+        if name == "check" and not vpn.STATE.engaged:
+            return done({"ok": False, "error": "VPN Mode is off; there is "
+                                               "nothing to check", **vpn.snapshot()})
+
+        note = ""
+        if name in ("on", "off"):
+            # Persisted for the same reason the menu toggle persists it: this is
+            # the user's preference about their browser, not a per-run flag.
+            # A file that cannot be written is reported and the mode changes
+            # anyway -- `vpn off` in particular has to work on a read-only home
+            # directory, because "you cannot turn this off" is the worst answer
+            # this op could give.
+            try:
+                settings.apply(vpn.SETTING, "1" if name == "on" else "0")
+            except (OSError, ValueError) as e:
+                note = ("this window changed, but the preference was not saved "
+                        "(%s)" % e)
+
+        def landed(state):
+            payload = {"ok": state.get("mode") != vpn.FAILED, **state}
+            if note:
+                payload["note"] = note
+            if not payload["ok"]:
+                payload["error"] = state.get("reason") or "VPN Mode failed"
+            done(payload)
+
+        self._vpn_set(name != "off", landed)
 
     # -- playbooks ----------------------------------------------------------
     # Recording happens in control.py, at the one point every API-initiated

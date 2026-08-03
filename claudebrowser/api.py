@@ -324,6 +324,27 @@ OPS = [
        call=lambda c, a: ("api_persona", (a.get("name"),)),
        tab=False, mcp=False),
 
+    # Not an MCP tool, for the same reason `settings` is not, and the reason is
+    # sharper here: this op decides whether the browser's traffic -- including
+    # the agent's own requests to Anthropic -- leaves from the user's address
+    # or from their exit host. An agent that can turn it off can deanonymize
+    # the person driving it in pursuit of some unrelated goal, and one that can
+    # turn it on can block every load it was asked to make. Neither belongs in
+    # a tool list. `cbctl vpn` is one command away for a person who means it.
+    #
+    # Generous timeout: turning it on ends with an external HTTPS fetch through
+    # the proxy, run three services deep before it gives up, and the op does not
+    # answer until that verdict is in -- reporting "connecting" and leaving the
+    # caller to poll would be a worse API for the one caller it has.
+    Op("vpn", "/vpn", "POST",
+       "Report VPN Mode, or turn it on or off. On, the browser's page loads and "
+       "its Claude API calls go through the configured proxy and the answer "
+       "carries the exit address an outside service actually saw.",
+       params=[Param("action", cli="optarg",
+                     help="on, off, check; omit to report the current state.")],
+       call=lambda c, a: ("api_vpn", (a.get("action"),)),
+       tab=False, mcp=False, timeout=90),
+
     # Not an MCP tool, and for a stronger version of the reason `persona` is
     # not: these are the user's own preferences about their browser, several of
     # them decide what is sent to Anthropic and what is stripped first, and one

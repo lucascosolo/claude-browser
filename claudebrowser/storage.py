@@ -167,6 +167,39 @@ def child_is_private(opener_private, requested=False):
     return bool(opener_private or requested)
 
 
+def apply_proxy(target, uri, ignore_hosts):
+    """Route everything `target` fetches through the proxy at `uri`.
+
+    `target` is a WebContext *or* a WebsiteDataManager -- both carry
+    `set_network_proxy_settings` with the same signature, and both have to be
+    told. The context covers the ordinary tabs that share its session; a
+    private tab has an ephemeral manager of its own, and a manager that was
+    never told about the proxy resolves and connects on its own behalf. Setting
+    only the context is therefore not "mostly right", it is VPN Mode with a
+    hole in it shaped exactly like the other privacy feature.
+
+    `uri` embeds the proxy's credentials -- NetworkProxySettings takes them no
+    other way in the 4.1 API -- so it is a secret, and nothing here prints it.
+
+    Exceptions are deliberately not swallowed. Every other WebKit call in this
+    file falls back to a working browser on failure, because losing cookies is
+    better than losing the window. This one is the opposite: a proxy that did
+    not apply and looks as if it did is the single failure VPN Mode exists to
+    prevent, so the caller has to see it and go to `failed`.
+    """
+    settings = WebKit2.NetworkProxySettings.new(uri, list(ignore_hosts))
+    target.set_network_proxy_settings(WebKit2.NetworkProxyMode.CUSTOM, settings)
+
+
+def clear_proxy(target):
+    """Put `target` back on the system's own proxy configuration.
+
+    Only ever called because a person turned VPN Mode off. Nothing on a failure
+    path reaches this -- see the note in vpn.py about never falling back.
+    """
+    target.set_network_proxy_settings(WebKit2.NetworkProxyMode.DEFAULT, None)
+
+
 def apply_policy(manager, persist=True):
     """Everything this browser decides about one WebsiteDataManager.
 

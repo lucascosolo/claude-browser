@@ -30,7 +30,8 @@ EVERY_KEY = (
     "CB_AUTH", "CB_AUTOSTART", "CB_BLOCK", "CB_COOKIES", "CB_GPU", "CB_HOME",
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
     "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
-    "CB_SCRUB", "CB_SEARCH", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_WEBGL",
+    "CB_SCRUB", "CB_SEARCH", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_VPN",
+    "CB_VPN_PROXY", "CB_WEBGL",
 )
 
 
@@ -93,7 +94,12 @@ class TestTable(Isolated):
                 # Both read at the moment they are consulted -- ai.private_ai_-
                 # enabled when a Claude feature is handed a tab, and
                 # storage.private_downloads_enabled when a download starts.
-                "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS"}
+                "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
+                # The window applies CB_VPN the moment it changes, the way it
+                # re-applies CB_THEME; CB_VPN_PROXY is read out of the file
+                # every time the mode is engaged, so correcting it and toggling
+                # is enough.
+                "CB_VPN", "CB_VPN_PROXY"}
         for knob in settings.SETTINGS:
             immediate = "restart" not in knob.effect.lower()
             self.assertEqual(immediate, knob.key in live,
@@ -359,15 +365,40 @@ class TestSecrets(Isolated):
         self.path.write_text("CB_TOKEN=hunter2\n")
         self.assertIn('type="password" value=""', self.render())
 
-    def test_the_api_key_is_not_a_setting_here(self):
-        """It lives in the same file, and envfile refuses to write it. Offering
-        a field would be the first step towards weakening that."""
+    def test_no_secret_is_writable_from_here(self):
+        """Every key envfile calls a secret is refused by this table too.
+
+        The API key is not in the table at all. CB_VPN_PROXY is -- it is a
+        genuine setting a user needs to see the state of -- but it is there as
+        a report, not as a control: it holds the proxy's password, so `apply`
+        and `reset` both refuse it before envfile gets the chance to.
+        """
+        self.assertNotIn("ANTHROPIC_API_KEY", settings.BY_KEY)
         for key in envfile.SECRET_KEYS:
-            self.assertNotIn(key, settings.BY_KEY)
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError, msg=key):
                 self.apply(key, "sk-ant-nope")
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError, msg=key):
                 self.reset(key)
+            knob = settings.BY_KEY.get(key)
+            if knob is not None:
+                self.assertFalse(knob.writable, key)
+                self.assertTrue(knob.unwritable_note.strip(), key)
+
+    def test_the_proxy_address_is_reported_but_never_rendered(self):
+        """cb:vpn and cb:settings both need to say whether one is configured.
+        Neither may say what it is: the password is inside the URL."""
+        self.path.write_text(
+            "CB_VPN_PROXY=http://cb:hunter2@10.0.0.1:8888\n")
+        block = self.item("CB_VPN_PROXY")
+        self.assertTrue(block["set"])
+        self.assertNotIn("value", block)
+        self.assertNotIn("hunter2", repr(self.described()))
+        page = self.render()
+        self.assertNotIn("hunter2", page)
+        self.assertNotIn("10.0.0.1", page)
+        # And no control at all -- a Save button wired to a call that always
+        # fails is worse than no button.
+        self.assertNotIn('data-k="CB_VPN_PROXY"', page)
 
     def test_an_api_key_in_the_file_never_reaches_the_page(self):
         self.path.write_text("ANTHROPIC_API_KEY=sk-ant-secret\nCB_BLOCK=0\n")

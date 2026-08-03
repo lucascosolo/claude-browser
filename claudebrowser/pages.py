@@ -296,6 +296,148 @@ def private_page(palette, nonce):
     return shell("Private tab", palette, nonce, "cb:private", body)
 
 
+#: What VPN Mode actually carries, and what it does not. Written as two lists
+#: for the same reason cb:private is: the second one is the honest half, and a
+#: page that only has the first is marketing. "VPN Mode" is the label the user
+#: asked for; every line here exists so the label cannot be read as a promise
+#: the feature does not keep.
+VPN_COVERS = (
+    ("Pages this browser loads", "every request WebKit makes for a page, its "
+     "subresources and its XHRs, in ordinary and private tabs alike."),
+    ("Questions you ask Claude", "the panel, TL;DR, Research and the Ctrl+G "
+     "agent reach api.anthropic.com through the same proxy, by an HTTP "
+     "CONNECT tunnel."),
+    ("The address bar stays quiet", "no name is resolved locally to warm a "
+     "connection while the mode is on, because that lookup would leave from "
+     "here rather than through the tunnel."),
+    ("WebRTC is switched off", "it reads the machine's own addresses and hands "
+     "them to the page over UDP, which no TCP tunnel can carry. Off is the "
+     "only answer, and it means video calls in this browser will not work."),
+)
+
+VPN_NOT = (
+    ("It is not a VPN", "it is an HTTP proxy with an exit on a machine you "
+     "run. Nothing outside this browser goes through it — not your mail "
+     "client, not your package manager, not anything else on this computer."),
+    ("It is best-effort, not a kill switch", "a compromised page, or a WebKit "
+     "subprocess that ignores the proxy setting, can still open a socket of "
+     "its own. Only an operating-system egress rule can actually guarantee "
+     "this, and that is not what this is."),
+    ("It only carries TCP", "the proxy speaks HTTP and CONNECT. Anything a "
+     "page tries over UDP — WebRTC media above all — is not proxied, which is "
+     "why WebRTC is turned off instead."),
+    ("You are not anonymous", "one exit address, used by one person. It "
+     "defeats a site logging your home address; it does not defeat anyone who "
+     "can see both ends."),
+    ("The exit host sees everything you do", "plaintext HTTP through it is "
+     "readable there, and whoever runs that machine could start writing it "
+     "down at any time. Trust in it is total."),
+    ("Local addresses stop working", "only loopback bypasses the proxy. A "
+     "device on your own network fails to load rather than quietly going "
+     "around the tunnel."),
+)
+
+#: How each state reads on the page, and which tone it takes. `bad` is the
+#: failed row: it is the only one that means the browser has stopped loading
+#: pages, so it is the only one painted as a warning.
+_VPN_STATES = {
+    "off": ("Off", "", "Traffic leaves from this machine's own address."),
+    # Connecting takes the plain accent band: the proxy is applied and traffic
+    # is covered, so it is neither a success to announce nor a problem.
+    "connecting": ("Connecting", "",
+                   "The proxy is applied. Checking what the outside world "
+                   "sees before calling it on."),
+    "on": ("On", "good", "Verified end to end: an outside service, asked "
+                         "through the proxy, reported the address below."),
+    "failed": ("Failed", "bad",
+               "New page loads are blocked. VPN Mode does not fall back to "
+               "loading them from your own address — turn it off if that is "
+               "what you want."),
+}
+
+
+def vpn_page(palette, nonce, state):
+    """cb:vpn -- where the mode is, what the world sees, and what it is not.
+
+    The observed exit address is the point of the page. A mode that reports
+    "on" from a local check is reporting that a proxy answered, which is not
+    the question anybody has; this page only ever shows an address that came
+    back from outside, through the tunnel, along with which service said it.
+    """
+    mode = state.get("mode") or "off"
+    label, tone, blurb = _VPN_STATES.get(mode, _VPN_STATES["off"])
+
+    facts = [_fact("State", label)]
+    if state.get("exit_ip"):
+        facts.append(_fact("Address the world sees", state["exit_ip"]))
+        if state.get("service"):
+            facts.append(_fact("Confirmed by", state["service"]))
+    facts.append(_fact("Proxy", state.get("proxy") or "not configured"))
+    facts.append(_fact("Never proxied",
+                       ", ".join(state.get("ignore_hosts") or ["—"])))
+
+    # The blurb is a notice for every state but `off`, because in every one of
+    # those the browser is doing something to the user's traffic and saying so
+    # in body text would be burying it. The tone comes from _VPN_STATES rather
+    # than from a branch here, so the three bands stay one table away from each
+    # other and a fourth state cannot be added without picking one.
+    said = _e(blurb)
+    if state.get("reason"):
+        said += " " + _e(state["reason"])
+    blurb_html = ('<p class="note">%s</p>' % said if mode == "off"
+                  else '<div class="notice %s">%s</div>' % (tone, said))
+
+    wanted = "off" if mode != "off" else "on"
+    buttons = ('<button class="pbbtn%(cls)s" onclick="return cbui.send('
+               '{action:%(act)s})">%(text)s</button>'
+               % {"cls": " on" if mode != "off" else "",
+                  "act": _js("vpn_" + wanted),
+                  "text": _e("Turn VPN Mode off" if mode != "off"
+                             else "Turn VPN Mode on")})
+    if mode != "off":
+        buttons += ('<button class="pbbtn" onclick="return cbui.send('
+                    '{action:%s})">Check the exit again</button>'
+                    % _js("vpn_check"))
+
+    def rows(items):
+        return "".join('<p class="note"><b>%s</b> &mdash; %s</p>'
+                       % (_e(head), _e(rest)) for head, rest in items)
+
+    body = """
+      <section>
+        <h2>Status</h2>
+        %(blurb)s
+        <div class="rows">%(facts)s
+          <div class="row set"><span class="sl"><span class="rt">%(label)s</span></span>
+          <span class="sc">%(buttons)s</span></div>
+        </div>
+      </section>
+      <section>
+        <h2>What goes through it</h2>
+        %(covers)s
+      </section>
+      <section>
+        <h2>What it is not</h2>
+        %(not)s
+      </section>
+      <p class="note">%(config)s</p>
+    """ % {
+        "blurb": blurb_html,
+        "label": _e("VPN Mode"),
+        "facts": "".join(facts),
+        "buttons": buttons,
+        "covers": rows(VPN_COVERS),
+        "not": rows(VPN_NOT),
+        "config": _e(
+            "The proxy address goes in the settings file as "
+            "CB_VPN_PROXY=http://user:password@host:port. It holds a password, "
+            "so the browser will not write it for you — the same rule the API "
+            "key follows. Only http:// works: the exit check and the Claude "
+            "API tunnel are both an HTTP CONNECT."),
+    }
+    return shell("VPN Mode", palette, nonce, "cb:vpn", body)
+
+
 def _snippet_html(text):
     """Render an FTS5 snippet, with its matched terms marked up.
 
@@ -758,6 +900,13 @@ def settings_page(palette, nonce, described, notice=None):
 def _setting_row(item):
     """One setting: what it is, when a change lands, and the control for it."""
     kind = item.get("kind")
+    # A setting the browser refuses to write gets no control at all, rather
+    # than a Save button wired to a call that always fails. It still gets a row:
+    # its value is part of how the browser is configured, and a reader who
+    # cannot see it here goes looking for a knob that does not exist.
+    if not item.get("writable", True):
+        return _set_readonly(item)
+
     control = {
         "bool": _set_toggle,
         "choice": _set_select,
@@ -796,6 +945,41 @@ def _setting_row(item):
                    ) if item.get("source") == "environment" else "",
         "control": control,
         "reset": reset,
+    }
+
+
+def _set_readonly(item):
+    """A setting shown but not offered.
+
+    Says three things and no more: whether it is set, that this page will not
+    write it, and why. The value itself is never rendered -- the only setting
+    that comes through here is a credential, which is the whole reason it is
+    not writable.
+    """
+    if item.get("kind") == "secret":
+        state = "set" if item.get("set") else "not set"
+    else:
+        state = str(item.get("value") or item.get("default") or "")
+    # The "why" line sits inside the label column rather than beside the value:
+    # `.row.set` is a two-column flex box that wraps, and a third child would
+    # drop onto a line of its own at every width.
+    return """
+    <div class="row set">
+      <span class="sl">
+        <span class="rt">%(label)s</span>
+        <span class="sx">%(explain)s</span>
+        <span class="sx"><b>%(why)s</b></span>
+        <span class="eff" title="%(note)s">%(effect)s</span>
+      </span>
+      <span class="sc"><span class="ru">%(state)s</span></span>
+    </div>""" % {
+        "label": _e(item.get("label") or item.get("key") or ""),
+        "explain": _e(item.get("explain") or ""),
+        "effect": _e(item.get("effect") or ""),
+        "note": _e(item.get("effect_note") or ""),
+        "state": _e(state),
+        "why": _e(item.get("unwritable_note") or
+                  "This one is edited in the settings file by hand."),
     }
 
 
@@ -1226,6 +1410,12 @@ h2 .more:hover { text-decoration:underline; }
           border-radius:10px; padding:10px 13px; margin:0 0 20px;
           font-size:12.5px; line-height:1.5; }
 .notice.bad { border-color:var(--warn); }
+/* A notice that is reporting success rather than asking for attention. Only
+   cb:vpn uses it, and it exists because "verified end to end" rendered in the
+   accent band read as an alert -- the one thing a working tunnel must not
+   look like. Border only: the soft fill is what makes the row a band, and a
+   green band would be shouting in the other direction. */
+.notice.good { border-color:var(--ok); }
 
 .empty { text-align:center; color:var(--dim); padding:44px 16px; grid-column:1/-1; }
 .ei { font-size:26px; opacity:.5; margin-bottom:8px; }
