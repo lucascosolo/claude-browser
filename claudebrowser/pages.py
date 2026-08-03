@@ -42,6 +42,12 @@ NAV = (
      "M12 3c4.97 0 9 1.34 9 3s-4.03 3-9 3-9-1.34-9-3 4.03-3 9-3zM3 9c0 1.66 4.03 3 9 3"
      "s9-1.34 9-3v4c0 1.66-4.03 3-9 3s-9-1.34-9-3zm0 6c0 1.66 4.03 3 9 3s9-1.34 9-3v4"
      "c0 1.66-4.03 3-9 3s-9-1.34-9-3z"),
+    # Sliders rather than a gear: the rail is 19px of stroke, and a gear's teeth
+    # disappear at that size into a grey blob.
+    ("cb:settings", "Settings",
+     "M3 8h6.5M15 8h6M3 16h9.5M18 16h3"
+     "M14.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0"
+     "M17.5 16a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0"),
 )
 
 
@@ -629,6 +635,156 @@ def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None,
     return shell("Data", palette, nonce, "cb:data", body)
 
 
+def settings_page(palette, nonce, described, notice=None):
+    """Every setting in the browser, editable.
+
+    The page renders what `settings.describe()` hands it and knows nothing else
+    about any particular key: a knob added to that table appears here with its
+    own control, its own explanation and its own honest note about when it
+    lands, with nothing to remember on this side.
+
+    Values are treated as hostile text throughout. Most of them are, in the
+    ordinary case, typed by the user -- but the settings file is also editable
+    by hand and by anything else running as this user, and a search template of
+    `"><script>` reaching this document unescaped would be script running in a
+    page that holds the message nonce.
+    """
+    banner = ""
+    if notice:
+        banner = ('<div class="notice %s">%s</div>'
+                  % ("bad" if notice.get("error") else "",
+                     _e(notice.get("error") or notice.get("message") or "")))
+
+    chunks = [banner]
+    for section in described.get("sections") or []:
+        rows = "".join(_setting_row(item) for item in section.get("settings") or [])
+        chunks.append("""
+      <section>
+        <h2>%(title)s</h2>
+        <p class="note">%(note)s</p>
+        <div class="rows">%(rows)s</div>
+      </section>""" % {"title": _e(section.get("title") or ""),
+                       "note": _e(section.get("note") or ""),
+                       "rows": rows})
+
+    chunks.append(
+        '<p class="note">%s <code>%s</code>. %s</p>'
+        % (_e("Every one of these is a line in"), _e(described.get("path") or ""),
+           _e("Editing that file by hand does the same thing, and your API key "
+              "lives there too — it is deliberately not editable from here.")))
+    return shell("Settings", palette, nonce, "cb:settings", "".join(chunks))
+
+
+def _setting_row(item):
+    """One setting: what it is, when a change lands, and the control for it."""
+    kind = item.get("kind")
+    control = {
+        "bool": _set_toggle,
+        "choice": _set_select,
+        "secret": _set_secret,
+    }.get(kind, _set_input)(item)
+
+    # Offered only when there is a line to remove. A "Default" button on a
+    # setting that is already the default does nothing, and a button that does
+    # nothing is one people stop trusting.
+    reset = ""
+    if item.get("in_file"):
+        reset = ('<button class="pbbtn" title="%s" onclick="return cbui.setreset(event, %s)"'
+                 '>Default</button>'
+                 % (_e("Remove the line and go back to the browser's default"),
+                    _js(item.get("key") or "")))
+
+    return """
+    <div class="row set">
+      <span class="sl">
+        <span class="rt">%(label)s</span>
+        <span class="sx">%(explain)s</span>
+        <span class="eff" title="%(note)s">%(effect)s</span>%(source)s
+      </span>
+      <span class="sc">%(control)s%(reset)s</span>
+    </div>""" % {
+        "label": _e(item.get("label") or item.get("key") or ""),
+        "explain": _e(item.get("explain") or ""),
+        "effect": _e(item.get("effect") or ""),
+        "note": _e(item.get("effect_note") or ""),
+        # Named because it changes what "Default" means: a value inherited from
+        # the environment survives the line being removed, and a user who does
+        # not know that reads the button as broken.
+        "source": ('<span class="eff env" title="%s">from your environment</span>'
+                   % _e("This browser was launched by a shell that exported it. "
+                        "Setting it here writes the settings file, which wins.")
+                   ) if item.get("source") == "environment" else "",
+        "control": control,
+        "reset": reset,
+    }
+
+
+def _set_toggle(item):
+    """A boolean. Posts the state it wants rather than a flip, for the reason
+    `_light_button` does: a page left open while the value changed elsewhere
+    would otherwise toggle against something it is no longer showing."""
+    on = bool(item.get("on"))
+    return ('<button class="pbbtn%(cls)s" onclick="return cbui.setting(event, %(key)s, %(want)s)"'
+            ' title="%(tip)s">%(text)s</button>'
+            % {"cls": " on" if on else "",
+               "key": _js(item.get("key") or ""),
+               "want": _js("0" if on else "1"),
+               "tip": _e("Turn it off" if on else "Turn it on"),
+               "text": "On" if on else "Off"})
+
+
+def _set_select(item):
+    options = "".join(
+        '<option value="%s"%s>%s</option>'
+        % (_e(choice.get("value")),
+           " selected" if choice.get("value") == item.get("value") else "",
+           _e(choice.get("label")))
+        for choice in item.get("choices") or [])
+    return ('<select class="sin pick" onchange="return cbui.setpick(event, %s)">%s</select>'
+            % (_js(item.get("key") or ""), options))
+
+
+def _set_input(item):
+    """A number or a free-text value, with its own Save button.
+
+    Not saved on every keystroke: each save is a rewrite of the user's settings
+    file, and a half-typed URL is a value the validator would rightly refuse
+    four times per word.
+    """
+    number = item.get("kind") == "number"
+    attrs = ""
+    if number:
+        for name, key in (("min", "minimum"), ("max", "maximum"), ("step", "step")):
+            if item.get(key) is not None:
+                attrs += ' %s="%s"' % (name, _e(item.get(key)))
+    return ('<input class="sin" type="%(type)s" value="%(value)s"%(attrs)s '
+            'data-k="%(dkey)s" autocomplete="off" spellcheck="false" %(unit)s>'
+            '<button class="pbbtn" onclick="return cbui.setinput(event, %(key)s)">Save</button>'
+            % {"type": "number" if number else "text",
+               "value": _e(item.get("value") or ""),
+               "attrs": attrs,
+               "dkey": _e(item.get("key") or ""),
+               "unit": ('title="%s"' % _e(item.get("unit"))) if item.get("unit") else "",
+               "key": _js(item.get("key") or "")})
+
+
+def _set_secret(item):
+    """The control token. Its value is never in this document.
+
+    The field starts empty whether or not a token is set -- the placeholder is
+    the only thing that says which -- so a new one can be typed without the old
+    one ever having been rendered, and "Default" is how it is cleared.
+    """
+    return ('<input class="sin" type="password" value="" autocomplete="off" '
+            'spellcheck="false" data-k="%(dkey)s" placeholder="%(hint)s">'
+            '<button class="pbbtn" onclick="return cbui.setinput(event, %(key)s)">Save</button>'
+            % {"hint": _e("A token is set — type a new one to replace it"
+                          if item.get("set") else "No token — the API is open to "
+                          "anything on this machine"),
+               "dkey": _e(item.get("key") or ""),
+               "key": _js(item.get("key") or "")})
+
+
 def _light_button(enabled):
     """The on/off switch for the Save-Data hint.
 
@@ -942,6 +1098,34 @@ h2 .more:hover { text-decoration:underline; }
 .note { color:var(--dim); font-size:12px; line-height:1.55; margin:14px 2px 0;
         max-width:62ch; }
 
+/* cb:settings. Two columns that collapse: the explanation is the widest thing
+   on the page and the control the smallest, so the row wraps rather than
+   ellipsizing away the sentence that says what the knob does. */
+.row.set { align-items:flex-start; padding:11px 12px; gap:14px; flex-wrap:wrap; }
+.sl { flex:1 1 340px; min-width:0; display:flex; flex-direction:column; gap:3px; }
+.row.set .rt { max-width:100%%; font-weight:600; white-space:normal; }
+.sx { font-size:11.5px; color:var(--dim); line-height:1.5; }
+.sc { flex:0 0 auto; margin-left:auto; display:flex; align-items:center; gap:6px; }
+.eff { display:inline-block; margin-top:3px; font-size:9.5px; font-weight:700;
+       text-transform:uppercase; letter-spacing:.06em; padding:2px 6px;
+       border-radius:5px; background:var(--panel); color:var(--dim);
+       align-self:flex-start; }
+.eff.env { background:var(--soft); color:var(--accent); margin-left:5px; }
+.sin { background:var(--field); color:var(--text); border:1px solid var(--line);
+       border-radius:8px; padding:6px 10px; font:13px system-ui,sans-serif;
+       min-width:120px; max-width:340px; }
+.sin:focus { outline:none; border-color:var(--accent); }
+.sin.pick { min-width:180px; }
+.pbbtn.on { border-color:var(--accent); color:var(--accent); background:var(--soft); }
+
+/* The one place a refused value is explained. Rendered from the browser, above
+   everything, because the control that was refused has already snapped back to
+   the stored value and would otherwise be the only clue. */
+.notice { border:1px solid var(--accent); background:var(--soft); color:var(--text);
+          border-radius:10px; padding:10px 13px; margin:0 0 20px;
+          font-size:12.5px; line-height:1.5; }
+.notice.bad { border-color:var(--warn); }
+
 .empty { text-align:center; color:var(--dim); padding:44px 16px; grid-column:1/-1; }
 .ei { font-size:26px; opacity:.5; margin-bottom:8px; }
 .eh { font-size:12px; margin-top:5px; opacity:.85; }
@@ -1067,6 +1251,35 @@ _DOC = """<!doctype html>
       }, 4000);
       return false;
     },
+    // cb:settings. Every one of these posts {action, url: key, title: value} --
+    // the message shape is fixed at {action, url, title}, so the key travels as
+    // the url and the value as the title, the way clear_data carries its kind.
+    setting: function (ev, key, value) {
+      ev.preventDefault();
+      return this.send({action: 'set_setting', url: key, title: value});
+    },
+    setpick: function (ev, key) {
+      return this.send({action: 'set_setting', url: key,
+                        title: ev.currentTarget.value});
+    },
+    setinput: function (ev, key) {
+      // The box is found from the element that fired rather than by key, so
+      // nothing here has to build a selector out of a settings name.
+      ev.preventDefault();
+      var el = ev.currentTarget;
+      var box = el.tagName === 'INPUT' ? el : el.parentNode.querySelector('input');
+      if (!box) return false;
+      var value = box.value;
+      // A password field is cleared on the way out: the token has already been
+      // handed over, and leaving it sitting in the DOM is the thing the field
+      // exists to avoid.
+      if (box.type === 'password') { box.value = ''; }
+      return this.send({action: 'set_setting', url: key, title: value});
+    },
+    setreset: function (ev, key) {
+      ev.preventDefault();
+      return this.send({action: 'reset_setting', url: key});
+    },
     confirmData: function (ev, kind, label) {
       // Same two-click arming as confirmClear, and for the same reason: a
       // window.confirm() inside a WebView blocks this embedder's main loop.
@@ -1118,6 +1331,15 @@ _DOC = """<!doctype html>
       if (e.key === 'Enter') { cbui.pbstart(e); }
     });
   }
+
+  // Enter saves the field it was pressed in, which is what anyone who has just
+  // typed a URL into a box expects. The Save button beside it stays, because
+  // the same box is also changed with the arrow keys of a number spinner.
+  document.querySelectorAll('input.sin').forEach(function (box) {
+    box.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { cbui.setinput(e, box.dataset.k); }
+    });
+  });
 
   // Filtering is local: re-rendering from Python on every keystroke would mean
   // a full page load per character. Enter is the exception -- searching the text

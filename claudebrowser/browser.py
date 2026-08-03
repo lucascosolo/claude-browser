@@ -21,7 +21,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  # noqa: E402
                passwords, perf, personas, playbooks, reader, resources, scrub,
-               storage, store, style, tabnames, urls)
+               settings, storage, store, style, tabnames, urls)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -72,10 +72,11 @@ MENU_SECTIONS = (
     )),
     ("Machine", (
         ("drive-harddisk-symbolic", "Cookies & cache", "", "cb:data"),
+        ("preferences-system-symbolic", "Settings", "", "cb:settings"),
     )),
 )
 INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history", "cb:data",
-            "cb:playbooks")
+            "cb:playbooks", "cb:settings")
 # console.* is not exposed to the embedder in webkit2gtk, so we shim it in the
 # page at document-start and read the ring buffer back out with JS later.
 CONSOLE_SHIM = """
@@ -283,9 +284,15 @@ class Browser(Gtk.Window):
         self.set_default_size(1180, 780)
         self.tabs = []
 
-        settings = Gtk.Settings.get_default()
+        gtk_settings = Gtk.Settings.get_default()
+        # Read before _apply_css overwrites it: that call sets the same property,
+        # so this is the only moment the desktop's own preference is still
+        # legible -- and cb:settings offers "follow the desktop" as a choice.
+        self.system_dark = bool(
+            gtk_settings
+            and gtk_settings.get_property("gtk-application-prefer-dark-theme"))
         if dark is None:
-            dark = bool(settings and settings.get_property("gtk-application-prefer-dark-theme"))
+            dark = self.system_dark
         self.dark = dark
         self._apply_css(dark)
 
@@ -296,7 +303,11 @@ class Browser(Gtk.Window):
         # the animations are then no longer whatever the setting says they are --
         # that page reports what was applied, not what would be applied now.
         self.light_at_start = perf.light_enabled()
-        for note in perf.tune_gtk(settings):
+        # A refused setting has to be explained on the page that refused it; the
+        # omnibox flash is gone in a second and a half. Consumed by the next
+        # render of cb:settings, which the write path triggers.
+        self._settings_notice = None
+        for note in perf.tune_gtk(gtk_settings):
             print("perf: %s" % note, flush=True)
 
         # One shared content manager. The console shim runs at document-start,
@@ -415,11 +426,18 @@ class Browser(Gtk.Window):
     # -- construction -------------------------------------------------------
 
     def _apply_css(self, dark):
-        provider = Gtk.CssProvider()
+        # One provider, reloaded. It used to build a new one per call, which was
+        # harmless while this only ran at startup; cb:settings can now re-theme a
+        # running window, and adding a provider per switch leaves every previous
+        # sheet attached to the screen for the life of the process.
+        provider = getattr(self, "_css_provider", None)
+        if provider is None:
+            provider = self._css_provider = Gtk.CssProvider()
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
         provider.load_from_data(style.css(dark))
-        Gtk.StyleContext.add_provider_for_screen(
-            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-        )
         s = Gtk.Settings.get_default()
         if s:
             s.set_property("gtk-application-prefer-dark-theme", dark)
@@ -1105,6 +1123,15 @@ class Browser(Gtk.Window):
                                           "hints": perf.hint_headers(),
                                           "motion": self.light_at_start})
 
+        # Answered before the store check below for the same reason cb:data is:
+        # the settings file has nothing to do with the history database, and a
+        # browser whose database failed to open is exactly when you want to
+        # reach the settings.
+        if name == "settings":
+            notice, self._settings_notice = self._settings_notice, None
+            return pages.settings_page(palette, self.nonce, settings.describe(),
+                                       notice=notice)
+
         if name == "passwords":
             if self.vault is None:
                 return pages.passwords_page(palette, self.nonce, [], available=False)
@@ -1218,6 +1245,12 @@ class Browser(Gtk.Window):
                 self._flash("Lighter pages on — from the next page load"
                             if wanted else "Lighter pages off")
                 self._reload_internal()
+        elif action in ("set_setting", "reset_setting"):
+            # `url` carries the key and `title` the new value, on the same
+            # reasoning as clear_data's kind: the message shape is fixed at
+            # {action, url, title}, and a fourth field would be one every other
+            # sender has to ignore. A reset has no value at all.
+            self._change_setting(url, None if action == "reset_setting" else title)
         elif action.startswith("pb_"):
             # `title` carries the playbook name, for the same reason clear_data
             # puts the kind there: the message shape is fixed at
@@ -2859,6 +2892,86 @@ class Browser(Gtk.Window):
         # the old persona would make the setting look like it had not taken.
         self.persona_combo.set_active_id(key)
         done({"ok": True, **personas.describe()})
+
+    def _change_setting(self, key, value):
+        """One control on cb:settings, answered by the api_* method behind it.
+
+        The same arrangement as _playbook_action: the page gets no write path of
+        its own, so a value refused over the API cannot be one the page quietly
+        accepts. `value` is None for the per-setting reset.
+        """
+        if not key:
+            return          # api_settings reads with no key; a control never does
+
+        def landed(result):
+            result = result if isinstance(result, dict) else {}
+            if result.get("ok"):
+                return self._flash(result.get("note") or "Saved")
+            error = result.get("error") or "that setting could not be changed"
+            # Both, and for different readers: the flash is where the user is
+            # looking, and the notice survives on the page after the flash has
+            # gone -- the control itself has already snapped back to the stored
+            # value, so without it there is nothing left saying why.
+            self._settings_notice = {"error": error}
+            self._flash(error)
+            self._reload_internal()
+
+        self.api_settings(key, value, value is None, landed)
+
+    def api_settings(self, name, value, reset, done):
+        """Report every setting, or change one.
+
+        Shaped like api_persona: no `name` is a read, which is what lets one op
+        serve `cbctl settings` and `cbctl settings CB_THEME dark`. Validation
+        lives in settings.py rather than here, so the page, the HTTP route and
+        the CLI cannot disagree about what a setting accepts.
+
+        Nothing in the answer carries the control token's value -- describe()
+        reports only whether one is set -- so a settings read is not a way to
+        exfiltrate the credential that guards this API.
+        """
+        if not name:
+            return done({"ok": True, **settings.describe()})
+
+        try:
+            knob = settings.get(name)
+            if reset:
+                settings.reset(name)
+            else:
+                settings.apply(name, value)
+        except ValueError as e:
+            return done({"ok": False, "error": str(e), **settings.describe()})
+        except OSError as e:
+            return done({"ok": False,
+                         "error": "could not write the settings file: %s" % e})
+
+        self._settings_took_effect(knob)
+        # Every open cb: page is now showing a stale value -- cb:settings most
+        # of all, but cb:data reports the light-mode switch too.
+        self._reload_internal()
+        done({"ok": True, "setting": name, "effect": knob.effect_note,
+              "note": "%s — %s" % (knob.label, knob.effect.lower()),
+              **settings.describe()})
+
+    def _settings_took_effect(self, knob):
+        """The half of a settings change that can land without a restart.
+
+        Deliberately short. Nothing here reaches into another module to replace
+        a value it captured at import: that would be a second, invisible way for
+        a setting to arrive, and the page would then have to guess which of the
+        two a given key follows. What is here is the surface this window owns.
+        """
+        if knob.key == personas.SETTING:
+            # The panel's selector is the other place this is visible; leaving it
+            # on the old persona makes the setting look like it did not take.
+            self.persona_combo.set_active_id(personas.current())
+        elif knob.key == "CB_THEME":
+            wanted = settings.effective(knob)[0]
+            self.dark = self.system_dark if not wanted else (wanted == "dark")
+            self._apply_css(self.dark)
+            # The Claude panel is not re-themed: it is a loaded document, and
+            # reloading it would throw away the conversation in it. cb:settings
+            # says so rather than letting it look like a rendering bug.
 
     # -- playbooks ----------------------------------------------------------
     # Recording happens in control.py, at the one point every API-initiated

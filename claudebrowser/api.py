@@ -316,6 +316,23 @@ OPS = [
                           "omit to report the current one.")],
        call=lambda c, a: ("api_persona", (a.get("name"),)),
        tab=False, mcp=False),
+
+    # Not an MCP tool, and for a stronger version of the reason `persona` is
+    # not: these are the user's own preferences about their browser, several of
+    # them decide what is sent to Anthropic and what is stripped first, and one
+    # is the token guarding this very API. An agent driving the browser has no
+    # business rewriting the rules it is being driven under.
+    Op("settings", "/settings", "POST",
+       "Report the browser's settings, or change one of them.",
+       params=[Param("name", cli="optarg",
+                     help="Setting key (CB_THEME, CB_BLOCK, ...); omit to "
+                          "report them all."),
+               Param("value", cli="optarg", help="New value."),
+               Param("reset", "boolean", "Remove the line so the built-in "
+                     "default applies again.", cli="opt", default=False)],
+       call=lambda c, a: ("api_settings", (a.get("name"), a.get("value"),
+                                           _truthy(a.get("reset"), False))),
+       tab=False, mcp=False),
 ]
 
 BY_NAME = {op.name: op for op in OPS}
