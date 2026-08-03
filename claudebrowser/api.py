@@ -135,7 +135,8 @@ OPS = [
        call=None, tab=False, mcp=False),
 
     Op("tabs", "/tabs", "GET", "List the browser's open tabs with their ids, "
-       "URLs and titles.",
+       "URLs and titles. A tab dropped to free memory is marked discarded and "
+       "carries a short summary of what it held.",
        call=lambda c, a: ("api_tabs", ()), tab=False),
 
     # Not an MCP tool: raising a window is a launcher's job, and an agent that

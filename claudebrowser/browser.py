@@ -249,7 +249,7 @@ class Tab:
         self.used = time.monotonic()
 
     def info(self):
-        return {
+        out = {
             "id": self.id,
             "url": (self.discarded or {}).get("url") or self.view.get_uri() or "",
             "title": (self.discarded or {}).get("title") or self.view.get_title() or "",
@@ -257,6 +257,11 @@ class Tab:
             "private": self.private,
             "discarded": bool(self.discarded),
         }
+        if self.discarded:
+            # Only on a discarded tab: a live tab's content can be read, so a
+            # summary of it would be a stale copy of something already available.
+            out["summary"] = self.discarded.get("summary") or ""
+        return out
 
 
 class Browser(Gtk.Window):
@@ -1368,9 +1373,8 @@ class Browser(Gtk.Window):
             if getattr(tab, "label", None):
                 tab.label.set_text(name)
                 info = tab.info()
-                tab.label.set_tooltip_text(
-                    info["url"] + ("\nDiscarded to free memory — click to reload"
-                                   if tab.discarded else ""))
+                tab.label.set_tooltip_text(tabnames.tab_tooltip(
+                    info["url"], info["discarded"], info.get("summary", "")))
             if getattr(tab, "label_box", None):
                 # Dimmed rather than badged: a discarded tab is still that tab,
                 # and a row of "zzz" markers would make an invisible optimisation
@@ -1525,16 +1529,53 @@ class Browser(Gtk.Window):
         url = tab.view.get_uri() or ""
         if not url or url.startswith("about:"):
             return False
-        tab.discarded = {"url": url, "title": tab.view.get_title() or ""}
+        tab.discarded = {"url": url, "title": tab.view.get_title() or "",
+                         "summary": ""}
         # Resolve anyone waiting on this tab before the page goes: they asked
         # about a load that is now never going to finish.
         self._settle(tab, {"ok": False, "error": "tab discarded to free memory",
                            **tab.info()})
         tab.loading = False
         tab.view.load_uri("about:blank")
+        self._capture_summary(tab, tab.discarded, url)
         self._relabel_tabs()
         self._flash("Freed a background tab — %s" % self.machine.reason())
         return True
+
+    def _capture_summary(self, tab, state, url):
+        """Leave a standing note of what a discarded tab held.
+
+        Derived locally from the page-text cache, never from the API. The API
+        answer would be better prose, and it would be paid for by a network
+        round trip fired *by memory pressure* -- on a machine that is by
+        definition already struggling, for a tab the user may never look at
+        again. A lead extract of text that is already on disk costs a single
+        indexed read.
+
+        It runs from an idle rather than inline because the point of a discard
+        is to free memory *now*: the sqlite read is small, but charging it to
+        the discard's own frame is exactly the stutter the discard exists to
+        avoid, and by then `load_uri` has already been issued.
+
+        Nothing extra is needed to keep private pages out of this. `discard_tab`
+        refuses a private tab outright, and the cache being read is only ever
+        written behind `store.recordable` in `_record` -- the one privacy choke
+        point -- so a page that was never recordable simply has no text here.
+        """
+        if self.pagetext is None:
+            return
+
+        def later():
+            # Identity of the dict, not a boolean: a tab restored and discarded
+            # again while this was queued carries a *new* state dict, so a
+            # summary of the older page can never land on the newer one.
+            if tab.discarded is state:
+                state["summary"] = tabnames.lead_extract(
+                    self.pagetext.text_for(url) or "")
+                self._relabel_tabs()
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(later)
 
     def restore_tab(self, tab):
         """Bring a discarded tab back. Called when it is selected, or by API."""

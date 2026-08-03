@@ -13,7 +13,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from claudebrowser.tabnames import base_name, host_of, label_tabs  # noqa: E402
+from claudebrowser.tabnames import (SUMMARY_CHARS, base_name, clamp,  # noqa: E402
+                                    host_of, label_tabs, lead_extract,
+                                    tab_tooltip)
 
 
 class BaseName(unittest.TestCase):
@@ -88,6 +90,74 @@ class Collisions(unittest.TestCase):
 
     def test_empty_strip(self):
         self.assertEqual(label_tabs([]), [])
+
+
+class LeadExtract(unittest.TestCase):
+    """The standing summary a discarded tab leaves behind."""
+
+    PROSE = ("Skip to content\nMenu\n"
+             "Rate limiting protects a service from a client that would "
+             "otherwise overwhelm it, and the token bucket is the usual shape.\n"
+             "More paragraphs follow.")
+
+    def test_the_first_paragraph_sized_line_wins(self):
+        self.assertTrue(lead_extract(self.PROSE).startswith("Rate limiting"))
+
+    def test_navigation_furniture_is_skipped(self):
+        self.assertNotIn("Skip to content", lead_extract(self.PROSE))
+
+    def test_an_empty_cache_yields_no_summary(self):
+        # The ordinary case: a page that never finished loading, or one that
+        # was never recordable, has nothing cached to summarise.
+        for empty in (None, "", "   \n\n  "):
+            self.assertEqual(lead_extract(empty), "")
+
+    def test_a_page_of_only_short_lines_still_says_something(self):
+        # A link list has no paragraph anywhere; its words beat an empty tooltip.
+        summary = lead_extract("Docs\nAPI\nPricing\nBlog")
+        self.assertEqual(summary, "Docs API Pricing Blog")
+
+    def test_the_summary_is_clamped_to_the_limit(self):
+        long = "word " * 400
+        summary = lead_extract(long)
+        self.assertLessEqual(len(summary), SUMMARY_CHARS)
+        self.assertTrue(summary.endswith("…"))
+
+    def test_the_limit_is_honoured_when_asked_for_explicitly(self):
+        self.assertLessEqual(len(lead_extract("a b c d e f g h", limit=6)), 6)
+
+    def test_a_short_summary_is_left_alone(self):
+        self.assertEqual(clamp("A short line.", 80), "A short line.")
+
+    def test_the_ellipsis_counts_inside_the_limit(self):
+        # A caller sizing a tooltip means the whole rendered string.
+        self.assertEqual(clamp("abcdefghij klmnop", 10), "abcdefghi…")
+
+    def test_clamping_cuts_at_a_word_boundary(self):
+        self.assertEqual(clamp("alpha beta gamma delta", 16), "alpha beta…")
+
+    def test_one_very_long_token_is_cut_mid_word_rather_than_to_nothing(self):
+        out = clamp("x" * 50, 10)
+        self.assertEqual(out, "x" * 9 + "…")
+
+    def test_whitespace_is_collapsed(self):
+        self.assertEqual(clamp("a\n\t b   c", 80), "a b c")
+
+
+class Tooltip(unittest.TestCase):
+    def test_a_live_tab_shows_only_its_url(self):
+        self.assertEqual(tab_tooltip("https://example.com/"),
+                         "https://example.com/")
+
+    def test_a_discarded_tab_explains_itself(self):
+        tip = tab_tooltip("https://example.com/", True, "About rate limits.")
+        self.assertEqual(tip.splitlines()[0], "https://example.com/")
+        self.assertIn("About rate limits.", tip)
+        self.assertIn("click to reload", tip)
+
+    def test_a_discarded_tab_with_no_summary_omits_the_blank_line(self):
+        tip = tab_tooltip("https://example.com/", True, "")
+        self.assertEqual(len(tip.splitlines()), 2)
 
 
 if __name__ == "__main__":

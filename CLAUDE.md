@@ -38,7 +38,7 @@ tests/         unittest, no display needed
 ./cbctl health                              # is it up
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 315 tests, ~20s, no display
+python3 -m unittest discover -s tests       # 335 tests, ~30s, no display
 CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
 ```
 
@@ -276,6 +276,14 @@ answer. Reopening one needs a new fact, not a new preference.
   separate project, and it contradicts the local-only posture the rest of this
   browser is built on: the point is that the agent uses *your* session on *your*
   machine.
+- **A model-written summary on the discard path.** A discarded tab keeps a
+  standing summary (`tabnames.lead_extract` over `pagetext.text_for`, captured
+  from an idle in `Browser._capture_summary`), and it is a lead extract on
+  purpose. Discards fire *because* memory is short, so an API call there is a
+  paid network round trip on the machine least able to afford it, for a tab the
+  user may never return to. A summary keyed by content hash and generated
+  lazily when a card renders was the alternative; the lead extract is free,
+  needs no new table, and is honest about being the opening of the page.
 - **Canvas-grade UI toys** — an animated knowledge graph, a session time-lapse,
   physics-y tab folders, a tray widget cycling summaries. They need a frontend
   this GTK chrome does not have and would not gain cheaply.
