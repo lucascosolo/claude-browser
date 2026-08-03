@@ -336,7 +336,7 @@ class TestApiRegistry(unittest.TestCase):
             "/close": {}, "/wait": {}, "/text": {}, "/markdown": {}, "/links": {},
             "/html": {}, "/reader": {}, "/find": {"q": "a"}, "/click": {"selector": "a"},
             "/fill": {"selector": "a", "value": "b"}, "/eval": {"js": "1"},
-            "/console": {}, "/screenshot": {},
+            "/console": {}, "/screenshot": {}, "/recall": {"q": "a"},
             "/machine": {}, "/discard": {}, "/storage": {}, "/clear": {},
         }
         # /health is served without touching the browser, so it has no builder.

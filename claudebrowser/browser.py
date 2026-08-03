@@ -19,8 +19,8 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import (agent, ai, auth, extract, findbar, pages, panel_html, passwords,  # noqa: E402
-               perf, reader, resources, storage, store, style, tabnames)
+from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  # noqa: E402
+               passwords, perf, reader, resources, storage, store, style, tabnames)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -293,6 +293,18 @@ class Browser(Gtk.Window):
             print("store: disabled (%s)" % e, flush=True)
             self.store = None
 
+        # The page-text cache is optional in the same way, and one step more so:
+        # an sqlite3 built without FTS5 costs the recall search, not the cache
+        # and certainly not the browser.
+        try:
+            self.pagetext = pagetext.PageText()
+            if not self.pagetext.available:
+                print("pagetext: search disabled (%s)" % self.pagetext.reason,
+                      flush=True)
+        except Exception as e:
+            print("pagetext: disabled (%s)" % e, flush=True)
+            self.pagetext = None
+
         # Proves a script message came from one of our own pages. See pages.py:
         # the handler is on the shared content manager, so every page in the
         # browser can reach it, and only ours can produce this value.
@@ -345,12 +357,13 @@ class Browser(Gtk.Window):
         """Let queued history writes land before the process goes away. The
         last page you visited before quitting is exactly the one most likely to
         be sitting in the queue."""
-        if self.store:
-            try:
-                self.store.flush()
-                self.store.close()
-            except Exception:
-                pass
+        for sink in (self.store, getattr(self, "pagetext", None)):
+            if sink:
+                try:
+                    sink.flush()
+                    sink.close()
+                except Exception:
+                    pass
         Gtk.main_quit()
 
     # -- construction -------------------------------------------------------
@@ -1215,6 +1228,36 @@ class Browser(Gtk.Window):
             return
         self.store.record(url, tab.view.get_title() or "")
         tab._recorded = url
+        self._cache_text(tab, url)
+
+    def _cache_text(self, tab, url):
+        """Keep the page's text for `cbctl recall`.
+
+        Hung off the same point as the history write, and for the same reason:
+        this is where we know the load finished and the tab is not private.
+        Nothing here blocks -- evaluate_javascript is asynchronous, and the
+        callback hands the text straight to a queue drained on a writer thread,
+        so neither the extraction nor the commit sits on the load's frame.
+        """
+        if self.pagetext is None:
+            return
+
+        def on_result(view, result, _data=None):
+            try:
+                value = view.evaluate_javascript_finish(result)
+                payload = json.loads(value.to_string()) if value else None
+            except (GLib.Error, json.JSONDecodeError, TypeError, AttributeError):
+                return  # a page we could not read is not worth a log line
+            if not isinstance(payload, dict):
+                return
+            self.pagetext.record(url, payload.get("title") or "",
+                                 payload.get("text") or "")
+
+        try:
+            tab.view.evaluate_javascript(extract.TEXT, -1, None, None, None,
+                                         on_result, None)
+        except GLib.Error:
+            pass
 
     def _retitle(self, tab):
         """Titles usually arrive after the load finishes. Update in place --
@@ -2437,6 +2480,24 @@ class Browser(Gtk.Window):
         done({"ok": False, "error": "cannot discard this tab (it is focused, "
                                     "private, empty, or already discarded)",
               **tab.info()})
+
+    def api_recall(self, query, limit, done):
+        """Search the cached text of pages already visited.
+
+        Undecorated and tab-free: it answers from disk, not from any tab, so an
+        agent can ask what it read an hour ago in a tab that is long closed.
+        """
+        if self.pagetext is None:
+            return done({"ok": False, "error": "page text cache is disabled"})
+        if not self.pagetext.available:
+            return done({"ok": False, "error": self.pagetext.reason or
+                         "full-text search unavailable"})
+        try:
+            count = int(limit) if limit not in (None, "") else 10
+        except (TypeError, ValueError):
+            count = 10
+        matches = self.pagetext.search(query or "", max(1, min(count, 50)))
+        done({"ok": True, "count": len(matches), "matches": matches})
 
     def api_storage(self, done):
         storage.summary(self.context, done)

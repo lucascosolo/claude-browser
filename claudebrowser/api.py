@@ -251,6 +251,18 @@ OPS = [
        call=lambda c, a: ("api_clear", (a.get("kind") or "cache",)),
        tab=False, mcp=False, timeout=90),
 
+    # Search over what has already been read. Not a web search: it only sees
+    # pages this browser loaded, which is exactly why it is useful -- "the page
+    # about X I had open yesterday" is a question no search engine can answer.
+    Op("recall", "/recall", "GET", "Search the full text of pages already visited "
+       "in this browser and return ranked matches with snippets. Use this to find "
+       "a page seen earlier instead of re-opening tabs to look for it.",
+       params=[Param("q", required=True, help="Words to look for."),
+               Param("limit", "integer", "Maximum matches (default 10).",
+                     cli="opt")],
+       call=lambda c, a: ("api_recall", (a["q"], a.get("limit"))),
+       tab=False),
+
     Op("screenshot", "/screenshot", "GET", "Save a PNG of the visible viewport to a "
        "path on disk.",
        params=[Param("path", help="Write here; omit to stream the PNG to stdout.",
