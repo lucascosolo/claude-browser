@@ -247,7 +247,7 @@ OPS = [
        call=lambda c, a: ("api_storage", ()), tab=False),
 
     Op("clear", "/clear", "POST", "Delete stored browsing data.",
-       params=[Param("kind", help="cache, cookies, storage, or all.",
+       params=[Param("kind", help="cache, cookies, storage, pagetext, or all.",
                      cli="optarg")],
        call=lambda c, a: ("api_clear", (a.get("kind") or "cache",)),
        tab=False, mcp=False, timeout=90),

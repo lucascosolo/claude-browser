@@ -679,6 +679,95 @@ class SynthesizeTest(unittest.TestCase):
         self.assertIn("No readable pages", "".join(ai.synthesize([])))
 
 
+class OutboundScrubTest(unittest.TestCase):
+    """Page text is redacted on the way out, and the caller is told what went.
+
+    These assert on the prompt, not on the network: what matters is that the
+    personal data is gone before a payload is built at all.
+    """
+
+    def setUp(self):
+        from claudebrowser import scrub
+
+        self.scrub = scrub
+        self.saved = os.environ.get(scrub.SCRUB_ENV)
+        os.environ.pop(scrub.SCRUB_ENV, None)
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop(self.scrub.SCRUB_ENV, None)
+        else:
+            os.environ[self.scrub.SCRUB_ENV] = self.saved
+
+    def page(self):
+        return {"url": "https://mail.example/inbox", "title": "Mail for ada@example.com",
+                "text": "From ada@example.com, card 4111 1111 1111 1111."}
+
+    def test_page_text_and_title_are_scrubbed_and_counted(self):
+        tally = {}
+        block = ai._page_block(self.page(), tally=tally)
+        self.assertNotIn("ada@example.com", block)
+        self.assertNotIn("4111", block)
+        self.assertIn("[email]", block)
+        self.assertEqual(tally, {"email": 2, "card": 1})
+
+    def test_the_url_is_left_intact_so_the_answer_can_cite_it(self):
+        self.assertIn("mail.example/inbox", ai._page_block(self.page()))
+
+    def test_cb_scrub_0_sends_the_page_as_it_is(self):
+        os.environ[self.scrub.SCRUB_ENV] = "0"
+        tally = {}
+        block = ai._page_block(self.page(), tally=tally)
+        self.assertIn("ada@example.com", block)
+        self.assertEqual(tally, {})
+
+    def test_synthesize_scrubs_every_page_into_one_tally(self):
+        pages = [self.page(), {"url": "u", "title": "t",
+                               "text": "bob@example.com"}]
+        tally = {}
+        # The prompt is assembled by the call itself; the generator it returns
+        # is never advanced, so nothing here touches the network.
+        ai.synthesize(pages, "q", tally=tally)
+        self.assertEqual(tally, {"email": 3, "card": 1})
+
+    def test_tool_results_are_scrubbed_but_nothing_else_is(self):
+        """The agent's page reads come back as tool_result blocks. The user's
+        own goal and the assistant's thinking blocks must survive untouched --
+        one is what they typed, the other has a signature to match."""
+        messages = [
+            {"role": "user", "content": "mail ada@example.com about it"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "reach ada@example.com",
+                 "signature": "sig"},
+                {"type": "tool_use", "id": "t1", "name": "read_page", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": "contact: ada@example.com"}]},
+        ]
+        tally = {}
+        out = ai._scrubbed_messages(messages, tally)
+        self.assertEqual(out[0], messages[0], "the goal is the user's own words")
+        self.assertEqual(out[1]["content"][0]["thinking"], "reach ada@example.com")
+        self.assertEqual(out[2]["content"][0]["content"], "contact: [email]")
+        self.assertEqual(tally, {"email": 1})
+        self.assertEqual(messages[2]["content"][0]["content"],
+                         "contact: ada@example.com",
+                         "the caller's own list must not be rewritten")
+
+    def test_the_agent_reports_each_redaction_once(self):
+        """Every turn re-sends the transcript, so the tally is cumulative and
+        only the difference is worth saying out loud."""
+        said = []
+        runner = agent.Agent(lambda *a, **k: {"ok": True}, said.append)
+        runner._report_redactions({"email": 2})
+        runner._report_redactions({"email": 2})
+        runner._report_redactions({"email": 2, "card": 1})
+        self.assertEqual(len(said), 2)
+        self.assertIn("2 emails", said[0])
+        self.assertIn("1 card", said[1])
+        self.assertNotIn("email", said[1])
+
+
 # -- the agent loop ---------------------------------------------------------
 
 class FakeBrowser:
@@ -722,7 +811,7 @@ class AgentTest(unittest.TestCase):
     def script(self, responses):
         self.sent = []
 
-        def fake(messages, tools, system, max_tokens=16000):
+        def fake(messages, tools, system, max_tokens=16000, tally=None):
             self.sent.append(messages)
             return responses[min(len(self.sent) - 1, len(responses) - 1)]
         ai.tool_turn = fake
@@ -796,7 +885,7 @@ class AgentTest(unittest.TestCase):
     def test_cancel_stops_the_loop(self):
         a = self.make()
 
-        def fake(messages, tools, system, max_tokens=16000):
+        def fake(messages, tools, system, max_tokens=16000, tally=None):
             a.cancel()
             return turn(tool_block("read_page", {}))
         ai.tool_turn = fake

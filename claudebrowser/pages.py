@@ -315,7 +315,7 @@ def _never_row(origin):
     }
 
 
-def data_page(palette, nonce, machine, storage_info, human):
+def data_page(palette, nonce, machine, storage_info, human, pagetext_info=None):
     """What the browser is holding: memory, and what is on disk.
 
     One page for both because they answer the same question -- "why is this
@@ -352,6 +352,16 @@ def data_page(palette, nonce, machine, storage_info, human):
         </div>
         <div class="footer">
           %(buttons)s
+        </div>
+      </section>
+      <section>
+        <h2>Page text</h2>
+        <div class="rows">
+          %(pagetext)s
+        </div>
+        <p class="note">%(pagetext_note)s</p>
+        <div class="footer">
+          %(pagetext_button)s
         </div>
       </section>
     """ % {
@@ -401,14 +411,36 @@ def data_page(palette, nonce, machine, storage_info, human):
             ("Disk cache", human(storage_info.get("cache_bytes"))),
             ("Stored in", storage_info.get("data_dir") or "—"),
         )),
-        "buttons": "".join(
-            '<button class="danger" data-kind="%s" onclick="return cbui.confirmData(event, %s, %s)">'
-            '%s</button>' % (kind, _js(kind), _js(label), _e(label))
-            for kind, label in (("cache", "Clear cache"),
-                                ("cookies", "Clear cookies"),
-                                ("all", "Clear everything"))),
+        "buttons": "".join(_clear_button(kind, label)
+                           for kind, label in (("cache", "Clear cache"),
+                                               ("cookies", "Clear cookies"),
+                                               ("all", "Clear everything"))),
+        # The text of every page read is on disk so `recall` can search it. That
+        # makes it the most personal thing this browser stores -- history is a
+        # list of URLs, this is the prose -- so it is clearable from the same
+        # page as the cookies, rather than only by deleting a file by hand.
+        "pagetext": "".join(_fact(label, value) for label, value in (
+            ("Pages cached", (pagetext_info or {}).get("pages", "—")),
+            ("Distinct articles", (pagetext_info or {}).get("bodies", "—")),
+            ("On disk", human((pagetext_info or {}).get("bytes"))),
+            ("Full-text search",
+             "on" if (pagetext_info or {}).get("search") else "off"),
+        )),
+        "pagetext_note": _e(
+            "The extracted text of pages you have read, kept so recall can "
+            "search it. Clearing it is not undoable: the text is gone until "
+            "those pages are visited again."),
+        "pagetext_button": _clear_button("pagetext", "Clear page text"),
     }
     return shell("Data", palette, nonce, "cb:data", body)
+
+
+def _clear_button(kind, label):
+    """One armed delete button. `data-kind` is what the confirm step reads back,
+    so the kind travels with the button rather than through a closure."""
+    return ('<button class="danger" data-kind="%s" '
+            'onclick="return cbui.confirmData(event, %s, %s)">%s</button>'
+            % (kind, _js(kind), _js(label), _e(label)))
 
 
 def _meter(label, value, total, caption):

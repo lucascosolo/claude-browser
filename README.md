@@ -170,7 +170,7 @@ Claude panel's visual language. A slim icon rail moves between them.
 | `cb:bookmarks` | Everything saved, filterable. |
 | `cb:history` | Grouped by day, filterable, with per-entry delete and a two-step clear. |
 | `cb:passwords` | **Saved logins**, plus the sites you told it never to ask about. |
-| `cb:data` | **Memory, swap, CPU and disk** — what the resource guard is seeing, how many tabs it has freed, and two-step buttons to clear the cache, the cookies, or everything. |
+| `cb:data` | **Memory, swap, CPU and disk** — what the resource guard is seeing, how many tabs it has freed, how much page text is cached for `recall`, and two-step buttons to clear the cache, the cookies, the cached page text, or everything. |
 
 Tiles carry a **site mark** — a letter on a colour hashed from the hostname —
 rather than a favicon. Favicons would mean a network request per tile on the
@@ -471,12 +471,13 @@ CB_BLOCK=1
 | `CB_MAX_TABS` | The ceiling on tabs an *agent* may open, default 10. Never applies to you. |
 | `CB_MEM_LIMIT` | MB per web process before WebKit starts shedding caches, default 512. |
 | `CB_PACE` | How slowly the agent moves so you can follow it. `1` (default), `0`/`off` for no pauses, up to `5` to slow it down. |
+| `CB_SCRUB` | `0`/`off` sends page text to Claude exactly as it appears. On by default: email addresses, phone numbers, card and IBAN numbers, SSNs and account numbers are replaced with `[email]`, `[card]` and friends before anything leaves the machine, and the panel says how many of each it removed. |
 | `CB_HOME`, `CB_PORT`, `CB_TOKEN`, `CB_THEME`, `CB_GPU`, `CB_WEBGL` | as before. |
 
 Cookies, the disk cache and per-site storage live in
 `~/.local/share/claude-browser` and `~/.cache/claude-browser`, and **persist
 across restarts** — you stay signed in. `cb:data` shows how much is there and
-clears any of it; `cbctl clear cookies|cache|storage|all` does the same from a
+clears any of it; `cbctl clear cookies|cache|storage|pagetext|all` does the same from a
 shell. Clearing is deliberately *not* an MCP tool: signing you out of every site
 you use is not a step an agent should be able to take in pursuit of some other
 goal.
@@ -543,7 +544,7 @@ session eats it. It is a fallback, not a foundation.
 python3 -m unittest discover -s tests
 ```
 
-291 tests, no display or GTK bindings needed.
+367 tests, no display or GTK bindings needed.
 
 `test_offline.py` covers URL intent, JS escaping, SSE parsing, control routing,
 the CLI and the MCP server — a stub speaks the control protocol so the
@@ -570,6 +571,13 @@ article share one body and come back as one search hit, that eviction is LRU
 over a byte cap and only drops a body once nothing points at it, that whatever
 the user types is quoted into a valid FTS5 query, and that everything still
 works when sqlite3 has no FTS5 at all.
+
+`test_scrub.py` covers the outbound redaction: one test per pattern, that a
+card-shaped order number is rejected by the Luhn check and a mistyped IBAN by
+mod-97, that the placeholders and counts are stable, that `CB_SCRUB=0` turns it
+off — and a list of ordinary prose (version strings, commit hashes, coordinates,
+numeric tables) that must come back untouched, because a scrubber with false
+positives rewrites the page out from under the answer.
 
 `test_reader.py` covers reader-mode option clamping, the reading-time estimate,
 and that the overlay never rewrites the page's own DOM; `test_pacing.py` covers

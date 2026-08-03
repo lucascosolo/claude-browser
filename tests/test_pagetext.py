@@ -47,6 +47,19 @@ class DedupeTest(unittest.TestCase):
         self.p.forget("https://b.example/x")
         self.assertEqual(self.p.stats()["bodies"], 0)
 
+    def test_clear_empties_the_cache_and_its_search_index(self):
+        """`clear()` is what cb:data and `cbctl clear pagetext` call. Leaving
+        the FTS rows behind would mean recall still returning hits for prose
+        the user just erased."""
+        self.p.record("https://a.example/x", "X", "wombats and their burrows")
+        self.p.record("https://b.example/y", "Y", "quokkas of Rottnest")
+        self.p.clear()
+        self.assertEqual(self.p.stats()["pages"], 0)
+        self.assertEqual(self.p.stats()["bodies"], 0)
+        self.assertIsNone(self.p.text_for("https://a.example/x"))
+        if self.p.available:
+            self.assertEqual(self.p.search("wombats"), [])
+
     def test_internal_and_empty_pages_are_never_cached(self):
         for url in ("cb:home", "about:blank", "data:text/html,x", ""):
             self.assertFalse(self.p.record(url, "nope", "text"), url)

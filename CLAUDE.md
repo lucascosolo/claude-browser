@@ -26,6 +26,7 @@ claudebrowser/
   urls.py      omnibox intent: navigate or search (GTK-free)
   reader.py    reader mode: article extraction + reading typography (GTK-free)
   pagetext.py  on-disk page-text cache + FTS5 `recall` search (GTK-free)
+  scrub.py     outbound PII redaction over page text (GTK-free)
   passwords.py saved logins in the system keyring + the injected form script
   store.py pages.py panel_html.py style.py perf.py envfile.py
 tests/         unittest, no display needed
@@ -38,14 +39,15 @@ tests/         unittest, no display needed
 ./cbctl health                              # is it up
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 335 tests, ~30s, no display
+python3 -m unittest discover -s tests       # 367 tests, ~60s, no display
 CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
 default 10), `CB_COOKIES` (`nothird`/`all`/`none`), `CB_ITP`, `CB_MEM_LIMIT`,
 `CB_PACE` (agent pacing multiplier, default 1; `0`/`off` removes the pauses,
-higher slows the cursor down, clamped to 5).
+higher slows the cursor down, clamped to 5), `CB_SCRUB` (outbound PII redaction,
+default on; `0`/`off` sends page text raw).
 
 There is no linter or type checker configured. `python3 -m py_compile` is the
 syntax gate.
@@ -105,8 +107,19 @@ syntax gate.
   AMP and tracking-parameter spellings of an article cost one copy of the prose
   and one search hit. Eviction is LRU over a byte cap (`MAX_BYTES`), not a row
   count, and only drops a body once the last URL referencing it is gone.
-  Known gap: `clear()` and `forget()` exist and nothing calls them — the cache
-  is not yet wired into `cb:data` or the `clear` op.
+  Clearing it goes through `Browser._clear_kind`, the single place both the
+  `clear` op and the cb:data buttons pass through, so "clear everything" cannot
+  come to mean two different sets depending on which surface was used.
+- **Page text is scrubbed on the way to Anthropic, and the user is told.**
+  Every path that puts page content in a request goes through `ai._redact`, so
+  `CB_SCRUB` is honoured once and the per-category counts have one place to be
+  collected. The counts are not decoration: a redaction the user cannot see is
+  one they cannot correct, so `_run_stream` renders them as the card's meta line
+  and the agent emits them as a step. `scrub.py` favours precision over recall
+  on purpose — it validates cards with Luhn and IBANs with mod-97, and it does
+  not try names or street addresses at all, because a scrubber that mangles
+  prose makes the answers stop matching the page and the user stops trusting
+  them.
 - Named exports of intent in comments: explain *why*, especially where a choice
   looks arbitrary but encodes a real constraint.
 
@@ -243,6 +256,14 @@ syntax gate.
   `urls.prefetch_host`, built on `looks_like_url` so it can never disagree with
   what Enter would do — warming a name for a search query is a lookup nobody
   visits and a leak of what was typed.
+- **A redaction placeholder is evidence to the next pattern.** `scrub.py`'s
+  account-number rule fires on wording like `card` or `iban` next to a digit
+  run — and `[card]` is a string it wrote itself one pass earlier, so without
+  the `(?<!\[)` guard a redacted card turned the phone number after it into an
+  "account number". Related, and found the same way: a card regex anchored only
+  at its start happily matches the last four digits of a phone number plus the
+  first twelve of the card behind it, fails Luhn, and *hides the real card* by
+  consuming the region — hence the trailing `(?![ -]\d)`.
 - **Screenshotting the chrome needs a cropped root grab.** `xwd -name` matches
   the legacy `WM_NAME`, which GTK does not set (it sets `_NET_WM_NAME`), and
   `xwd -id` on the toplevel misses popovers because a GTK popover is its own X

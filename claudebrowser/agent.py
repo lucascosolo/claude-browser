@@ -19,7 +19,7 @@ import json
 import os
 import time
 
-from . import ai, extract
+from . import ai, extract, scrub
 
 MAX_STEPS = 14
 PAGE_CHARS = 15_000     # per read_page result fed back to the model
@@ -169,6 +169,7 @@ class Agent:
         self.cancelled = False
         self.spent = 0          # characters of tool output fed back so far
         self.seen = {}          # (tool, args) -> count, for loop detection
+        self.redacted = {}      # category -> count reported to the user so far
         self.pace = pace_scale() if pace is None else float(pace)
 
     def cancel(self):
@@ -184,6 +185,21 @@ class Agent:
         delay = self.delay_for(seconds)
         if delay > 0 and not self.cancelled:
             time.sleep(delay)
+
+    def _report_redactions(self, tally):
+        """Say what the scrubber took out, once per thing it took out.
+
+        `tally` is cumulative for the run, because every turn re-sends (and so
+        re-scrubs) the whole transcript. Reporting the difference against what
+        has already been said is what stops a five-step run announcing the same
+        redacted email five times.
+        """
+        new = {k: n - self.redacted.get(k, 0) for k, n in tally.items()
+               if n > self.redacted.get(k, 0)}
+        if not new:
+            return
+        self.redacted = dict(tally)
+        self.emit("  → %s before sending\n" % scrub.describe(new))
 
     # -- tool implementations ----------------------------------------------
 
@@ -250,14 +266,17 @@ class Agent:
             if self.cancelled:
                 self.emit("\n[stopped]\n")
                 return
+            tally = {}
             try:
-                response = ai.tool_turn(messages, TOOLS, SYSTEM)
+                response = ai.tool_turn(messages, TOOLS, SYSTEM, tally=tally)
             except ai.NoKey as e:
                 return self.emit(str(e) + "\n")
             except ai.ApiError as e:
                 return self.emit("\n%s\n" % e)
             except Exception as e:
                 return self.emit("\n[error] %r\n" % (e,))
+
+            self._report_redactions(tally)
 
             if response.get("type") == "error":
                 return self.emit("\n[api error] %s\n"

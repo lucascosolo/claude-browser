@@ -399,7 +399,8 @@ class TestApiRegistry(unittest.TestCase):
             "/html": {}, "/reader": {}, "/find": {"q": "a"}, "/click": {"selector": "a"},
             "/fill": {"selector": "a", "value": "b"}, "/eval": {"js": "1"},
             "/console": {}, "/screenshot": {}, "/recall": {"q": "a"},
-            "/machine": {}, "/discard": {}, "/storage": {}, "/clear": {},
+            "/machine": {}, "/discard": {}, "/storage": {},
+            "/clear": {"kind": "pagetext"},
         }
         # /health is served without touching the browser, so it has no builder.
         callable_routes = {op.route for op in self.api.OPS if op.call}
@@ -409,6 +410,16 @@ class TestApiRegistry(unittest.TestCase):
             method, call_args = self.dispatch(route, args)
             self.assertTrue(method.startswith("api_"), route)
             self.assertIsInstance(call_args, tuple, route)
+
+    def test_clear_carries_its_kind_through_and_documents_pagetext(self):
+        """The page-text cache is the most personal thing on disk, so it is
+        clearable from the same op as the cookies -- and api.py is the only
+        place that says so."""
+        self.assertEqual(self.dispatch("/clear", {"kind": "pagetext"})[1],
+                         ("pagetext",))
+        self.assertEqual(self.dispatch("/clear", {})[1], ("cache",))
+        kind = next(p for p in self.api.BY_NAME["clear"].params if p.name == "kind")
+        self.assertIn("pagetext", kind.help)
 
     def test_health_needs_no_browser(self):
         self.assertIsNone(self.api.BY_NAME["health"].call)

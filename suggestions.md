@@ -9,8 +9,8 @@ those refusals lives in `CLAUDE.md` under *Architectures already rejected*, so
 it does not get re-proposed here every six months.
 
 Ideas that have since been built — reader mode, the page-text cache, `recall`
-full-text search, the visible agent cursor — are documented in `README.md` and
-`CLAUDE.md` and are no longer suggestions.
+full-text search, the visible agent cursor, the outbound PII scrubber — are
+documented in `README.md` and `CLAUDE.md` and are no longer suggestions.
 
 ## Tab snapshot summaries
 
@@ -28,24 +28,25 @@ Open question worth deciding before starting: whether the summary is generated
 eagerly on discard (costs an API call for a tab you may never return to) or
 lazily the first time the deck renders a discarded card.
 
-## PII scrubber and an outbound prompt preview
+## An editable outbound prompt preview
 
-Ask, TL;DR, Research and the agent loop all send page text to Anthropic. Nothing
-currently shows the user what is about to leave the machine.
+The scrubber half of this is built: `scrub.py` redacts emails, phone numbers,
+Luhn-valid cards, mod-97-valid IBANs, SSNs and account-adjacent digit runs out
+of every page that goes to Anthropic, `CB_SCRUB` turns it off, and the panel
+says how many of each it removed. Clearing the page-text cache is built too, on
+`cb:data` and as `cbctl clear pagetext`.
 
-Two halves:
+What is left is the second half: a preview step in the Claude panel for the
+large sends — a full page dump, Research across every open tab — showing the
+redacted text as it will be sent, editable before it goes. That is the part that
+answers "what is about to leave this machine" rather than "what left it", and it
+is a panel interaction rather than a text-processing problem: the scrubber
+already produces the text it would show.
 
-- A local scrubber over the text about to be sent — email addresses, phone
-  numbers, card-shaped digit runs, anything in a field the password layer
-  recognises — highlighted with one-tap redaction. Regex and `passwords.py`'s
-  existing field knowledge; no model.
-- A preview step in the Claude panel for the large sends (a full page dump,
-  Research across every open tab), with the redactions applied and editable
-  before it goes.
-
-Fold in the known gap while here: `pagetext` has `clear()` and `forget()` and
-nothing calls either. Wire them into `cb:data` and into `cbctl clear`, so the
-page-text cache is clearable like cookies and the disk cache already are.
+Worth deciding first: whether the preview is opt-in (a toggle, off by default,
+because a confirmation step on every question would be nagging) or triggered by
+size, and whether an edit to the preview is one-shot or remembered for that
+page.
 
 ## Playbooks: record and replay command sequences
 

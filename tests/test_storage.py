@@ -82,7 +82,7 @@ class TestSizes(unittest.TestCase):
 class TestDataPage(unittest.TestCase):
     """cb:data renders from plain dicts, so it can be built without a browser."""
 
-    def render(self, machine=None, info=None):
+    def render(self, machine=None, info=None, pagetext_info=None):
         def human(size):
             return "—" if size is None else "%d B" % size
 
@@ -93,7 +93,8 @@ class TestDataPage(unittest.TestCase):
                               "tab_ceiling": 10, "loading": 0}
         info = info or {"policy": "nothird", "domains": 12, "cache_bytes": 4096,
                         "cookie_jar_bytes": 512, "data_dir": "/tmp/cb"}
-        return pages.data_page(style.palette(True), "NONCE", machine, info, human)
+        return pages.data_page(style.palette(True), "NONCE", machine, info, human,
+                               pagetext_info=pagetext_info)
 
     def test_it_renders_the_numbers_that_matter(self):
         html = self.render()
@@ -123,8 +124,24 @@ class TestDataPage(unittest.TestCase):
     def test_clearing_is_armed_rather_than_immediate(self):
         html = self.render()
         self.assertIn("confirmData", html)
-        for kind in ("cache", "cookies", "all"):
+        for kind in ("cache", "cookies", "all", "pagetext"):
             self.assertIn('data-kind="%s"' % kind, html)
+
+    def test_the_page_text_cache_is_reported_and_clearable(self):
+        """It holds the prose of everything read, which makes it the most
+        personal thing on disk -- so it belongs on the page that clears data,
+        not only in a file nobody knows the path of."""
+        html = self.render(pagetext_info={"pages": 42, "bodies": 30,
+                                          "bytes": 8192, "search": True})
+        self.assertIn("Page text", html)
+        self.assertIn("Pages cached", html)
+        self.assertIn(">42<", html)
+        self.assertIn("Clear page text", html)
+
+    def test_a_disabled_page_text_cache_renders_without_numbers(self):
+        html = self.render(pagetext_info=None)
+        self.assertIn("Page text", html)
+        self.assertNotIn(">None<", html)
 
     def test_meters_are_clamped(self):
         """A load average can exceed the core count, and a bar wider than its

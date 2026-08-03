@@ -28,7 +28,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from . import auth
+from . import auth, scrub
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
@@ -588,12 +588,35 @@ def _describe_error(status, raw, label):
 
 # -- one-shot text features -------------------------------------------------
 
-def _page_block(page, limit=120_000):
+def _redact(text, tally=None):
+    """Run the outbound scrubber over one piece of page text.
+
+    Every path that puts page content into a request goes through here, so
+    `CB_SCRUB` has one place to be honoured and the counts have one place to be
+    collected. `tally` is a dict the caller owns: it is updated in place because
+    the request is built inside a generator the UI does not otherwise get a
+    return value from, and the UI has to be able to say what was removed.
+    """
+    result = scrub.scrub(text)
+    if tally is not None:
+        for kind, n in result.counts.items():
+            tally[kind] = tally.get(kind, 0) + n
+    return result.text
+
+
+def _page_block(page, limit=120_000, tally=None):
+    # Truncate first, then scrub: scrubbing the tail we are about to throw away
+    # is wasted work on a 400KB page, and a placeholder is never longer than
+    # what it replaced so the budget still holds afterwards.
     body = page.get("text") or ""
     if len(body) > limit:
         body = body[:limit] + "\n\n[page truncated for length]"
+    # The URL is left alone on purpose: the model is asked to cite it back, and
+    # a redacted URL is one the user cannot click. The title is not -- a webmail
+    # tab puts the correspondent's address straight into it.
     return "<page url=%r title=%r>\n%s\n</page>" % (
-        page.get("url", ""), page.get("title", ""), body)
+        page.get("url", ""), _redact(page.get("title", ""), tally),
+        _redact(body, tally))
 
 
 def _stream(system, prompt):
@@ -620,18 +643,24 @@ def _stream(system, prompt):
         yield "\n[stream interrupted: %s]" % (e,)
 
 
-def ask(question, page, page_chars=120_000):
-    """Answer a question about one page."""
-    return _stream(SYSTEM, _page_block(page, page_chars) + "\n\n" + question)
+def ask(question, page, page_chars=120_000, tally=None):
+    """Answer a question about one page.
+
+    `tally` is an optional dict; personal data found in the page is counted into
+    it by category before the request is built, so the panel can say what left
+    the machine. It is filled by the time this returns -- the prompt is
+    assembled here, not lazily inside the generator.
+    """
+    return _stream(SYSTEM, _page_block(page, page_chars, tally) + "\n\n" + question)
 
 
-def summarize(page):
+def summarize(page, tally=None):
     """TL;DR for one page. Invoked by a button, never on load -- a request per
     page view would be both slow and expensive."""
-    return _stream(TLDR_SYSTEM, _page_block(page) + "\n\nSummarize this page.")
+    return _stream(TLDR_SYSTEM, _page_block(page, tally=tally) + "\n\nSummarize this page.")
 
 
-def synthesize(pages, question=None):
+def synthesize(pages, question=None, tally=None):
     """Read every open tab together and answer across them."""
     if not pages:
         def empty():
@@ -643,7 +672,8 @@ def synthesize(pages, question=None):
     per_page = max(4_000, 100_000 // max(len(pages), 1))
     body = "\n\n".join(
         "<page number=%d url=%r title=%r>\n%s\n</page>"
-        % (i + 1, p.get("url", ""), p.get("title", ""), (p.get("text") or "")[:per_page])
+        % (i + 1, p.get("url", ""), _redact(p.get("title", ""), tally),
+           _redact((p.get("text") or "")[:per_page], tally))
         for i, p in enumerate(pages)
     )
     return _stream(SYNTHESIS_SYSTEM, body + "\n\n" + (question or "Synthesize these pages."))
@@ -651,7 +681,37 @@ def synthesize(pages, question=None):
 
 # -- tool use ---------------------------------------------------------------
 
-def tool_turn(messages, tools, system, max_tokens=16000):
+def _scrubbed_messages(messages, tally=None):
+    """A copy of `messages` with page content redacted out of tool results.
+
+    The agent's page reads come back as `tool_result` blocks, which is the only
+    place in this conversation a web page's text appears -- the goal is the
+    user's own words and the assistant blocks (including thinking, which must be
+    echoed back byte-identical) are the model's. Rewriting anything else would
+    either edit what the user typed or invalidate a thinking signature, so the
+    walk is deliberately narrow and copies rather than mutating the caller's
+    list, which the agent loop keeps appending to across steps.
+    """
+    out = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+        blocks, changed = [], False
+        for block in content:
+            if (isinstance(block, dict) and block.get("type") == "tool_result"
+                    and isinstance(block.get("content"), str)):
+                text = _redact(block["content"], tally)
+                if text != block["content"]:
+                    changed = True
+                    block = dict(block, content=text)
+            blocks.append(block)
+        out.append(dict(message, content=blocks) if changed else message)
+    return out
+
+
+def tool_turn(messages, tools, system, max_tokens=16000, tally=None):
     """One non-streaming turn that may request tools.
 
     Non-streaming on purpose: the agent loop needs the whole message -- every
@@ -664,7 +724,7 @@ def tool_turn(messages, tools, system, max_tokens=16000):
         "max_tokens": max_tokens,
         "system": system,
         "tools": tools,
-        "messages": messages,
+        "messages": _scrubbed_messages(messages, tally),
     }
     with _open(payload) as resp:
         return json.loads(resp.read())

@@ -20,8 +20,8 @@ gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  # noqa: E402
-               passwords, perf, reader, resources, storage, store, style, tabnames,
-               urls)
+               passwords, perf, reader, resources, scrub, storage, store, style,
+               tabnames, urls)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -971,7 +971,9 @@ class Browser(Gtk.Window):
             machine["tab_ceiling"] = resources.tab_ceiling(self.machine, MAX_AGENT_TABS)
             machine["loading"] = sum(1 for t in self.tabs if t.loading)
             return pages.data_page(palette, self.nonce, machine,
-                                   self._storage_facts, storage.human)
+                                   self._storage_facts, storage.human,
+                                   pagetext_info=(self.pagetext.stats()
+                                                  if self.pagetext else None))
 
         if name == "passwords":
             if self.vault is None:
@@ -1046,7 +1048,7 @@ class Browser(Gtk.Window):
                             else "Could not clear: %s" % result.get("error"))
                 self._reload_internal()
 
-            storage.clear(self.context, title, cleared)
+            self._clear_kind(title, cleared)
         elif action == "clear_history" and self.store:
             self.store.clear_history()
             self.store.flush()
@@ -2101,11 +2103,18 @@ class Browser(Gtk.Window):
             return False
         return True
 
-    def _run_stream(self, make_generator, title="Claude", subtitle="", clear=True):
+    def _run_stream(self, make_generator, title="Claude", subtitle="", clear=True,
+                    tally=None):
         """Drive a text-producing generator on a worker thread.
 
         The generator does blocking network I/O, so it cannot run on the GTK
         thread; every write comes back through idle_add, gated on the run token.
+
+        `tally` is a dict the ai.* call fills with what the scrubber removed
+        from the page before sending it. It is rendered as the card's meta line
+        as soon as the prompt has been built -- before the answer arrives, not
+        after -- because a redaction the user only learns about once they have
+        finished reading is one they cannot weigh while reading.
         """
         import threading
 
@@ -2130,9 +2139,19 @@ class Browser(Gtk.Window):
                 self._finish_run(token, "failed", "error")
             return GLib.SOURCE_REMOVE
 
+        def note(counts):
+            if token == self.run_id and counts:
+                self._js(panel_html.call("meta", card, scrub.describe(counts)))
+            return GLib.SOURCE_REMOVE
+
         def work():
             try:
-                for chunk in make_generator():
+                generator = make_generator()
+                # The prompt is assembled by the call above, not lazily inside
+                # the generator, so the tally is complete here.
+                if tally is not None:
+                    GLib.idle_add(note, dict(tally))
+                for chunk in generator:
                     if token != self.run_id:
                         return
                     GLib.idle_add(write, chunk)
@@ -2201,10 +2220,16 @@ class Browser(Gtk.Window):
         if not self._require_key():
             return
         self._set_status("reading page…", "busy")
-        self._with_page(lambda page: self._run_stream(
-            lambda: ai.summarize(page),
-            title="TL;DR",
-            subtitle=page.get("title") or page.get("url") or "this page"))
+
+        def go(page):
+            tally = {}
+            self._run_stream(
+                lambda: ai.summarize(page, tally=tally),
+                title="TL;DR",
+                subtitle=page.get("title") or page.get("url") or "this page",
+                tally=tally)
+
+        self._with_page(go)
 
     # -- mode: research across tabs -----------------------------------------
 
@@ -2228,10 +2253,12 @@ class Browser(Gtk.Window):
                     self._panel_write("None of the open tabs had readable text.",
                                       replace=True, tag="error")
                     return self._set_status("nothing to read", "warn")
+                tally = {}
                 return self._run_stream(
-                    lambda: ai.synthesize(pages, question),
+                    lambda: ai.synthesize(pages, question, tally=tally),
                     title="Research",
-                    subtitle="%d tab%s" % (len(pages), "" if len(pages) == 1 else "s"))
+                    subtitle="%d tab%s" % (len(pages), "" if len(pages) == 1 else "s"),
+                    tally=tally)
 
             def got(page):
                 if (page.get("text") or "").strip():
@@ -2311,8 +2338,13 @@ class Browser(Gtk.Window):
             self._pending = ""
             self._new_card("you", "You")
             self._js(panel_html.call("append", str(self._card_id), text))
-            self._with_page(lambda page: self._run_stream(
-                lambda: ai.ask(text, page), title="Claude", clear=False))
+
+            def go(page):
+                tally = {}
+                self._run_stream(lambda: ai.ask(text, page, tally=tally),
+                                 title="Claude", clear=False, tally=tally)
+
+            self._with_page(go)
 
     # -- agent API ----------------------------------------------------------
     # Every method here takes a trailing `done` callback and calls it once.
@@ -2590,4 +2622,37 @@ class Browser(Gtk.Window):
             self._reload_internal()
             done(result)
 
-        storage.clear(self.context, kind or "cache", finished)
+        self._clear_kind(kind, finished)
+
+    def _clear_kind(self, kind, done):
+        """Delete one category of stored data, whoever asked.
+
+        The one place that knows the page-text cache is clearable next to
+        WebKit's own data: both the `clear` op and the cb:data buttons come
+        through here, so "everything" cannot come to mean two different sets
+        depending on which surface was used.
+        """
+        kind = kind or "cache"
+        # Validated here rather than left to storage.clear, whose message can
+        # only name the WebKit categories it knows about -- a user told to "try
+        # cache/cookies/storage/all" would reasonably conclude the page-text
+        # cache is not clearable at all.
+        if kind != "pagetext" and kind not in storage.KINDS:
+            return done({"ok": False, "error": "unknown kind %r; try %s"
+                         % (kind, "/".join(sorted(set(storage.KINDS) | {"pagetext"})))})
+        if kind in ("pagetext", "all"):
+            if self.pagetext is None:
+                if kind == "pagetext":
+                    return done({"ok": False,
+                                 "error": "the page text cache is disabled"})
+            else:
+                self.pagetext.clear()
+                # Flushed rather than left to the writer thread: this returns to
+                # a page reload that reads the stats straight back, and two
+                # DELETEs on a capped database are far cheaper than showing a
+                # user who just erased their reading history that it is still
+                # there.
+                self.pagetext.flush()
+        if kind == "pagetext":
+            return done({"ok": True, "cleared": kind})
+        storage.clear(self.context, kind, done)
