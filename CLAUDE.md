@@ -17,7 +17,8 @@ claudebrowser/
   client.py    the client half: used by cbctl, cb-mcp and the launch handoff
   extract.py   JavaScript injected into pages (read, click, fill, halo)
   agent.py     the in-browser tool-use loop behind Ctrl+G
-  ai.py        Anthropic Messages API over urllib; auth.py picks the credential
+  ai.py        Anthropic Messages API over a pooled http.client connection;
+               auth.py picks the credential
   resources.py THE RESOURCE POLICY -- when to wait, refuse, or drop a tab
   storage.py   the web context: persistent cookies, disk cache, clearing
   findbar.py   Ctrl+F, driving WebKit's per-view FindController
@@ -37,7 +38,7 @@ tests/         unittest, no display needed
 ./cbctl health                              # is it up
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
-python3 -m unittest discover -s tests       # 291 tests, ~20s, no display
+python3 -m unittest discover -s tests       # 315 tests, ~20s, no display
 CB_AUTOSTART=0 python3 -m unittest ...      # in tests, so cb-mcp cannot launch a real window
 ```
 
@@ -194,6 +195,32 @@ syntax gate.
   an unbalanced paren raises instead of searching. `pagetext.match_query` quotes
   every token, ANDs them, and prefixes only the last one with `*` for
   search-as-you-type. Bypassing it turns user input into query syntax.
+- **A pooled connection may only be recycled once its body is gone.** `ai.py`
+  keeps the connection to api.anthropic.com alive across requests, which removes
+  a TLS handshake from every panel question and every agent step. The price is
+  that a response abandoned half-read leaves its remaining bytes in the socket,
+  and the *next* request on that socket parses them as its own reply — a
+  corruption that shows up one call later, in an unrelated feature. `_Response`
+  hands the connection back only on proof of a clean finish: `read()` with no
+  argument, or an iteration that actually reached EOF. Breaking out of an SSE
+  loop drops the connection, on purpose.
+- **`CLOCK_MONOTONIC` does not tick while the laptop is suspended**, so an idle
+  timeout cannot be the only staleness check on a kept-alive socket: a
+  connection that has been dead since yesterday still looks seconds old after a
+  resume. The real defence is `ai._request`'s single retry on a *fresh*
+  connection when a *reused* one dies before answering. `reused` is the whole
+  condition — the same exception on a new socket is a genuine network failure,
+  and retrying it only delays the message. The retry is safe exclusively because
+  it sits between sending the request and returning the response, so a stream
+  that has already yielded text can never be silently restarted.
+- **The omnibox "changed" signal is one keystroke, not one intent.** DNS
+  preconnect debounces (`PREFETCH_DELAY_MS`) *and* dedupes by host
+  (`urls.HostWarmer`), because neither alone is enough: without the pause,
+  typing `example.com` resolves `example.c` and `example.co` first, and those
+  are different hosts as far as a set is concerned. The prefetch decision is
+  `urls.prefetch_host`, built on `looks_like_url` so it can never disagree with
+  what Enter would do — warming a name for a search query is a lookup nobody
+  visits and a leak of what was typed.
 - **Screenshotting the chrome needs a cropped root grab.** `xwd -name` matches
   the legacy `WM_NAME`, which GTK does not set (it sets `_NET_WM_NAME`), and
   `xwd -id` on the toplevel misses popovers because a GTK popover is its own X

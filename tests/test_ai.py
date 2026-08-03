@@ -5,13 +5,14 @@ discover in front of a user: retries, refusals, truncated turns, and an agent
 loop that stops making progress.
 """
 
+import http.client
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
-import urllib.error
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +22,17 @@ from claudebrowser import agent, ai  # noqa: E402
 
 
 class FakeResponse(io.BytesIO):
+    """Stands in for ai._Response: a status, headers, and a readable body."""
+
+    def __init__(self, body=b"{}", status=200, headers=None):
+        super().__init__(body)
+        self.body = body
+        self.status = status
+        self.headers = headers or {}
+
+    def clone(self):
+        return FakeResponse(self.body, self.status, self.headers)
+
     def __enter__(self):
         return self
 
@@ -30,9 +42,10 @@ class FakeResponse(io.BytesIO):
 
 
 def http_error(code, message="nope", headers=None):
-    return urllib.error.HTTPError(
-        "https://api", code, "err", headers or {}, io.BytesIO(
-            b'{"error":{"message":"%s"}}' % message.encode()))
+    """A non-2xx response. Not an exception any more: over http.client an API
+    rejection is an ordinary reply with a status, not a raised HTTPError."""
+    return FakeResponse(b'{"error":{"message":"%s"}}' % message.encode(),
+                        code, headers or {})
 
 
 def hide_real_settings_file(case):
@@ -69,6 +82,8 @@ class ApiRequestTest(unittest.TestCase):
         ai.os.environ["ANTHROPIC_API_KEY"] = "test-key"
         self.slept = []
         self.calls = 0
+        self._request = ai._request
+        self.addCleanup(setattr, ai, "_request", self._request)
 
     def tearDown(self):
         for name, value in (("ANTHROPIC_API_KEY", self._key), ("CB_AUTH", self._auth)):
@@ -79,13 +94,15 @@ class ApiRequestTest(unittest.TestCase):
 
     def patch(self, sequence):
         """Each element is an exception to raise or a response to return."""
-        def fake(req, timeout=None):
+        def fake(body, headers, timeout, pool=None):
             item = sequence[min(self.calls, len(sequence) - 1)]
             self.calls += 1
             if isinstance(item, Exception):
                 raise item
-            return item
-        ai.urllib.request.urlopen = fake
+            # A fresh copy each time: the last element is reused once the
+            # sequence runs out, and a body can only be read once.
+            return item.clone()
+        ai._request = fake
 
     def test_missing_key_raises_before_any_request(self):
         ai.os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -95,9 +112,9 @@ class ApiRequestTest(unittest.TestCase):
             ai._open({"model": "m"}, sleep=self.slept.append)
 
     def test_retries_then_succeeds(self):
-        self.patch([http_error(529, "overloaded"), http_error(529), FakeResponse(b"{}")])
+        self.patch([http_error(529, "overloaded"), http_error(529), FakeResponse()])
         resp = ai._open({"model": "m"}, sleep=self.slept.append)
-        self.assertIsInstance(resp, FakeResponse)
+        self.assertEqual(resp.status, 200)
         self.assertEqual(self.calls, 3)
         self.assertEqual(len(self.slept), 2)
 
@@ -118,17 +135,17 @@ class ApiRequestTest(unittest.TestCase):
             self.assertEqual(self.calls, 1, "status %d should not retry" % code)
 
     def test_retry_after_header_is_honoured(self):
-        self.patch([http_error(429, "slow down", {"retry-after": "7"}), FakeResponse(b"{}")])
+        self.patch([http_error(429, "slow down", {"retry-after": "7"}), FakeResponse()])
         ai._open({"model": "m"}, sleep=self.slept.append)
         self.assertEqual(self.slept, [7.0])
 
     def test_backoff_is_capped(self):
-        self.patch([http_error(429, "x", {"retry-after": "9999"}), FakeResponse(b"{}")])
+        self.patch([http_error(429, "x", {"retry-after": "9999"}), FakeResponse()])
         ai._open({"model": "m"}, sleep=self.slept.append)
         self.assertLessEqual(self.slept[0], 30)
 
     def test_network_failure_retries_then_reports(self):
-        self.patch([urllib.error.URLError("no route")])
+        self.patch([OSError("no route")])
         with self.assertRaises(ai.ApiError) as caught:
             ai._open({"model": "m"}, sleep=self.slept.append)
         self.assertIn("network error", str(caught.exception))
@@ -142,6 +159,237 @@ class ApiRequestTest(unittest.TestCase):
             list(ai._stream("sys", "prompt"))
         self.assertIn("server error (500)", str(caught.exception))
         self.assertIn("transient", str(caught.exception))
+
+
+class FakeRaw:
+    """A stand-in for http.client.HTTPResponse."""
+
+    def __init__(self, lines=(b"ok",), status=200, will_close=False):
+        self.status = status
+        self.headers = {}
+        self.will_close = will_close
+        self._lines = list(lines)
+        self.closed = False
+
+    def read(self, amt=None):
+        data = b"".join(self._lines)
+        self._lines = []
+        return data
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeConn:
+    """A connection that records its life and can be told how to fail."""
+
+    serial = 0
+
+    def __init__(self, timeout=None, fail=None, raw=None):
+        FakeConn.serial += 1
+        self.id = FakeConn.serial
+        self.timeout = timeout
+        self.fail = fail
+        self.raw = raw or FakeRaw()
+        self.requests = []
+        self.closed = False
+
+    def request(self, method, path, body=None, headers=None):
+        if self.fail is not None:
+            failure, self.fail = self.fail, None
+            raise failure
+        self.requests.append((method, path, headers))
+
+    def getresponse(self):
+        return self.raw
+
+    def close(self):
+        self.closed = True
+
+
+class PoolTest(unittest.TestCase):
+    """The keep-alive bookkeeping, without a socket in sight."""
+
+    def setUp(self):
+        self.made = []
+        self.now = [1000.0]
+
+    def pool(self, **kw):
+        def connect(timeout):
+            conn = FakeConn(timeout)
+            self.made.append(conn)
+            return conn
+        kw.setdefault("clock", lambda: self.now[0])
+        return ai._Pool(connect, **kw)
+
+    def test_a_returned_connection_is_the_next_one_handed_out(self):
+        pool = self.pool()
+        conn, reused = pool.take(60)
+        self.assertFalse(reused)
+        pool.give_back(conn)
+        again, reused = pool.take(60)
+        self.assertIs(again, conn)
+        self.assertTrue(reused, "a pooled connection must be reported as reused")
+        self.assertEqual(len(self.made), 1, "no second handshake")
+
+    def test_a_discarded_connection_is_closed_and_not_reused(self):
+        pool = self.pool()
+        conn, _ = pool.take(60)
+        pool.discard(conn)
+        self.assertTrue(conn.closed)
+        again, reused = pool.take(60)
+        self.assertIsNot(again, conn)
+        self.assertFalse(reused)
+
+    def test_an_idle_connection_past_its_welcome_is_dropped(self):
+        pool = self.pool(idle_timeout=50)
+        conn, _ = pool.take(60)
+        pool.give_back(conn)
+        self.now[0] += 51
+        again, reused = pool.take(60)
+        self.assertFalse(reused)
+        self.assertTrue(conn.closed, "the stale one should not just be leaked")
+
+    def test_the_idle_list_is_capped_and_evicts_the_oldest(self):
+        pool = self.pool(max_idle=2)
+        conns = [pool.take(60)[0] for _ in range(3)]
+        for conn in conns:
+            pool.give_back(conn)
+        self.assertEqual(pool.idle_count(), 2)
+        self.assertTrue(conns[0].closed)
+        self.assertFalse(conns[2].closed)
+
+
+class ResponseReuseTest(unittest.TestCase):
+    """The half-read-body hazard: a response nobody finished must never hand
+    its socket back, or the leftovers become the next request's reply."""
+
+    def setUp(self):
+        self.given = []
+        self.dropped = []
+
+    def make(self, raw):
+        pool = type("P", (), {
+            "give_back": lambda _s, c: self.given.append(c),
+            "discard": lambda _s, c: self.dropped.append(c),
+        })()
+        return ai._Response(raw, "conn", pool)
+
+    def test_a_fully_read_body_recycles_the_connection(self):
+        resp = self.make(FakeRaw([b"body"]))
+        resp.read()
+        resp.close()
+        self.assertEqual(self.given, ["conn"])
+        self.assertEqual(self.dropped, [])
+
+    def test_a_fully_iterated_body_recycles_the_connection(self):
+        resp = self.make(FakeRaw([b"a\n", b"b\n"]))
+        self.assertEqual(list(resp), [b"a\n", b"b\n"])
+        resp.close()
+        self.assertEqual(self.given, ["conn"])
+
+    def test_a_stream_abandoned_half_way_drops_the_connection(self):
+        resp = self.make(FakeRaw([b"a\n", b"b\n", b"c\n"]))
+        for _line in resp:
+            break
+        resp.close()
+        self.assertEqual(self.given, [])
+        self.assertEqual(self.dropped, ["conn"])
+
+    def test_an_unread_body_drops_the_connection(self):
+        resp = self.make(FakeRaw([b"a\n"]))
+        resp.close()
+        self.assertEqual(self.dropped, ["conn"])
+
+    def test_a_partial_read_drops_the_connection(self):
+        resp = self.make(FakeRaw([b"abcdef"]))
+        resp.read(2)
+        resp.close()
+        self.assertEqual(self.dropped, ["conn"])
+
+    def test_connection_close_from_the_server_is_obeyed(self):
+        resp = self.make(FakeRaw([b"body"], will_close=True))
+        resp.read()
+        resp.close()
+        self.assertEqual(self.dropped, ["conn"],
+                         "the server said it is closing; do not pool it")
+
+    def test_closing_twice_releases_the_connection_once(self):
+        resp = self.make(FakeRaw([b"body"]))
+        resp.read()
+        resp.close()
+        resp.close()
+        self.assertEqual(self.given, ["conn"])
+
+
+class StaleRetryTest(unittest.TestCase):
+    """A kept-alive socket the far end closed while we were idle must be retried
+    transparently -- exactly once, and only when it was actually reused."""
+
+    def setUp(self):
+        self.made = []
+
+    def pool(self, failures):
+        """`failures` is one entry per connection handed out, or None."""
+        def connect(timeout):
+            index = len(self.made)
+            conn = FakeConn(timeout, fail=failures[index] if index < len(failures) else None)
+            self.made.append(conn)
+            return conn
+        return ai._Pool(connect)
+
+    def test_stale_reused_connection_is_retried_on_a_fresh_one(self):
+        pool = self.pool([http.client.RemoteDisconnected("closed"), None])
+        first, _ = pool.take(60)
+        pool.give_back(first)          # now it is an idle, reusable connection
+        resp = ai._request(b"{}", {}, 60, pool=pool)
+        self.assertEqual(len(self.made), 2, "should have opened one replacement")
+        self.assertTrue(first.closed)
+        self.assertEqual(self.made[1].requests[0][0], "POST")
+        self.assertIs(resp._conn, self.made[1])
+
+    def test_the_retry_happens_at_most_once(self):
+        pool = self.pool([http.client.RemoteDisconnected("closed"),
+                          http.client.RemoteDisconnected("closed again")])
+        first, _ = pool.take(60)
+        pool.give_back(first)
+        with self.assertRaises(http.client.RemoteDisconnected):
+            ai._request(b"{}", {}, 60, pool=pool)
+        self.assertEqual(len(self.made), 2, "no third connection")
+
+    def test_a_fresh_connection_failing_is_not_retried(self):
+        """The same exception on a brand new socket is a real network failure.
+        Opening another only delays the message the user needs to read."""
+        pool = self.pool([ConnectionResetError("refused")])
+        with self.assertRaises(ConnectionResetError):
+            ai._request(b"{}", {}, 60, pool=pool)
+        self.assertEqual(len(self.made), 1)
+
+    def test_a_timeout_on_a_reused_connection_is_not_retried(self):
+        """The server may still be working on it; a second copy is a second
+        bill, and the retry budget in _open_with is the right place anyway."""
+        pool = self.pool([socket.timeout("too slow"), None])
+        first, _ = pool.take(60)
+        pool.give_back(first)
+        with self.assertRaises(socket.timeout):
+            ai._request(b"{}", {}, 60, pool=pool)
+        self.assertEqual(len(self.made), 1)
+
+    def test_is_stale_only_answers_yes_for_reused_connections(self):
+        for exc in (http.client.RemoteDisconnected("x"),
+                    http.client.BadStatusLine("junk"),
+                    http.client.CannotSendRequest(),
+                    ConnectionResetError(), BrokenPipeError()):
+            self.assertTrue(ai._is_stale(exc, True), repr(exc))
+            self.assertFalse(ai._is_stale(exc, False), repr(exc))
+
+    def test_unrelated_failures_are_never_treated_as_stale(self):
+        for exc in (socket.timeout(), socket.gaierror("no such host"),
+                    ValueError("bug"), ai.ApiError("nope")):
+            self.assertFalse(ai._is_stale(exc, True), repr(exc))
 
 
 class ErrorMessageTest(unittest.TestCase):
@@ -217,20 +465,22 @@ class AuthTest(unittest.TestCase):
         self.fake_subscription()
         seen = []
 
-        def fake(req, timeout=None):
-            seen.append(req.headers.get("X-api-key") or req.headers.get("Authorization"))
+        def fake(body, headers, timeout, pool=None):
+            seen.append(headers.get("x-api-key") or headers.get("authorization"))
             if len(seen) == 1:
-                raise http_error(429, "rate limited")
+                return http_error(429, "rate limited")
             return FakeResponse(b'{"content":[{"type":"text","text":"hi"}]}')
 
-        original = ai.urllib.request.urlopen
-        ai.urllib.request.urlopen = fake
+        original = ai._request
+        ai._request = fake
         try:
             resp = ai._open({"stream": False}, sleep=lambda _s: None)
             self.assertEqual(json.loads(resp.read())["content"][0]["text"], "hi")
         finally:
-            ai.urllib.request.urlopen = original
+            ai._request = original
         self.assertEqual(len(seen), 2, "should have tried the second credential")
+        self.assertTrue(seen[0].startswith("sk-ant-"), "API key goes first")
+        self.assertTrue(seen[1].startswith("Bearer "), "the OAuth token is the fallback")
         self.assertEqual(ai.LAST_CREDENTIAL, "max subscription")
 
     def test_non_final_credential_does_not_burn_the_retry_budget(self):
@@ -240,17 +490,17 @@ class AuthTest(unittest.TestCase):
         self.fake_subscription()
         calls = []
 
-        def fake(req, timeout=None):
+        def fake(body, headers, timeout, pool=None):
             calls.append(1)
-            raise http_error(429, "rate limited")
+            return http_error(429, "rate limited")
 
-        original = ai.urllib.request.urlopen
-        ai.urllib.request.urlopen = fake
+        original = ai._request
+        ai._request = fake
         try:
             with self.assertRaises(ai.ApiError):
                 ai._open({"stream": False}, sleep=lambda _s: None)
         finally:
-            ai.urllib.request.urlopen = original
+            ai._request = original
         # 1 attempt for the API key (no retries, it is not last) + 1 + MAX_RETRIES
         # for the subscription, which is.
         self.assertEqual(len(calls), 1 + 1 + ai.MAX_RETRIES)

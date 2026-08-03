@@ -20,10 +20,16 @@ gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  # noqa: E402
-               passwords, perf, reader, resources, storage, store, style, tabnames)
+               passwords, perf, reader, resources, storage, store, style, tabnames,
+               urls)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
+
+# How long the omnibox must sit still before its host is worth resolving.
+# Firing on the keystroke itself would resolve every prefix of a hostname --
+# "e", "exa", "exampl.c" -- names that do not exist, several per navigation.
+PREFETCH_DELAY_MS = 300
 
 # What the hamburger holds: (heading, ((icon, label, accelerator, action), ...)).
 # Claude comes first because it is the reason this browser exists; everything
@@ -827,9 +833,45 @@ class Browser(Gtk.Window):
 
         completion.connect("match-selected", self._on_suggestion)
         self.omnibox.set_completion(completion)
+        self._prefetch_id = None
+        self._warmer = urls.HostWarmer(self._prefetch_dns)
         self.omnibox.connect("changed", self._on_omnibox_changed)
 
+    def _prefetch_dns(self, host):
+        """Resolve a name into WebKit's own cache before the navigation needs it.
+
+        Deprecated upstream in 2.46 with nothing to replace it in the 4.1 API,
+        so it is called defensively: on a build without it the browser simply
+        does not preconnect, which is exactly where it was before.
+        """
+        try:
+            self.context.prefetch_dns(host)
+        except (AttributeError, TypeError, GLib.Error):
+            pass
+
+    def _schedule_prefetch(self, entry):
+        """Warm the typed host's DNS a beat after typing stops.
+
+        Debounced rather than deduped alone: the dedupe in `HostWarmer` cannot
+        tell "example.c" from "example.com", so without the pause a single
+        domain still costs a lookup for each of its prefixes.
+        """
+        if self._prefetch_id is not None:
+            GLib.source_remove(self._prefetch_id)
+            self._prefetch_id = None
+        if not entry.has_focus():
+            return
+        text = entry.get_text()
+
+        def fire():
+            self._prefetch_id = None
+            self._warmer.consider(text)
+            return GLib.SOURCE_REMOVE
+
+        self._prefetch_id = GLib.timeout_add(PREFETCH_DELAY_MS, fire)
+
     def _on_omnibox_changed(self, entry):
+        self._schedule_prefetch(entry)
         if self.store is None or not entry.has_focus():
             return
         text = entry.get_text().strip()
