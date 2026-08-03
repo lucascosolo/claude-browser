@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import control, envfile
+from . import control, envfile, style
 
 
 def main(argv=None):
@@ -20,8 +20,9 @@ def main(argv=None):
                         help="run as a plain browser with no agent API")
     parser.add_argument("--token", default=None,
                         help="require this token on control requests")
-    parser.add_argument("--theme", choices=("dark", "light"), default=None,
-                        help="override the system light/dark preference")
+    parser.add_argument("--theme", choices=style.THEME_NAMES, default=None,
+                        help="override the system theme preference "
+                             "(%s)" % ", ".join(style.THEME_NAMES))
     parser.add_argument("--env-file", help="settings file (default: "
                                            "~/.config/claude-browser/env)")
     parser.add_argument("--new-window", action="store_true",
@@ -110,8 +111,7 @@ def main(argv=None):
             except GLib.Error:
                 pass  # a missing window icon is not worth failing to launch over
 
-    dark = None if args.theme is None else (args.theme == "dark")
-    browser = Browser(urls=args.urls or None, dark=dark)
+    browser = Browser(urls=args.urls or None, theme=args.theme)
     browser.show_all()
     browser.panel.hide()
     browser.progress.hide()

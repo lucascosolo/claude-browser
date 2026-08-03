@@ -45,7 +45,7 @@ console.log(JSON.stringify(out));
 
 def render(sources):
     """Run the panel's renderer over each source string, in node."""
-    page = panel_html.page(style.palette(True))
+    page = panel_html.page(style.palette("dark"))
     script = page[page.index("<script>") + len("<script>"):page.rindex("</script>")]
     js = ("const SCRIPT = %s;\nconst CASES = %s;\n%s"
           % (json.dumps(script), json.dumps(sources), HARNESS))

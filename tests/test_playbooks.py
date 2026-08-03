@@ -302,7 +302,7 @@ class TestPage(unittest.TestCase):
     the store is fed in as the plain dicts `Playbooks.summaries()` returns.
     """
 
-    palette = style.palette(True)
+    palette = style.palette("dark")
 
     def render(self, books=(), recording=None, available=True):
         return pages.playbooks_page(self.palette, "NONCE", list(books),

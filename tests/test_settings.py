@@ -58,7 +58,7 @@ class Isolated(unittest.TestCase):
         raise AssertionError("%s is not on the page" % key)
 
     def render(self, notice=None):
-        return pages.settings_page(style.palette(True), "NONCE", self.described(),
+        return pages.settings_page(style.palette("dark"), "NONCE", self.described(),
                                    notice=notice)
 
 

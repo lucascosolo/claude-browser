@@ -189,7 +189,7 @@ class TestDataPageSurface(unittest.TestCase):
                    "discarded": 0, "tab_ceiling": 10, "loading": 0}
         info = {"policy": "nothird", "domains": 1, "cache_bytes": 0,
                 "cookie_jar_bytes": 0, "data_dir": "/tmp/cb"}
-        return pages.data_page(style.palette(True), "NONCE", machine, info,
+        return pages.data_page(style.palette("dark"), "NONCE", machine, info,
                                lambda size: "0 B", light=light)
 
     def test_it_says_when_the_hint_is_being_sent(self):

@@ -93,7 +93,7 @@ class TestDataPage(unittest.TestCase):
                               "tab_ceiling": 10, "loading": 0}
         info = info or {"policy": "nothird", "domains": 12, "cache_bytes": 4096,
                         "cookie_jar_bytes": 512, "data_dir": "/tmp/cb"}
-        return pages.data_page(style.palette(True), "NONCE", machine, info, human,
+        return pages.data_page(style.palette("dark"), "NONCE", machine, info, human,
                                pagetext_info=pagetext_info)
 
     def test_it_renders_the_numbers_that_matter(self):

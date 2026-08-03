@@ -127,7 +127,7 @@ class StoreTest(unittest.TestCase):
 
 class PageRenderTest(unittest.TestCase):
     def setUp(self):
-        self.palette = style.palette(True)
+        self.palette = style.palette("dark")
         self.nonce = "test-nonce-value"
 
     def rows(self, url="https://a.example/x", title="A"):

@@ -232,14 +232,17 @@ SETTINGS = (
     # -- Appearance ---------------------------------------------------------
     Setting(
         "CB_THEME", "Appearance", "Theme",
-        "dark or light, overriding the system preference.",
+        "dark, light or phosphor, overriding the system preference.",
         "choice", "",
         "Applies now",
         "The window and the browser's own pages re-colour immediately. The "
         "Claude panel is a document that is already loaded, so it keeps its "
         "colours until the browser restarts.",
-        choices=(("", "Follow the desktop"), ("dark", "Dark"), ("light", "Light")),
-        canon=_choice_canon(("", "dark", "light"))),
+        # "Follow the desktop" can only ever mean dark or light -- a desktop has
+        # no way to ask for phosphor, so that one has to be picked by name.
+        choices=(("", "Follow the desktop"), ("dark", "Dark"), ("light", "Light"),
+                 ("phosphor", "Phosphor (HUD)")),
+        canon=_choice_canon(("", "dark", "light", "phosphor"))),
     Setting(
         "CB_LIGHT", "Appearance", "Ask sites for a lighter page",
         "Sends Save-Data: on with each page this browser loads, and asks for "

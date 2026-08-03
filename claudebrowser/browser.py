@@ -279,7 +279,7 @@ class Tab:
 
 
 class Browser(Gtk.Window):
-    def __init__(self, urls=None, dark=None):
+    def __init__(self, urls=None, theme=None):
         super().__init__(title="claude-browser")
         self.set_default_size(1180, 780)
         self.tabs = []
@@ -288,13 +288,14 @@ class Browser(Gtk.Window):
         # Read before _apply_css overwrites it: that call sets the same property,
         # so this is the only moment the desktop's own preference is still
         # legible -- and cb:settings offers "follow the desktop" as a choice.
-        self.system_dark = bool(
+        # Held as a theme name, not a flag: there are three themes now, and only
+        # two of them are what a desktop can express.
+        self.system_theme = "dark" if (
             gtk_settings
-            and gtk_settings.get_property("gtk-application-prefer-dark-theme"))
-        if dark is None:
-            dark = self.system_dark
-        self.dark = dark
-        self._apply_css(dark)
+            and gtk_settings.get_property("gtk-application-prefer-dark-theme")
+        ) else "light"
+        self.theme = style.resolve(theme or self.system_theme)
+        self._apply_css(self.theme)
 
         # Before any WebView exists: WebKit reads the GTK settings block once at
         # web-process start as well as watching it, so flipping this after the
@@ -425,7 +426,7 @@ class Browser(Gtk.Window):
 
     # -- construction -------------------------------------------------------
 
-    def _apply_css(self, dark):
+    def _apply_css(self, theme):
         # One provider, reloaded. It used to build a new one per call, which was
         # harmless while this only ran at startup; cb:settings can now re-theme a
         # running window, and adding a provider per switch leaves every previous
@@ -437,10 +438,20 @@ class Browser(Gtk.Window):
                 Gdk.Screen.get_default(), provider,
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
             )
-        provider.load_from_data(style.css(dark))
         s = Gtk.Settings.get_default()
+        # Reduced motion, decided here because it is the only place that can see
+        # both halves. The first call happens before `perf.tune_gtk` has run, so
+        # `gtk-enable-animations` is still its default True and the setting is
+        # what answers; every later call (a re-theme from cb:settings) sees the
+        # property tune_gtk actually managed to set. Either way a sheet with no
+        # transitions in it is the one thing that cannot be undone by a widget
+        # animating anyway.
+        animations = bool(s.get_property("gtk-enable-animations")) if s else True
+        provider.load_from_data(
+            style.css(theme, motion=animations and not perf.light_enabled()))
         if s:
-            s.set_property("gtk-application-prefer-dark-theme", dark)
+            s.set_property("gtk-application-prefer-dark-theme",
+                           style.is_dark(theme))
 
     def _icon_button(self, icon, tooltip, handler):
         btn = Gtk.Button()
@@ -639,7 +650,7 @@ class Browser(Gtk.Window):
         self.panel_ready = False
         self.panel_queue = []
         self.panel_view.connect("load-changed", self._on_panel_loaded)
-        self.panel_view.load_html(panel_html.page(style.palette(self.dark)), None)
+        self.panel_view.load_html(panel_html.page(style.palette(self.theme)), None)
         box.pack_start(self.panel_view, True, True, 0)
 
         prompt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -1095,7 +1106,7 @@ class Browser(Gtk.Window):
         request.finish(stream, len(data), "text/html; charset=utf-8")
 
     def _render_internal(self, name, query=""):
-        palette = style.palette(self.dark)
+        palette = style.palette(self.theme)
         term = ""
         for part in (query or "").split("&"):
             key, _sep, value = part.partition("=")
@@ -2967,8 +2978,8 @@ class Browser(Gtk.Window):
             self.persona_combo.set_active_id(personas.current())
         elif knob.key == "CB_THEME":
             wanted = settings.effective(knob)[0]
-            self.dark = self.system_dark if not wanted else (wanted == "dark")
-            self._apply_css(self.dark)
+            self.theme = style.resolve(wanted or self.system_theme)
+            self._apply_css(self.theme)
             # The Claude panel is not re-themed: it is a loaded document, and
             # reloading it would throw away the conversation in it. cb:settings
             # says so rather than letting it look like a rendering bug.

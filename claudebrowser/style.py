@@ -1,23 +1,67 @@
 """The visual language of the browser, in one file.
 
-Chrome stays minimal -- one 40px bar -- but not colourless. The palette is
-Claude's: a warm coral-orange accent against warm neutrals, rather than the
-blue-grey default every GTK app already looks like.
+Chrome stays minimal -- one 40px bar -- but not colourless. There are three
+themes, chosen by name (`CB_THEME`, `--theme`), never by a boolean:
 
-Colour is used for meaning, never decoration:
-  accent   the active mode, focus, progress, the prompt caret
+  dark, light   Claude's warm neutrals and coral accent. Unchanged.
+  phosphor      a near-black, cool-cast HUD: cyan phosphor structure, hairline
+                rules, bracketed fields, one static scanline gradient.
+
+Colour is used for meaning, never decoration, and it is spent on two separate
+axes -- which is the one thing to understand before editing a palette:
+
+  accent   *chrome* state: focus, the active tab, load progress, selection,
+           a private window. In dark/light this is Claude's coral; in phosphor
+           it is cyan.
+  agent    *Claude* state: the AI buttons, "Claude is driving this tab", the
+           busy status. Always coral/amber, in every theme.
   ok       a finished run
   warn     something failed, and why
-Everything else is neutral so those three read instantly.
+
+The two-accent split exists because the agent's on-page cursor is amber and
+cannot be re-themed -- it is drawn into the page, not the chrome. If chrome
+focus and agent activity shared an ink, then in phosphor either the cursor
+would no longer match its own chrome, or "Claude is doing something" would
+become the same green-cyan as "this text field has focus", and the one signal
+that must never be missed would be the most common colour on screen. So
+structure gets the phosphor, and Claude keeps the warm ink it already owns.
+In dark/light `agent` is simply the same coral `accent` already was, so those
+two themes keep exactly the colours they had.
+
+Tokens (the same keys in every theme, so a template written against one theme
+renders in all three):
+
+  bg bar panel field field_focus tab_active   surfaces, back to front
+  line          the load-bearing 1px rule; >= 3:1 on every surface
+  edge          a decorative structural line -- HUD brackets, corner marks
+  text dim      body ink (>= 4.5:1) and secondary ink (>= 3:1)
+  accent accent_soft on_accent    chrome state
+  agent agent_soft on_agent       Claude state
+  ok warn       outcome
+  grid          ink of the static texture; equals `bg` where there is none
+  mono          the chrome font chain -- only faces installed here
+  name          the theme's own name, for templates that branch on it
+
+`mono` is for chrome labels (tabs, omnibox, status, menu) only. Web page
+content is never restyled by this file, and never gets a font from it.
 """
+
+# Only faces `fc-list` actually reports on this machine, most-preferred first.
+# No downloaded fonts, ever: this browser has no network at build time and a
+# missing family silently falls back to whatever GTK picks, which is a
+# proportional sans and destroys the whole point of a monospaced chrome.
+_MONO = ('"DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", '
+         '"Noto Mono", "Nimbus Mono PS", monospace')
 
 # Claude's warm neutrals and coral accent. The dark surfaces are warm-tinted
 # (note the red channel leads) so the orange sits on them without clashing.
 _DARK = {
+    "name": "dark",
     "bg": "#1f1e1d",
     "bar": "#262624",
     "panel": "#232221",
     "line": "#3a3937",
+    "edge": "#3a3937",
     "text": "#f0eee6",
     "dim": "#9a968c",
     "field": "#2a2927",
@@ -25,18 +69,25 @@ _DARK = {
     "accent": "#d97757",       # Claude coral
     "accent_soft": "#4a2e24",  # accent at low alpha, pre-blended for GTK3
     "on_accent": "#1f1e1d",
+    "agent": "#d97757",        # same ink: here chrome and Claude agree
+    "agent_soft": "#4a2e24",
+    "on_agent": "#1f1e1d",
     "ok": "#7fb069",
     "warn": "#e0894f",
     "tab_active": "#2f2d2b",
+    "grid": "#1f1e1d",         # == bg: this theme draws no texture
+    "mono": _MONO,
 }
 
 # On white, the coral has to darken to stay readable as text (#d97757 is only
 # ~2.9:1 on white; this is ~4.6:1). Same hue, different job.
 _LIGHT = {
+    "name": "light",
     "bg": "#ffffff",
     "bar": "#faf9f5",
     "panel": "#f7f5ef",
     "line": "#e5e1d8",
+    "edge": "#e5e1d8",
     "text": "#3d3d3a",
     "dim": "#6f6c63",
     "field": "#ffffff",
@@ -44,10 +95,59 @@ _LIGHT = {
     "accent": "#b8532f",
     "accent_soft": "#f6e4dc",
     "on_accent": "#ffffff",
+    "agent": "#b8532f",
+    "agent_soft": "#f6e4dc",
+    "on_agent": "#ffffff",
     "ok": "#4a7c3f",
     "warn": "#a8541f",
     "tab_active": "#ffffff",
+    "grid": "#ffffff",
+    "mono": _MONO,
 }
+
+# Phosphor: a cool near-black instrument panel.
+#
+# The surfaces are blue-led rather than red-led (the exact inverse of _DARK) and
+# stop short of #000 -- pure black gives a 1px hairline nothing to sit on, and
+# on an LCD it reads as a hole rather than as a surface. Everything here was
+# picked against the contrast floor, not by eye: `text` is 17:1 on `bg`, `dim`
+# 8.8:1, `line` 4.1:1, and each of accent/agent/ok/warn clears 6.5:1 on every
+# surface it is ever painted on -- see tests/test_style.py, which computes them.
+#
+# Four hues, far enough apart to be told apart at 12px and at a glance:
+# cyan (chrome), amber (Claude), green (done), red (failed).
+_PHOSPHOR = {
+    "name": "phosphor",
+    "bg": "#04070b",
+    "bar": "#070c12",
+    "panel": "#060a10",
+    "line": "#4a7686",         # 4.06:1 on bg -- a hairline you can still see
+    "edge": "#1f7288",         # deeper cyan: brackets and corner marks
+    "text": "#d6f5ea",
+    "dim": "#8fb3ab",
+    "field": "#050a10",
+    "field_focus": "#08131b",
+    "accent": "#38dbff",       # phosphor cyan: focus, structure, chrome state
+    "accent_soft": "#0b252d",  # accent at 14% over bg, pre-blended for GTK3
+    "on_accent": "#04070b",
+    "agent": "#ffb454",        # Claude's ink here: amber, matching the cursor
+    "agent_soft": "#271f15",
+    "on_agent": "#04070b",
+    "ok": "#4ee88a",
+    "warn": "#ff6b6b",
+    "tab_active": "#0c1620",
+    "grid": "#38dbff",         # the scanline is the accent at ~3% alpha
+    "mono": _MONO,
+}
+
+THEMES = {"dark": _DARK, "light": _LIGHT, "phosphor": _PHOSPHOR}
+
+#: In the order they are offered on cb:settings and on `--theme`.
+THEME_NAMES = ("dark", "light", "phosphor")
+
+#: Which themes want the dark stock GTK widgets underneath (scrollbars, the
+#: file chooser, anything this sheet does not repaint).
+DARK_THEMES = ("dark", "phosphor")
 
 _TEMPLATE = """
 window, .cb-root {{ background: {bg}; }}
@@ -69,15 +169,16 @@ window, .cb-root {{ background: {bg}; }}
     min-width: 20px;
     min-height: 20px;
     border-radius: 7px;
-    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+    {mo}
 }}
 .cb-nav button:hover {{ color: {text}; background: {field_focus}; border-color: {line}; }}
 .cb-nav button:active {{ color: {accent}; background: {accent_soft}; border-color: transparent; }}
 .cb-nav button:disabled {{ color: {line}; background: transparent; border-color: transparent; }}
 
-/* The Claude actions get the accent, so they read as a group. */
-.cb-nav button.cb-ai {{ color: {accent}; }}
-.cb-nav button.cb-ai:hover {{ background: {accent_soft}; color: {accent}; }}
+/* The Claude actions get the agent ink, so they read as a group -- and as the
+   same program as the amber cursor Claude draws on the page. */
+.cb-nav button.cb-ai {{ color: {agent}; }}
+.cb-nav button.cb-ai:hover {{ background: {agent_soft}; color: {agent}; }}
 
 /* The bookmark star: lit means saved. The one control here whose colour is
    state rather than decoration. */
@@ -86,7 +187,8 @@ window, .cb-root {{ background: {bg}; }}
 
 /* ---- private tabs ----
    A private window must be obvious at a glance without being loud: a dashed
-   accent underline on the bar, and a badge on the tab itself. */
+   accent underline on the bar, and a badge on the tab itself. Chrome state, so
+   chrome ink -- a private window is not Claude doing something. */
 .cb-private .cb-bar {{
     border-bottom: 1px dashed {accent};
     background: {panel};
@@ -109,7 +211,7 @@ window, .cb-root {{ background: {bg}; }}
     padding: 6px 12px;
     margin: 0 6px;
     caret-color: {accent};
-    transition: border-color 120ms ease, box-shadow 120ms ease;
+    {mo_field}
 }}
 /* A focus ring rather than a hard accent outline: 3px of very transparent
    accent reads as "this is live" without redrawing the box in a new colour
@@ -128,8 +230,8 @@ window, .cb-root {{ background: {bg}; }}
 
 /* ---- the save-password bar ----
    Sits under the toolbar and above the page. It is a prompt, not an alert, so
-   it does not shout: the surface is the same warm neutral as every other panel
-   and the accent appears exactly twice -- a 3px spine on the left edge, and the
+   it does not shout: the surface is the same neutral as every other panel and
+   the accent appears exactly twice -- a 3px spine on the left edge, and the
    one button that actually does something. An accent-washed background with a
    flat accent button was the first attempt and read as an error banner; colour
    spent everywhere buys no emphasis anywhere. */
@@ -162,7 +264,7 @@ entry.cb-findentry {{
     min-height: 0;
     outline: none;
     caret-color: {accent};
-    transition: border-color 120ms ease, box-shadow 120ms ease;
+    {mo_field}
 }}
 entry.cb-findentry:focus {{
     background: {field_focus};
@@ -232,7 +334,7 @@ entry.cb-findentry.cb-find-miss:focus {{
     color: {dim};
     font-size: 0.92em;
     outline: none;
-    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+    {mo}
 }}
 .cb-pwbtn:hover {{ color: {text}; background: {field_focus}; border-color: {line}; }}
 
@@ -295,7 +397,7 @@ popover.cb-menu > arrow {{
     min-height: 0;
     color: {text};
     outline: none;
-    transition: background 110ms ease, color 110ms ease;
+    {mo}
 }}
 /* GTK gives the first row keyboard focus as soon as the popover opens, and the
    default focus ring reads as "already selected" on a menu nobody has touched. */
@@ -310,7 +412,7 @@ popover.cb-menu > arrow {{
 .cb-accel {{
     color: {dim};
     font-size: 0.80em;
-    font-family: monospace;
+    font-family: {mono};
     padding-left: 14px;
 }}
 .cb-menuitem:hover .cb-accel {{ color: alpha({accent}, 0.85); }}
@@ -331,7 +433,7 @@ notebook.cb-tabs > header > tabs > tab {{
     border-radius: 8px 8px 0 0;
     font-size: 0.88em;
     min-height: 0;
-    transition: background 120ms ease, color 120ms ease;
+    {mo}
 }}
 notebook.cb-tabs > header > tabs > tab:checked {{
     background: {tab_active};
@@ -345,26 +447,26 @@ notebook.cb-tabs > header > tabs > tab:checked:hover {{ background: {tab_active}
     padding: 0 3px; margin: 0; min-width: 16px; min-height: 16px;
     border-radius: 5px;
     color: {dim};
-    transition: background 120ms ease, color 120ms ease;
+    {mo}
 }}
 .cb-tabclose:hover {{ color: {text}; background: alpha({text}, 0.10); }}
 
 /* ---- "Claude is driving this tab" ----
    GTK3 has no animation we can rely on here, so the tell is static and loud
-   rather than pulsing: an accent ring on the tab, and an accent frame around
-   the whole window while that tab is the one on screen. Both use the same ink
-   as every other Claude surface, so it reads as "the assistant", not "an
-   error". */
+   rather than pulsing: an agent-ink ring on the tab, and a frame around the
+   whole window while that tab is the one on screen. Both use the same ink as
+   the cursor Claude draws into the page, so it reads as "the assistant", not
+   "an error" and not "something has focus". */
 .cb-tablabel.cb-agent {{
-    background: {accent_soft};
-    border: 1px solid {accent};
+    background: {agent_soft};
+    border: 1px solid {agent};
     border-radius: 5px;
     padding: 0 4px;
     margin: -1px -2px;
 }}
 .cb-root.cb-agent-window {{
-    border: 2px solid {accent};
-    background: {accent_soft};
+    border: 2px solid {agent};
+    background: {agent_soft};
 }}
 
 /* The drag handle between page and console. GTK gives a paned separator 1px by
@@ -426,8 +528,10 @@ notebook.cb-tabs > header > tabs > tab:checked:hover {{ background: {tab_active}
 }}
 .cb-persona button:hover {{ color: {text}; border-color: {dim}; }}
 
+/* `busy` is Claude working, so it takes the agent ink; ok/warn are the outcome
+   of that work and keep their own. */
 .cb-status {{ color: {dim}; font-size: 0.82em; padding: 0 8px; }}
-.cb-status.busy {{ color: {accent}; }}
+.cb-status.busy {{ color: {agent}; }}
 .cb-status.ok {{ color: {ok}; }}
 .cb-status.warn {{ color: {warn}; }}
 
@@ -435,21 +539,22 @@ notebook.cb-tabs > header > tabs > tab:checked:hover {{ background: {tab_active}
     background: {panel};
     color: {text};
     padding: 8px 10px;
-    font-family: monospace;
+    font-family: {mono};
     font-size: 0.92em;
 }}
 .cb-panel-view text {{ background: {panel}; color: {text}; }}
 .cb-panel-view text selection {{ background: {accent}; color: {on_accent}; }}
 
-/* Prompt row: a console line, accent caret and chevron. */
+/* Prompt row: a console line. The chevron is where you type *to Claude*, so it
+   carries the agent ink; the caret is ordinary text focus and does not. */
 .cb-prompt-row {{
     background: {bar};
     border-top: 1px solid {line};
     padding: 3px 6px;
 }}
 .cb-chevron {{
-    color: {accent};
-    font-family: monospace;
+    color: {agent};
+    font-family: {mono};
     font-weight: 700;
     padding: 0 4px 0 6px;
 }}
@@ -459,7 +564,7 @@ notebook.cb-tabs > header > tabs > tab:checked:hover {{ background: {tab_active}
     border: none;
     box-shadow: none;
     padding: 5px 4px;
-    font-family: monospace;
+    font-family: {mono};
     caret-color: {accent};
 }}
 .cb-prompt:focus {{ background: transparent; border: none; box-shadow: none; }}
@@ -481,12 +586,193 @@ notebook.cb-tabs > header > tabs > tab:checked:hover {{ background: {tab_active}
 .cb-panel-btn.stop:hover {{ color: {warn}; border-color: {warn}; }}
 """
 
+# ---------------------------------------------------------------------------
+# The HUD layer.
+#
+# Appended after the base sheet, for the phosphor theme only, and every rule in
+# it is an override of one already above. Written this way rather than as a
+# second full template so that dark and light keep exactly the shape they have
+# today -- picking phosphor is meant to be a visible choice, not a silent
+# redesign of the other two -- and so there is one place to read what "HUD"
+# actually means here:
+#
+#   * square corners. A radius is the single loudest 2010s-app tell, and a HUD
+#     is drawn with a plotter, not a rounded-rect API.
+#   * brackets instead of boxes. The focused field is held between two 2px
+#     accent uprights with hairlines top and bottom -- "[ text ]" -- which reads
+#     as an instrument slot rather than as a form input, and needs no
+#     pseudo-elements (GTK3 has none).
+#   * monospaced, letterspaced micro-labels. GTK3 has no `text-transform`, so
+#     the strings themselves stay as the widgets set them; the tell is the face
+#     and the tracking.
+#   * one static scanline. `repeating-linear-gradient` at 3% alpha, painted
+#     once into each chrome strip and cached by GTK like any other background.
+#     Not on `window`/`.cb-root`: the WebView covers those entirely, so it would
+#     be pure cost for pixels nobody sees -- and never as an animation, which on
+#     two cores is a frame budget spent on decoration.
+# ---------------------------------------------------------------------------
+_HUD = """
+/* Scanline. One declaration, reused: 1px of accent at 3% every 3px. At 3% it is
+   texture rather than pattern -- it should be noticeable on a large flat strip
+   and invisible behind text. */
+.cb-bar, .cb-panel-head, .cb-prompt-row, .cb-findbar, .cb-pwbar,
+notebook.cb-tabs > header {{
+    background-image: repeating-linear-gradient(
+        to bottom,
+        alpha({grid}, 0.030) 0px, alpha({grid}, 0.030) 1px,
+        transparent 1px, transparent 3px);
+}}
+/* The bar's underline is the top rule of the instrument: hairline, plus one
+   faint accent line under it so the chrome sits on a lit edge. */
+.cb-bar {{
+    border-bottom: 1px solid {edge};
+    box-shadow: inset 0 -2px 0 -1px alpha({accent}, 0.22);
+}}
 
-def palette(dark: bool) -> dict:
+/* Square everything the base sheet rounded. */
+.cb-nav button, .cb-pwbtn, .cb-findbtn, .cb-findtoggle, .cb-tabclose,
+.cb-menuitem, .cb-priv-badge, .cb-panel-btn, .cb-persona,
+.cb-persona button, .cb-tablabel.cb-agent {{ border-radius: 0; }}
+.cb-mode {{ border-radius: 0; }}
+notebook.cb-tabs > header > tabs > tab {{ border-radius: 0; }}
+popover.cb-menu, popover.cb-menu > arrow {{ border-radius: 0; }}
+
+/* Chrome type: monospaced, tracked out, small. Never the page -- these are all
+   chrome nodes. */
+.cb-nav button, .cb-pwbtn, .cb-findbtn, .cb-findtoggle, .cb-findcount,
+.cb-menuitem, .cb-menuhead, .cb-status, .cb-priv-badge, .cb-mode,
+.cb-panel-btn, .cb-persona button, .cb-pwbar label,
+notebook.cb-tabs > header > tabs > tab {{
+    font-family: {mono};
+}}
+/* The micro-labels: the ones that are a legend on an instrument rather than a
+   sentence. Tracking is what makes 11px monospace read as engraved. */
+.cb-menuhead, .cb-status, .cb-findcount, .cb-priv-badge, .cb-mode,
+.cb-panel-btn, .cb-findtoggle {{
+    letter-spacing: 1px;
+}}
+.cb-menuhead {{ letter-spacing: 2px; }}
+notebook.cb-tabs > header > tabs > tab {{ letter-spacing: 0.5px; font-size: 0.84em; }}
+
+/* ---- the omnibox as a bracketed slot ---- */
+.cb-omnibox {{
+    border-radius: 0;
+    border: 1px solid {line};
+    border-left: 2px solid {edge};
+    border-right: 2px solid {edge};
+    font-family: {mono};
+    padding: 6px 10px;
+}}
+/* Focus: the brackets light, and the field gets a real glow rather than a
+   flat ring -- 1px hard edge plus 9px of bloom, which is the CRT tell. */
+.cb-omnibox:focus {{
+    border-color: {line};
+    border-left-color: {accent};
+    border-right-color: {accent};
+    box-shadow: 0 0 0 1px alpha({accent}, 0.45), 0 0 9px alpha({accent}, 0.30);
+}}
+entry.cb-findentry {{
+    border-radius: 0;
+    border-left: 2px solid {edge};
+    border-right: 2px solid {edge};
+    font-family: {mono};
+}}
+entry.cb-findentry:focus {{
+    border-color: {line};
+    border-left-color: {accent};
+    border-right-color: {accent};
+    box-shadow: 0 0 0 1px alpha({accent}, 0.45), 0 0 9px alpha({accent}, 0.30);
+}}
+entry.cb-findentry.cb-find-miss,
+entry.cb-findentry.cb-find-miss:focus {{
+    border-color: {warn};
+    box-shadow: 0 0 0 1px alpha({warn}, 0.45), 0 0 9px alpha({warn}, 0.30);
+}}
+
+/* The active tab: a lit underline plus the same bloom, so the eye finds it in
+   a row of dim monospace without needing a filled shape. */
+notebook.cb-tabs > header > tabs > tab:checked {{
+    box-shadow: 0 0 8px alpha({accent}, 0.22);
+}}
+
+/* Buttons read as switch positions: a hairline that lights on hover. */
+.cb-nav button:hover {{ border-color: {edge}; }}
+.cb-nav button:active {{ box-shadow: 0 0 7px alpha({accent}, 0.28); }}
+.cb-nav button.cb-ai:hover {{ box-shadow: 0 0 7px alpha({agent}, 0.28); }}
+
+/* The menu is a panel bolted to the bar, not a floating pill: square, a
+   hairline in the structural cyan, and a hard shadow instead of a soft one. */
+popover.cb-menu {{
+    border: 1px solid {edge};
+    box-shadow: 0 6px 22px alpha(#000000, 0.55);
+}}
+.cb-menuhead-gap {{ border-top: 1px solid {edge}; }}
+
+/* Claude working: amber, and the only glow on screen that is not cyan. That is
+   the whole point of the split -- at a glance, colour alone says whether the
+   machine is waiting for you or for Claude. */
+.cb-tablabel.cb-agent {{ box-shadow: 0 0 8px alpha({agent}, 0.35); }}
+.cb-root.cb-agent-window {{ border-color: {agent}; }}
+
+/* The console keeps a plain surface: it is a field of text, and a scanline
+   behind it would fight the lines of the text itself. Only its chrome (head,
+   prompt row) carries the texture. */
+.cb-panel {{ border-top: 1px solid {edge}; }}
+.cb-panel-btn {{ border-color: {edge}; }}
+.cb-split > separator {{
+    background: {bar};
+    border-top: 1px solid {edge};
+    border-bottom: 1px solid {edge};
+}}
+.cb-chevron {{ text-shadow: 0 0 8px alpha({agent}, 0.45); }}
+"""
+
+# The transitions, as tokens rather than literals, so reduced motion removes
+# them instead of overriding them: a later `transition: none` rule would lose to
+# any earlier selector with higher specificity, and GTK3 has no `!important`
+# escape worth relying on. An empty string here means the property is simply
+# never declared.
+_MOTION = {
+    "mo": ("transition: background 120ms ease, color 120ms ease, "
+           "border-color 120ms ease;"),
+    "mo_field": "transition: border-color 120ms ease, box-shadow 120ms ease;",
+}
+_STILL = {"mo": "", "mo_field": ""}
+
+
+def resolve(theme) -> str:
+    """The name of the theme to use for `theme`.
+
+    Accepts a name, or None/"" meaning "the caller has no opinion" -- which
+    lands on dark rather than raising, because a typo in `CB_THEME` must not be
+    able to stop the browser from starting.
+    """
+    name = (theme or "").strip().lower()
+    return name if name in THEMES else "dark"
+
+
+def is_dark(theme) -> bool:
+    """Should the stock GTK widgets under this sheet be the dark ones?"""
+    return resolve(theme) in DARK_THEMES
+
+
+def palette(theme) -> dict:
     """The raw colours, for widgets that cannot be styled with CSS
-    (GtkTextTag takes colours directly, not style classes)."""
-    return dict(_DARK if dark else _LIGHT)
+    (GtkTextTag takes colours directly, not style classes) and for the `cb:`
+    pages and the Claude panel, which render HTML against the same tokens."""
+    return dict(THEMES[resolve(theme)])
 
 
-def css(dark: bool) -> bytes:
-    return _TEMPLATE.format(**palette(dark)).encode()
+def css(theme, motion: bool = True) -> bytes:
+    """The GTK3 sheet for `theme`.
+
+    `motion=False` strips every transition. That state is not guessable from
+    inside this module -- it is `perf.light_enabled()` and GTK's own
+    `gtk-enable-animations`, both of which live outside it -- so the caller
+    reads it and passes it in. Importing perf here would drag `gi` into a module
+    that is otherwise pure data and testable without a display.
+    """
+    name = resolve(theme)
+    tokens = dict(THEMES[name], **(_MOTION if motion else _STILL))
+    sheet = _TEMPLATE + (_HUD if name == "phosphor" else "")
+    return sheet.format(**tokens).encode()
