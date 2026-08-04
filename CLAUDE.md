@@ -302,6 +302,15 @@ stronger gate; on those four, py_compile is the only one there is.
   (which needs a hand-written `X-XFCE-Helper`), and `gio`. `install.sh
   --set-default` writes all four. Writing one leaves the system disagreeing
   with itself.
+- **Shipping is not finished until `./install.sh --set-default` has been run.**
+  This is the user's daily browser, so a merge that never reaches the installed
+  entry points is a release that did not happen. `~/.local/bin/claude-browser` is
+  a *symlink into this working tree*, so the code itself follows whatever is
+  checked out — but the desktop entry, the icons and the four registries above do
+  not, and a stale one fails as `Failed to execute child process
+  "claude-browser"`, which looks like a broken browser rather than a stale
+  registration. Run the installer after every ship or deploy, then confirm with
+  `xdg-settings get default-web-browser` and one real launch.
 - **The settings file beats the environment**, on purpose — see the long comment
   in `envfile.py`. A desktop-launched window never sees your shell. The API key
   is never copied into `os.environ` at all.

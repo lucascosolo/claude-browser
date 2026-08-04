@@ -123,3 +123,28 @@ policy (M1, M2) and the Python layer above WebKit, not WebKit storage.**
 - **L7** `tabnames.py` makes no network call; "AI tab naming" is a misnomer.
   Closed.
 - **L8** `personas` contributes no page data. Closed.
+
+## What the suite cannot reach
+
+Every HIGH and MEDIUM finding above is fixed and covered by tests, with two
+deliberate exceptions: **L1** stands (that deck is *how you switch to a private
+tab*, it is in-memory only, and it is shoulder-surfing rather than a stored
+leak), and **M5** needed no action.
+
+But `browser.py`, `control.py`, `findbar.py` and `__main__.py` need a display and
+are never imported by any test, so the following are *not* proven by a green
+suite and want a hand check on a real display before the privacy claim is treated
+as fully verified:
+
+1. `storage.apply_policy` really flipping `itp_enabled` and the cookie accept
+   policy on a live ephemeral manager.
+2. `download-started` firing for a download from an ephemeral view, and the
+   cancel actually landing.
+3. Popup inheritance end to end — an OAuth-style `window.open` from a private tab
+   arriving *as* a private tab, with the badge.
+4. `cb:private` and `cb:vpn` rendering in all three themes.
+5. `tab.view.destroy()` in `close_tab` staying warning-free over a close/reopen
+   cycle.
+6. VPN Mode on: the exit IP shown matches the VPS, and a private tab opened while
+   VPN Mode is on is *also* proxied — the two features have to compose, and the
+   private tab is the one that would silently go out direct.
