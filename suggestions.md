@@ -10,24 +10,47 @@ it does not get re-proposed here every six months.
 
 Ideas that have since been built — reader mode, the page-text cache, `recall`
 full-text search, the visible agent cursor, the outbound PII scrubber, playbooks,
-and Claude personas — are documented in `README.md` and `CLAUDE.md` and are no
-longer suggestions.
+Claude personas, discard-path tab summaries, private-mode hardening and VPN
+Mode — are documented in `README.md` and `CLAUDE.md` and are no longer
+suggestions.
 
-## Tab snapshot summaries
+## Perceived speed and feel
 
-A discarded tab currently reloads from nothing when you come back to it, and in
-the deck it is a title and a site mark. Give the resource guard's discard path a
-one-line summary to leave behind, so a dropped tab still says what it was.
+Measured on the target machine, not guessed: **Celeron N3060, 2 cores @1.6GHz,
+3.8GB RAM, and no swap configured at all** (`swapon --show` is empty). That is
+what decides every trade here — `perf.py`'s conservative defaults are *correct*
+and must not be loosened to buy smoothness. Smooth scrolling and WebGL stay off.
+What is left are the wins that cost no CPU.
 
-The text is already on disk — `pagetext.text_for(url)` has the article for any
-page that finished loading — so this is a summarisation and a place to put the
-result, not a new capture path. Cache the summary keyed by content hash, the
-same way `pagetext` keys bodies, so revisiting an article does not pay for it
-twice. Show it on the `cb:deck` card and in the tab tooltip.
+- **Every navigation flashes white.** `set_background_color` is applied to the
+  Claude panel and to no page view, so WebKit paints its default white between
+  commit and first paint. On the phosphor default that is the single most jarring
+  thing about using the browser, and it is free to fix.
+- **Autoplay is allowed.** `media-playback-requires-user-gesture` defaults to
+  `False` and `perf.tune_view` never sets it. On two 1.6GHz cores an autoplaying
+  video is not a nuisance, it is the page. This is the biggest real CPU win left.
+- **No hover prefetch.** DNS is warmed while typing in the omnibox
+  (`urls.HostWarmer`) but there is no `mouse-target-changed` handler, so a link
+  the pointer is resting on pays full DNS latency on click. It has to inherit the
+  privacy gates: not in a private tab, and not while VPN Mode is on, where a local
+  resolution would defeat the tunnel.
+- **`Tab.scroll` is a dead field** — set to `0` and never read or written again,
+  so a tab discarded under memory pressure reloads to the top and loses your
+  reading position. Capturing and restoring it makes discards nearly invisible.
+- **Back/forward swipe gestures** (`enable-back-forward-navigation-gestures`)
+  default `False` and are free to enable.
+- **Startup is ~7.8s of imports** (`python3 -X importtime`), most of it
+  unavoidable — the WebKit2 typelib alone is ~2.6s and Gtk+Gdk ~1.4s. But
+  `claudebrowser.agent` costs 0.83s cumulative and pulls in `ai` (0.81s) and
+  `http.client` (0.36s), none of which is needed until the user actually asks for
+  something. Note the self-inflicted part: the private-mode work put
+  `private_ai_enabled()` / `PRIVATE_REFUSAL` in `ai.py`, and `api_tabs` calls it,
+  so an ordinary tab listing now drags `http.client` and `ssl` in. Move those two
+  names to a GTK-free home and `agent`/`ai` become lazy imports.
 
-Open question worth deciding before starting: whether the summary is generated
-eagerly on discard (costs an API call for a tab you may never return to) or
-lazily the first time the deck renders a discarded card.
+Rejected after probing: `enable-mediasource` and `enable-webaudio` stay **on**.
+Disabling them breaks streaming video and site audio, which is a correctness
+regression sold as a speed win.
 
 ## An editable outbound prompt preview
 
