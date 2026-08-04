@@ -208,6 +208,58 @@ window, .cb-root {{ background: {bg}; }}
     border-radius: 4px;
 }}
 
+/* ---- VPN Mode ----
+   Chrome ink, not agent ink: where the browser's packets go is a property of
+   the window, the same axis as "this is a private tab" -- it is not Claude
+   doing something, and painting it amber would put it in the one colour that
+   has to keep meaning only that. It is told apart from the private underline
+   by being a filled pill carrying text (the exit address) rather than a rule.
+
+   It is only ever visible while the mode is engaged, so it costs nothing when
+   it has nothing to say. `bad` is the failed state, and it is the loud one on
+   purpose: in that state the browser has stopped loading pages.
+
+   Every selector here is `.cb-nav button.cb-vpnpill` and not `.cb-vpnpill`,
+   because the pill lives in the toolbar's right-hand `.cb-nav` box and
+   `.cb-nav button` above is a *more specific* selector than a bare class. A
+   plain `.cb-vpnpill` therefore lost every property the nav rule also sets --
+   which is not a rule that fails loudly, it is a pill that renders as ordinary
+   dim toolbar text with no box around it, and only in the two themes whose
+   `dim` happens to look like ordinary text. */
+.cb-nav button.cb-vpnpill {{
+    background: {accent_soft};
+    background-image: none;
+    box-shadow: none;
+    color: {accent};
+    border: 1px solid {accent};
+    border-radius: 6px;
+    padding: 1px 7px;
+    margin: 0 3px;
+    min-height: 0;
+    min-width: 0;
+    font-size: 0.76em;
+    font-weight: 700;
+}}
+.cb-nav button.cb-vpnpill:hover {{
+    background: {accent};
+    color: {on_accent};
+    border-color: {accent};
+}}
+/* Not yet proven. Deliberately quiet -- the proxy is already applied, so this
+   is "checking", not "warning". */
+.cb-nav button.cb-vpnpill.wait {{
+    background: transparent;
+    color: {dim};
+    border-color: {line};
+}}
+.cb-nav button.cb-vpnpill.wait:hover {{ background: {field_focus}; color: {text}; }}
+.cb-nav button.cb-vpnpill.bad {{
+    background: transparent;
+    color: {warn};
+    border-color: {warn};
+}}
+.cb-nav button.cb-vpnpill.bad:hover {{ background: {warn}; color: {bg}; }}
+
 /* ---- omnibox ---- */
 .cb-omnibox {{
     background: {field};
@@ -639,6 +691,7 @@ notebook.cb-tabs > header {{
 .cb-nav button, .cb-pwbtn, .cb-findbtn, .cb-findtoggle, .cb-tabclose,
 .cb-menuitem, .cb-priv-badge, .cb-panel-btn, .cb-persona,
 .cb-persona button, .cb-tablabel.cb-agent {{ border-radius: 0; }}
+.cb-nav button.cb-vpnpill {{ border-radius: 0; }}
 .cb-mode {{ border-radius: 0; }}
 notebook.cb-tabs > header > tabs > tab {{ border-radius: 0; }}
 popover.cb-menu, popover.cb-menu > arrow {{ border-radius: 0; }}
@@ -647,16 +700,22 @@ popover.cb-menu, popover.cb-menu > arrow {{ border-radius: 0; }}
    chrome nodes. */
 .cb-nav button, .cb-pwbtn, .cb-findbtn, .cb-findtoggle, .cb-findcount,
 .cb-menuitem, .cb-menuhead, .cb-status, .cb-priv-badge, .cb-mode,
-.cb-panel-btn, .cb-persona button, .cb-pwbar label,
+.cb-panel-btn, .cb-persona button, .cb-pwbar label, .cb-vpnpill,
 notebook.cb-tabs > header > tabs > tab {{
     font-family: {mono};
 }}
 /* The micro-labels: the ones that are a legend on an instrument rather than a
    sentence. Tracking is what makes 11px monospace read as engraved. */
 .cb-menuhead, .cb-status, .cb-findcount, .cb-priv-badge, .cb-mode,
-.cb-panel-btn, .cb-findtoggle {{
+.cb-panel-btn, .cb-findtoggle, .cb-vpnpill {{
     letter-spacing: 1px;
 }}
+/* The exit address is the payload of this pill, so it gets the glow the
+   phosphor sheet gives everything else that is live. Same specificity note as
+   the base rules: `.cb-nav button` would otherwise beat a bare class. */
+.cb-nav button.cb-vpnpill {{ box-shadow: 0 0 7px alpha({accent}, 0.26); }}
+.cb-nav button.cb-vpnpill.wait {{ box-shadow: none; }}
+.cb-nav button.cb-vpnpill.bad {{ box-shadow: 0 0 7px alpha({warn}, 0.30); }}
 .cb-menuhead {{ letter-spacing: 2px; }}
 notebook.cb-tabs > header > tabs > tab {{ letter-spacing: 0.5px; font-size: 0.84em; }}
 

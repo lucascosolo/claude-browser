@@ -29,8 +29,9 @@ from claudebrowser import envfile, pages, personas, settings, style  # noqa: E40
 EVERY_KEY = (
     "CB_AUTH", "CB_AUTOSTART", "CB_BLOCK", "CB_COOKIES", "CB_GPU", "CB_HOME",
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
-    "CB_PERSONA", "CB_PORT", "CB_SCRUB", "CB_SEARCH", "CB_THEME", "CB_TOKEN",
-    "CB_URL", "CB_WEBGL",
+    "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
+    "CB_SCRUB", "CB_SEARCH", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_VPN",
+    "CB_VPN_PROXY", "CB_WEBGL",
 )
 
 
@@ -89,7 +90,16 @@ class TestTable(Isolated):
         which CB_THEME does). Adding a setting copies an existing row, so the
         badge is exactly the field most likely to be copied unexamined."""
         live = {"CB_THEME", "CB_LIGHT", "CB_SCRUB", "CB_PERSONA", "CB_AUTH",
-                "CB_PACE", "CB_URL", "CB_AUTOSTART"}
+                "CB_PACE", "CB_URL", "CB_AUTOSTART",
+                # Both read at the moment they are consulted -- ai.private_ai_-
+                # enabled when a Claude feature is handed a tab, and
+                # storage.private_downloads_enabled when a download starts.
+                "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
+                # The window applies CB_VPN the moment it changes, the way it
+                # re-applies CB_THEME; CB_VPN_PROXY is read out of the file
+                # every time the mode is engaged, so correcting it and toggling
+                # is enough.
+                "CB_VPN", "CB_VPN_PROXY"}
         for knob in settings.SETTINGS:
             immediate = "restart" not in knob.effect.lower()
             self.assertEqual(immediate, knob.key in live,
@@ -171,6 +181,40 @@ class TestValidation(Isolated):
     def test_a_boolean_only_takes_the_words_it_understands(self):
         self.bad("CB_BLOCK", "maybe")
         self.assertEqual(self.apply("CB_BLOCK", "no"), "0")
+
+    def test_the_private_knobs_default_to_the_private_answer(self):
+        """Both are the inverse of every other boolean here: off is the safe
+        reading, so an unrecognised value has to land on off rather than on."""
+        for key in ("CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS"):
+            knob = settings.get(key)
+            self.assertEqual(knob.default, "0", key)
+            self.assertFalse(knob.truth(""), key)
+            self.assertFalse(knob.truth("yeah"), key)
+            self.assertFalse(knob.truth(None), key)
+            self.assertTrue(knob.truth("1"), key)
+            self.assertTrue(knob.truth("on"), key)
+
+    def test_the_private_knobs_are_written_as_ones_and_zeroes(self):
+        for key in ("CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS"):
+            self.assertEqual(self.apply(key, "yes"), "1")
+            self.assertEqual(self.apply(key, "off"), "0")
+            with self.assertRaises(ValueError, msg=key):
+                self.apply(key, "sometimes")
+            self.assertEqual(envfile.values(self.path)[key], "0")
+
+    def test_the_private_knobs_are_what_their_consumers_read(self):
+        """The table restates a spelling that lives in ai.py and storage.py;
+        this is the string that ties the two together."""
+        from claudebrowser import ai, storage
+
+        for word in ("1", "on", "true", "YES"):
+            self.assertTrue(ai.private_ai_enabled(word), word)
+            self.assertTrue(storage.private_downloads_enabled(word), word)
+            self.assertTrue(settings.get("CB_PRIVATE_AI").truth(word), word)
+        for word in ("", "0", "off", "maybe"):
+            self.assertFalse(ai.private_ai_enabled(word), word)
+            self.assertFalse(storage.private_downloads_enabled(word), word)
+            self.assertFalse(settings.get("CB_PRIVATE_AI").truth(word), word)
 
     def test_an_unknown_setting_is_refused(self):
         with self.assertRaises(ValueError):
@@ -321,15 +365,40 @@ class TestSecrets(Isolated):
         self.path.write_text("CB_TOKEN=hunter2\n")
         self.assertIn('type="password" value=""', self.render())
 
-    def test_the_api_key_is_not_a_setting_here(self):
-        """It lives in the same file, and envfile refuses to write it. Offering
-        a field would be the first step towards weakening that."""
+    def test_no_secret_is_writable_from_here(self):
+        """Every key envfile calls a secret is refused by this table too.
+
+        The API key is not in the table at all. CB_VPN_PROXY is -- it is a
+        genuine setting a user needs to see the state of -- but it is there as
+        a report, not as a control: it holds the proxy's password, so `apply`
+        and `reset` both refuse it before envfile gets the chance to.
+        """
+        self.assertNotIn("ANTHROPIC_API_KEY", settings.BY_KEY)
         for key in envfile.SECRET_KEYS:
-            self.assertNotIn(key, settings.BY_KEY)
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError, msg=key):
                 self.apply(key, "sk-ant-nope")
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError, msg=key):
                 self.reset(key)
+            knob = settings.BY_KEY.get(key)
+            if knob is not None:
+                self.assertFalse(knob.writable, key)
+                self.assertTrue(knob.unwritable_note.strip(), key)
+
+    def test_the_proxy_address_is_reported_but_never_rendered(self):
+        """cb:vpn and cb:settings both need to say whether one is configured.
+        Neither may say what it is: the password is inside the URL."""
+        self.path.write_text(
+            "CB_VPN_PROXY=http://cb:hunter2@10.0.0.1:8888\n")
+        block = self.item("CB_VPN_PROXY")
+        self.assertTrue(block["set"])
+        self.assertNotIn("value", block)
+        self.assertNotIn("hunter2", repr(self.described()))
+        page = self.render()
+        self.assertNotIn("hunter2", page)
+        self.assertNotIn("10.0.0.1", page)
+        # And no control at all -- a Save button wired to a call that always
+        # fails is worse than no button.
+        self.assertNotIn('data-k="CB_VPN_PROXY"', page)
 
     def test_an_api_key_in_the_file_never_reaches_the_page(self):
         self.path.write_text("ANTHROPIC_API_KEY=sk-ant-secret\nCB_BLOCK=0\n")

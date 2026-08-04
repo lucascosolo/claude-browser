@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from claudebrowser import ai, extract  # noqa: E402
 from claudebrowser.urls import (HostWarmer, looks_like_url,  # noqa: E402
-                                normalize, prefetch_host)
+                                normalize, omnibox_allows, prefetch_host)
 
 
 class TestUrlIntent(unittest.TestCase):
@@ -108,6 +108,26 @@ class TestHostWarmer(unittest.TestCase):
             warmer.consider("host%d.example" % i)
         self.assertEqual(len(self.warmed), 7)
         self.assertLessEqual(len(warmer._seen), 3)
+
+
+class TestOmniboxInAPrivateTab(unittest.TestCase):
+    """H7: there is one omnibox for the window, so everything hanging off its
+    "changed" signal has to ask whether the tab in front is private."""
+
+    def test_an_ordinary_tab_gets_all_three(self):
+        self.assertEqual(omnibox_allows(False),
+                         {"prefetch": True, "history": True, "recall": True})
+
+    def test_a_private_tab_gets_none_of_them(self):
+        allows = omnibox_allows(True)
+        self.assertFalse(allows["prefetch"])   # a DNS query leaves the machine
+        self.assertFalse(allows["history"])    # persistent rows in the dropdown
+        self.assertFalse(allows["recall"])     # snippets of pages read earlier
+
+    def test_the_policy_covers_every_helper_hung_off_the_signal(self):
+        """A fourth suggestion source must be added here, not beside it."""
+        self.assertEqual(sorted(omnibox_allows(False)),
+                         ["history", "prefetch", "recall"])
 
 
 class TestJsConstruction(unittest.TestCase):
@@ -406,7 +426,7 @@ class TestApiRegistry(unittest.TestCase):
             "/clear": {"kind": "pagetext"},
             "/playbook/record": {"action": "status"}, "/playbook/list": {},
             "/playbook/run": {"name": "login"}, "/playbook/delete": {"name": "login"},
-            "/persona": {}, "/settings": {},
+            "/persona": {}, "/settings": {}, "/vpn": {},
         }
         # /health is served without touching the browser, so it has no builder.
         callable_routes = {op.route for op in self.api.OPS if op.call}

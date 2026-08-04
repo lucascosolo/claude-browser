@@ -38,7 +38,7 @@ it. Nothing here is a fresh description of behaviour written from the name.
 
 import os
 
-from . import envfile, personas
+from . import envfile, personas, vpn
 
 #: Section headings, in the order the page shows them, with the one line that
 #: says what the section is for.
@@ -81,6 +81,25 @@ def _only_zero_is_off(raw):
 def _only_one_is_on(raw):
     """perf.tune_view reads CB_WEBGL with a literal `== "1"`."""
     return (raw or "").strip() == "1"
+
+
+def _only_on_words(raw):
+    """ai.private_ai_enabled / storage.private_downloads_enabled: off unless a
+    word that unambiguously means on. The inverse list from `_off_words`, and
+    the inversion is the point -- for these two a typo has to fall back to the
+    private behaviour, not out of it."""
+    return (raw or "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def _vpn_truth(raw):
+    """vpn.enabled: absent is off, but anything that is not a word meaning off
+    is on. The inverse of `_only_on_words` and inverted deliberately -- for this
+    one knob a misreading in the "off" direction means browsing from your own
+    address while the browser says otherwise, and in the "on" direction it means
+    a mode you have to turn back off. Called through a wrapper because
+    `vpn.enabled(None)` goes and reads the settings file, which is not what a
+    validator handed an empty value should do."""
+    return vpn.enabled(raw or "")
 
 
 def _choice_canon(values, aliases=None):
@@ -137,12 +156,14 @@ class Setting:
 
     __slots__ = ("key", "section", "label", "explain", "kind", "default",
                  "effect", "effect_note", "choices", "canon", "minimum",
-                 "maximum", "step", "truth", "check", "allow_empty", "unit")
+                 "maximum", "step", "truth", "check", "allow_empty", "unit",
+                 "writable", "unwritable_note")
 
     def __init__(self, key, section, label, explain, kind, default, effect,
                  effect_note, choices=(), canon=None, minimum=None,
                  maximum=None, step=1, truth=None, check=None,
-                 allow_empty=False, unit=""):
+                 allow_empty=False, unit="", writable=True,
+                 unwritable_note=""):
         self.key = key
         self.section = section
         self.label = label
@@ -160,6 +181,13 @@ class Setting:
         self.check = check
         self.allow_empty = allow_empty    # empty box means "remove the line"
         self.unit = unit
+        # A setting the browser reports but refuses to write. There is one, and
+        # it is a credential: see CB_VPN_PROXY below and envfile.SECRET_KEYS.
+        # The refusal lives here rather than only in envfile so the page can
+        # render the row without a control at all, instead of offering a Save
+        # button that always fails.
+        self.writable = writable
+        self.unwritable_note = unwritable_note
 
     # -- validation ---------------------------------------------------------
 
@@ -310,6 +338,62 @@ SETTINGS = (
         "Next question",
         "Read fresh every time a page is prepared for a question, so the next "
         "one you ask uses the new setting."),
+    Setting(
+        "CB_PRIVATE_AI", "Privacy", "Let Claude read private tabs",
+        "Off by default: Ask, TL;DR, Research and the Ctrl+G agent refuse a "
+        "private tab rather than send its address, title and text to "
+        "Anthropic. Turn it on if you want those features in a private tab "
+        "anyway.",
+        "bool", "0",
+        "Next question",
+        "Read at the moment a Claude feature is asked to read a tab, so the "
+        "next thing you ask uses the new setting.",
+        truth=_only_on_words),
+    Setting(
+        "CB_PRIVATE_DOWNLOADS", "Privacy", "Allow downloads from private tabs",
+        "Off by default: a download is a permanent file named by the remote "
+        "server, which is the one thing a private tab promises not to leave "
+        "behind. Downloads from ordinary tabs are unaffected.",
+        "bool", "0",
+        "Next download",
+        "Read when a download starts, so a change applies to the next one "
+        "without a restart.",
+        truth=_only_on_words),
+    Setting(
+        "CB_VPN", "Privacy", "VPN Mode",
+        "Sends this browser's page loads and its Claude API calls through the "
+        "proxy below, so sites see that machine's address instead of yours. It "
+        "is a proxy, not a VPN: other applications, WebRTC and system traffic "
+        "are untouched. cb:vpn has the state, the address the world sees, and "
+        "the full list of what it does not cover.",
+        "bool", "0",
+        "Applies now",
+        "The proxy is handed to the web context and to every private tab's own "
+        "session immediately, and the browser then checks what the outside "
+        "world sees before it will call itself on. If that check fails the "
+        "mode goes to failed and stays there — it never quietly goes back to "
+        "loading pages from your own address.",
+        truth=_vpn_truth),
+    Setting(
+        "CB_VPN_PROXY", "Privacy", "VPN proxy address",
+        "Where VPN Mode sends traffic, as http://user:password@host:port. Only "
+        "http:// works: the exit check and the Claude API tunnel are both an "
+        "HTTP CONNECT, which cannot speak socks5 or wrap TLS around a proxy hop.",
+        "secret", "",
+        "Next time VPN Mode is turned on",
+        "Read from the settings file each time the mode is engaged, so "
+        "correcting it and toggling VPN Mode off and on is enough.",
+        allow_empty=True,
+        # The one setting on this page the browser will not write. The address
+        # embeds the proxy's password -- WebKit's NetworkProxySettings takes
+        # credentials no other way -- so it is a credential wearing a URL's
+        # clothes, and every argument that keeps ANTHROPIC_API_KEY out of the
+        # settings controls applies to it unchanged. envfile.SECRET_KEYS refuses
+        # it one layer down as well; this is the layer that can explain why.
+        writable=False,
+        unwritable_note="This address holds a password, so the browser will "
+                        "not write it. Put it in the settings file by hand, "
+                        "the way the API key goes in."),
 
     # -- Performance --------------------------------------------------------
     Setting(
@@ -478,6 +562,8 @@ def describe_one(setting, path=None, environ=None):
         "source": source,
         "in_file": source == "file",
         "default": setting.default,
+        "writable": setting.writable,
+        "unwritable_note": setting.unwritable_note,
     }
     if setting.kind == "secret":
         block["set"] = bool(raw)
@@ -513,10 +599,27 @@ def describe(path=None, environ=None):
             "path": str(envfile.config_path() if path is None else path)}
 
 
+def _writable(setting):
+    """Refuse a setting the browser reports but will not write.
+
+    Checked in `apply` and in `reset` alike: "reset to default" on a credential
+    is deleting the user's credential from inside the browser, which is not a
+    smaller act than writing one. envfile refuses both again underneath, but
+    the message it raises names the mechanism; this one names the reason.
+    """
+    if setting.writable:
+        return
+    raise ValueError(
+        "%s is not editable from inside the browser. %s"
+        % (setting.label, setting.unwritable_note
+           or "Edit the settings file by hand."))
+
+
 def apply(key, value, path=None, environ=None):
     """Validate and store one setting. Returns what was written, or None when
     an empty value meant "remove the line"."""
     setting = get(key)
+    _writable(setting)
     cleaned = setting.clean(value)
     if cleaned is None:
         envfile.remove(key, path=path, environ=environ)
@@ -529,5 +632,6 @@ def reset(key, path=None, environ=None):
     """Drop the line so the built-in default applies again. Returns the default
     that is now in force."""
     setting = get(key)
+    _writable(setting)
     envfile.remove(key, path=path, environ=environ)
     return setting.default

@@ -1,0 +1,55 @@
+# /etc/systemd/system/cb-vpn.service
+#
+#   systemctl daemon-reload && systemctl enable --now cb-vpn
+#
+# `enable` is the half that survives a reboot; `start` alone does not, and the
+# omission is invisible until the box next restarts.
+
+[Unit]
+Description=cb-vpn — claude-browser tailnet HTTP forward proxy
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+# PartOf, not just Requires: restarting Docker rebuilds its iptables chains and
+# drops the DOCKER-USER jump this unit installs. Tying the lifecycle to Docker
+# means the egress filter is re-applied whenever that happens, instead of the
+# proxy coming back up with no SSRF protection and nobody noticing.
+PartOf=docker.service
+
+[Service]
+# Attached `compose up`, not `up -d`: systemd should be supervising something.
+# With a detached compose the unit exits immediately and Restart=always would
+# supervise nothing at all.
+Type=simple
+WorkingDirectory=/srv/cb-vpn
+
+# Firewall first, container second. If the rules cannot be installed the proxy
+# must not run — an unfiltered proxy on the tailnet is the failure mode this
+# whole design exists to avoid.
+ExecStartPre=/srv/cb-vpn/firewall.sh up
+ExecStartPre=/usr/bin/docker compose build --pull
+ExecStart=/usr/bin/docker compose up --remove-orphans --abort-on-container-exit
+ExecStop=/usr/bin/docker compose down
+
+# The chain is deliberately NOT torn down on stop: leaving it in place means a
+# restart window is never a window with the filter off.
+
+# Always, not on-failure: a clean exit(0) from an always-on proxy is still an
+# outage. RestartSec keeps a crash-loop off the CPU of a 2-core box.
+Restart=always
+RestartSec=10s
+
+# Give up after 5 failures in 5 minutes so a broken deploy surfaces as a failed
+# unit rather than looping in silence.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+TimeoutStartSec=900
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cb-vpn
+
+[Install]
+WantedBy=multi-user.target

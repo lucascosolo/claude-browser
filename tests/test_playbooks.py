@@ -222,6 +222,120 @@ class TestSecretsAreNeverRecorded(unittest.TestCase):
             self.assertNotIn("password", path.read_text())
 
 
+class TestTabPrivacy(unittest.TestCase):
+    """The mirror the recorder reads instead of GtkNotebook."""
+
+    def setUp(self):
+        self.privacy = playbooks.TabPrivacy()
+
+    def test_an_ordinary_tab_is_not_private(self):
+        self.privacy.opened(1, False)
+        self.privacy.focused(1)
+        self.assertFalse(self.privacy.is_private(1))
+        self.assertFalse(self.privacy.is_private())
+
+    def test_a_private_tab_is(self):
+        self.privacy.opened(2, True)
+        self.privacy.focused(2)
+        self.assertTrue(self.privacy.is_private(2))
+        self.assertTrue(self.privacy.is_private())
+
+    def test_no_tab_id_means_the_focused_one(self):
+        self.privacy.opened(1, False)
+        self.privacy.opened(2, True)
+        self.privacy.focused(1)
+        self.assertFalse(self.privacy.is_private())
+        self.privacy.focused(2)
+        self.assertTrue(self.privacy.is_private())
+
+    def test_an_unknown_id_answers_private(self):
+        """Fail closed: a stale id costs one step the user re-adds by hand, and
+        the other answer writes a private URL to disk."""
+        self.privacy.opened(1, False)
+        self.assertTrue(self.privacy.is_private(99))
+
+    def test_a_closed_tab_is_forgotten(self):
+        self.privacy.opened(1, False)
+        self.privacy.focused(1)
+        self.privacy.closed(1)
+        self.assertTrue(self.privacy.is_private(1))
+        self.assertTrue(self.privacy.is_private())
+
+    def test_no_focused_tab_answers_private(self):
+        self.assertTrue(self.privacy.is_private())
+
+    def test_a_tab_id_is_read_out_of_the_arguments(self):
+        self.assertEqual(playbooks.target_tab({"tab": 4}), 4)
+        self.assertEqual(playbooks.target_tab({"tab": "4"}), 4)
+        self.assertIsNone(playbooks.target_tab({}))
+        self.assertIsNone(playbooks.target_tab({"tab": ""}))
+        self.assertIsNone(playbooks.target_tab({"tab": "nonsense"}))
+
+
+class TestRecordingPrivateTabs(unittest.TestCase):
+    """H2: a step aimed at a private tab is refused, not written.
+
+    The recorder cannot see a tab id -- the registry's default is "the focused
+    tab" and clients omit it -- so the browser is the authority and this is
+    where that is pinned.
+    """
+
+    def setUp(self):
+        self.privacy = playbooks.TabPrivacy()
+        self.privacy.opened(1, False)
+        self.privacy.opened(2, True)
+        self.rec = playbooks.Recorder(self.privacy)
+        self.rec.start("run")
+
+    def test_a_navigate_in_a_private_tab_is_not_recorded(self):
+        self.privacy.focused(2)
+        self.assertFalse(self.rec.observe(
+            "navigate", {"url": "https://mail.example.com/?access_token=abc"}))
+        self.assertEqual(self.rec.stop()[1], [])
+
+    def test_the_url_never_reaches_the_file(self):
+        self.privacy.focused(2)
+        self.rec.observe("navigate",
+                         {"url": "https://x.example/?t=magic-link-value"})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "playbooks.json"
+            _name, steps, skipped = self.rec.stop()
+            playbooks.Playbooks(path).save(
+                "run", steps or [{"op": "reload", "params": {}}], skipped)
+            self.assertNotIn("magic-link-value", path.read_text())
+
+    def test_an_ordinary_tab_still_records(self):
+        self.privacy.focused(1)
+        self.assertTrue(self.rec.observe("navigate",
+                                         {"url": "https://example.com"}))
+
+    def test_an_explicit_private_tab_id_is_refused_too(self):
+        """The focused tab is ordinary; the operation names the private one."""
+        self.privacy.focused(1)
+        self.assertFalse(self.rec.observe("click", {"selector": "#go", "tab": 2}))
+
+    def test_the_refusals_are_counted_and_reported(self):
+        self.privacy.focused(2)
+        self.rec.observe("reload", {})
+        self.rec.observe("click", {"selector": "#go"})
+        status = self.rec.status()
+        self.assertEqual(status["skipped_private"], 2)
+        self.assertEqual(status["steps"], 0)
+        self.assertTrue(status["private_now"])
+
+    def test_a_recorder_with_no_privacy_mirror_records_as_before(self):
+        rec = playbooks.Recorder()
+        rec.start("run")
+        self.assertTrue(rec.observe("reload", {}))
+        self.assertFalse(rec.status()["private_now"])
+
+    def test_nothing_is_counted_while_not_recording(self):
+        self.rec.stop()
+        self.privacy.focused(2)
+        self.assertFalse(self.rec.observe("reload", {}))
+        self.assertEqual(self.rec.status()["skipped_private"], 0)
+
+
 class TestStorage(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -242,6 +356,12 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(book["steps"], self.steps())
         self.assertEqual(again.names(), ["report"])
         playbooks.validate(book["steps"])
+
+    def test_the_file_is_readable_only_by_its_owner(self):
+        """H3: it holds the URLs and selectors of the user's own logged-in
+        workflows, and the default umask would leave it world-readable."""
+        self.books.save("report", self.steps())
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
     def test_the_file_is_json_a_person_can_read(self):
         self.books.save("report", self.steps())

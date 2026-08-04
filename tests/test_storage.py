@@ -10,6 +10,7 @@ that a tab was discarded or that the cache has grown to a gigabyte.
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from claudebrowser import pages, style
 
@@ -42,6 +43,157 @@ class TestPolicy(unittest.TestCase):
         """A typo in an env var should cost you the setting, not the browser."""
         os.environ["CB_COOKIES"] = "yes-please"
         self.assertEqual(self.policy_name(), "nothird")
+
+
+class FakeCookies:
+    """The two calls `attach_cookies` makes, recorded rather than performed."""
+
+    def __init__(self):
+        self.policy = None
+        self.persisted = None
+
+    def set_accept_policy(self, policy):
+        self.policy = policy
+
+    def set_persistent_storage(self, path, backend):
+        self.persisted = (path, backend)
+
+
+class NoItpManager:
+    """A WebKit build with no `set_itp_enabled` at all. `apply_policy` has to
+    leave such a manager alone rather than raise, since one code path runs on
+    every build."""
+
+    def __init__(self):
+        self.cookies = FakeCookies()
+
+    def get_cookie_manager(self):
+        return self.cookies
+
+
+class FakeManager(NoItpManager):
+    def __init__(self):
+        super().__init__()
+        self.itp = None
+
+    def set_itp_enabled(self, enabled):
+        self.itp = enabled
+
+
+class TestPolicyOnAnyManager(unittest.TestCase):
+    """The policy half of storage.py, applied to a stand-in manager.
+
+    A private tab's manager is built by WebKit inside a view, so it cannot be
+    made here -- but `apply_policy` only ever calls these three methods, and
+    what it must do differently for an ephemeral manager is entirely visible
+    through them.
+    """
+
+    def setUp(self):
+        self.saved = {k: os.environ.get(k) for k in ("CB_COOKIES", "CB_ITP")}
+
+    def tearDown(self):
+        for key, value in self.saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    def storage(self):
+        from claudebrowser import storage
+
+        return storage
+
+    def test_an_ephemeral_manager_gets_the_same_cookie_policy(self):
+        storage = self.storage()
+        os.environ["CB_COOKIES"] = "none"
+        persistent, ephemeral = FakeManager(), FakeManager()
+        storage.apply_policy(persistent)
+        storage.apply_policy(ephemeral, persist=False)
+        self.assertEqual(ephemeral.cookies.policy, storage.POLICIES["none"])
+        self.assertEqual(ephemeral.cookies.policy, persistent.cookies.policy)
+
+    def test_an_ephemeral_manager_gets_no_cookie_file(self):
+        storage = self.storage()
+        os.environ["CB_COOKIES"] = "all"
+        manager = FakeManager()
+        storage.apply_policy(manager, persist=False)
+        self.assertEqual(manager.cookies.policy, storage.POLICIES["all"])
+        self.assertIsNone(manager.cookies.persisted)
+
+    def test_a_persistent_manager_still_gets_its_jar(self):
+        storage = self.storage()
+        os.environ["CB_COOKIES"] = "nothird"
+        manager = FakeManager()
+        storage.apply_policy(manager)
+        self.assertIsNotNone(manager.cookies.persisted)
+
+    def test_tracking_prevention_reaches_both(self):
+        """M1: the ephemeral manager defaulted to ITP off, so a private tab had
+        *weaker* tracking protection than an ordinary one."""
+        storage = self.storage()
+        os.environ.pop("CB_ITP", None)
+        ephemeral = FakeManager()
+        storage.apply_policy(ephemeral, persist=False)
+        self.assertTrue(ephemeral.itp)
+
+    def test_itp_can_still_be_turned_off(self):
+        storage = self.storage()
+        os.environ["CB_ITP"] = "0"
+        manager = FakeManager()
+        storage.apply_policy(manager, persist=False)
+        self.assertIsNone(manager.itp)
+
+    def test_a_build_without_itp_is_not_an_error(self):
+        storage = self.storage()
+        storage.apply_policy(NoItpManager(), persist=False)  # raises if it is
+
+
+class TestInheritedPrivacy(unittest.TestCase):
+    """H1/H6: a tab opened from a private tab is private, whoever opened it."""
+
+    def rule(self):
+        from claudebrowser import storage
+
+        return storage.child_is_private
+
+    def test_a_popup_from_a_private_tab_is_private(self):
+        self.assertTrue(self.rule()(True))
+
+    def test_a_popup_from_an_ordinary_tab_is_not(self):
+        self.assertFalse(self.rule()(False))
+
+    def test_asking_for_privacy_grants_it(self):
+        self.assertTrue(self.rule()(False, True))
+
+    def test_privacy_cannot_be_declined(self):
+        """The whole point: no combination of arguments turns it off."""
+        self.assertTrue(self.rule()(True, False))
+
+
+class TestPrivateDownloads(unittest.TestCase):
+    """M4: off unless the user unambiguously said yes."""
+
+    def allowed(self, raw):
+        from claudebrowser import storage
+
+        return storage.private_downloads_enabled(raw)
+
+    def test_nothing_set_means_no(self):
+        """Read against an empty settings file rather than the real one, so the
+        default under test is the code's and not this machine's."""
+        from claudebrowser import storage
+
+        path = Path(tempfile.mkdtemp()) / "env"
+        path.write_text("", encoding="utf-8")
+        self.assertFalse(storage.private_downloads_enabled(path=path))
+
+    def test_an_explicit_yes_means_yes(self):
+        for word in ("1", "on", "true", "YES"):
+            self.assertTrue(self.allowed(word), word)
+
+    def test_a_typo_falls_back_to_refusing(self):
+        for word in ("yeah", "sure", "0", "off", "", None):
+            self.assertFalse(self.allowed(word or ""), word)
 
 
 class TestSizes(unittest.TestCase):

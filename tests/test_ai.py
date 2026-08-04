@@ -802,6 +802,16 @@ class FakeBrowser:
         return {"ok": True, "url": "http://x/", "title": "T"}
 
 
+class PrivateBrowser(FakeBrowser):
+    """A browser whose tab in front is private: the gate answers no."""
+
+    def __call__(self, method, *args, **kwargs):
+        if method == "private_gate":
+            self.calls.append((method, args))
+            return {"ok": False, "error": ai.PRIVATE_REFUSAL}
+        return super().__call__(method, *args, **kwargs)
+
+
 def turn(*blocks, stop="tool_use"):
     return {"content": list(blocks), "stop_reason": stop}
 
@@ -859,7 +869,9 @@ class AgentTest(unittest.TestCase):
             turn(text_block("done"), stop="end_turn"),
         ])
         self.make().run("go to x")
-        self.assertEqual(self.browser.calls[0][0], "api_navigate")
+        # The privacy gate is asked first; the navigation is what follows it.
+        self.assertEqual([c[0] for c in self.browser.calls][:2],
+                         ["private_gate", "api_navigate"])
         self.assertIn("done", self.text())
         # The assistant turn must be echoed back verbatim -- it carries the
         # thinking blocks Opus 5 requires to be returned unmodified.
@@ -925,6 +937,36 @@ class AgentTest(unittest.TestCase):
         self.make().run("read")
         result = self.sent[1][2]["content"][0]["content"]
         self.assertLessEqual(len(result), agent.RESULT_CHARS)
+
+    def test_a_private_tab_is_not_read_for_the_model(self):
+        """H6: the gate answers no, and the tool never reaches the browser."""
+        refusing = self.browser = PrivateBrowser()
+        self.script([
+            turn(tool_block("read_page", {})),
+            turn(text_block("understood"), stop="end_turn"),
+        ])
+        self.make().run("read it")
+        self.assertEqual([c[0] for c in refusing.calls], ["private_gate"])
+        # The model is told why, and so is the person watching the panel.
+        self.assertIn("private", self.text())
+        self.assertIn("private", self.sent[1][2]["content"][0]["content"])
+
+    def test_every_tool_that_touches_the_tab_is_gated(self):
+        """A tool added to the loop without a decision about private tabs is
+        the whole failure mode this list exists to prevent."""
+        driving = {t["name"] for t in agent.TOOLS} - {"list_tabs", "open_tab"}
+        self.assertEqual(driving, set(agent.TAB_TOOLS))
+
+    def test_an_agent_opened_tab_asks_for_nothing_and_inherits(self):
+        """H1/H6: api_open takes a private flag now, and False is a request for
+        nothing rather than a demand for an ordinary tab."""
+        self.script([
+            turn(tool_block("open_tab", {"url": "http://x/"})),
+            turn(text_block("ok"), stop="end_turn"),
+        ])
+        self.make().run("open it")
+        opened = next(c for c in self.browser.calls if c[0] == "api_open")
+        self.assertEqual(opened[1], ("http://x/", True, True, False))
 
     def test_step_budget_is_enforced(self):
         # Distinct calls each time, so loop detection does not fire first.

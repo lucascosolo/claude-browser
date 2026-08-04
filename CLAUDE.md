@@ -29,6 +29,11 @@ claudebrowser/
   reader.py    reader mode: article extraction + reading typography (GTK-free)
   pagetext.py  on-disk page-text cache + FTS5 `recall` search (GTK-free)
   scrub.py     outbound PII redaction over page text (GTK-free)
+  vpn.py       VPN Mode: proxy-URI policy, redaction, the state machine and the
+               external exit-IP probe (GTK-free)
+backend/       the VPS half of VPN Mode: tinyproxy in a container, tailnet-bound,
+               deployed as the cb-vpn systemd unit. See backend/README.md
+AUDIT.md       the private-tab leak inventory the hardening was written against
   passwords.py saved logins in the system keyring + the injected form script
   settings.py  EVERY SETTING DESCRIBED ONCE -- values, validation, when each
                one lands. Behind cb:settings and `cbctl settings` (GTK-free)
@@ -48,7 +53,7 @@ tests/         unittest, no display needed
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
 ./cbctl settings                            # every setting; add KEY VALUE to change one
-CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 576 tests, ~9s, no display
+CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 680 tests, ~13s, no display
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
@@ -58,9 +63,14 @@ higher slows the cursor down, clamped to 5), `CB_SCRUB` (outbound PII redaction,
 default on; `0`/`off` sends page text raw), `CB_LIGHT` (ask servers for a
 cheaper page — `Save-Data: on` plus reduced motion, default on; `0`/`off`),
 `CB_PERSONA` (the Claude panel's answering style; `off` by default), `CB_THEME`
-(`phosphor` by default, or `dark`/`light`/`system`).
+(`phosphor` by default, or `dark`/`light`/`system`), `CB_PRIVATE_AI` (off — a
+private tab refuses Ask/TL;DR/Research/the agent rather than sending its page to
+Anthropic), `CB_PRIVATE_DOWNLOADS` (off — a download from a private tab is
+cancelled rather than writing a server-named file to disk), `CB_VPN` (off) and
+`CB_VPN_PROXY` (the VPS proxy URL; a `SECRET_KEY`, so never exported to the
+environment and never writable from inside the browser).
 
-`settings.py` describes all 19 of them, with the validator each one's *consumer*
+`settings.py` describes all 23 of them, with the validator each one's *consumer*
 actually needs. `test_settings.EVERY_KEY` is a hand-kept copy of that key list —
 adding a knob means adding it in both places, on purpose, so a new setting is a
 deliberate act in a test as well as in the table.
@@ -135,6 +145,39 @@ stronger gate; on those four, py_compile is the only one there is.
   disk.** History and the page-text cache are written from the same point in
   `Browser._record`, so a private tab or a `cb:` page is excluded from both by
   one check. A new on-disk sink hangs off that same point or it is a leak.
+- **`store.recordable()` was never the whole privacy boundary, and a new sink is
+  not the only way to leak.** It gates the two *disk* sinks. Everything else that
+  learns about a private tab needs its own guard, because for a long time nothing
+  had one: `grep -rn "private"` used to return zero hits in `ai.py`, `agent.py`,
+  `playbooks.py`, `control.py`, `urls.py` and `storage.py`. What leaked was not
+  storage — an `is_ephemeral` view really does keep cookies, localStorage,
+  IndexedDB, service workers, HSTS and ITP off disk (probed) — but the *policy*
+  applied to that view and the whole Python layer above it. Three rules came out
+  of it, and they are the ones to keep:
+  **privacy only ever travels downhill** (`storage.child_is_private` can add it to
+  a child tab and can never remove it, so the next thing that opens a tab cannot
+  reintroduce the popup bug); **an unresolvable identity answers "private"** (the
+  playbook recorder cannot always tell which tab an op targeted, so an id it
+  cannot resolve is treated as private and the step is dropped); and **the agent
+  is not told private tabs exist** — `api_tabs` omits them rather than labelling
+  them, because `list_tabs` used to ship every private URL and title to Anthropic
+  annotated with which ones were private.
+- **A private tab is its own network session, so VPN Mode has to be applied
+  twice.** `WebContext.set_network_proxy_settings` does not reach a view created
+  `is_ephemeral=True`; that view's own `WebsiteDataManager` needs the same call,
+  in `Tab.__init__`, before its first navigation. Miss it and the two modes do the
+  opposite of composing — the private tab is the one that goes out direct.
+  For the same reason `ai._Pool` stamps every pooled socket with the route it was
+  opened on: a direct connection serving a tunnelled request is exactly the leak
+  the mode exists to prevent, and it would look like a cache hit.
+- **"VPN on" means an external echo answered *through* the proxy.** A proxy that
+  accepts a connection proves only that the tailnet path works — the VPS's default
+  route, Docker's NAT and the provider's firewall each fail independently. And
+  there is no fallback anywhere in that path: a failed mode refuses navigation and
+  says why, because silently reverting to `DEFAULT` is a user browsing from home
+  believing otherwise. Be honest about the ceiling: this is a browser proxy with a
+  VPS exit, not a VPN, and without an OS-level egress kill switch it is
+  best-effort — a compromised page or WebKit subprocess can still open a socket.
 - **The page-text cache is keyed by content hash, not by URL.** `pagetext`
   stores one body per hash with a row per URL pointing at it, so the canonical,
   AMP and tracking-parameter spellings of an article cost one copy of the prose
@@ -449,6 +492,21 @@ stronger gate; on those four, py_compile is the only one there is.
   observed — confirming it needs a display. Never assert reduced motion with an
   injected `animation: none !important` sheet instead: it fights the page's own
   styles and breaks anything waiting on `animationend`.
+- **Three of this engine's privacy-shaped settings are deprecated no-ops, and
+  they read as protection.** `set_enable_hyperlink_auditing` logs "deprecated and
+  does nothing" once per view while the getter still returns `True`;
+  `enable-dns-prefetching` always reads `False` and pages get no prefetch at all
+  (the real local lookup is the browser's *own* `context.prefetch_dns` off the
+  omnibox, which is where the guard belongs); and `set_process_model` is the
+  original of the species. `hasattr` cannot tell you — all three exist. Only
+  `enable-webrtc` is real, and it is the one that matters, since ICE candidates
+  carry the host address straight past an HTTP proxy. Do not add the other calls
+  back to look thorough.
+- **`media-playback-requires-user-gesture` defaults to `False`.** On two 1.6GHz
+  cores an autoplaying video is not a nuisance, it is the page. Worth knowing
+  alongside the rest of `perf.py`'s defaults, which are tuned for a Celeron N3060
+  with 3.8GB and **no swap at all** — check `swapon --show` before assuming
+  `resources.py`'s swap-in signal has anything to read.
 - **Screenshotting the chrome needs a cropped root grab.** `xwd -name` matches
   the legacy `WM_NAME`, which GTK does not set (it sets `_NET_WM_NAME`), and
   `xwd -id` on the toplevel misses popovers because a GTK popover is its own X
@@ -477,11 +535,19 @@ answer. Reopening one needs a new fact, not a new preference.
   megabytes of weights in a browser whose premise is the standard library, to
   rank a few thousand pages one person has actually read. BM25 over full text is
   the honest answer at this scale.
-- **An opt-in VPS backend** — gateway, Redis, Postgres+pgvector or Qdrant, a
-  Playwright container, device pairing and JWTs. Remote infrastructure is a
-  separate project, and it contradicts the local-only posture the rest of this
-  browser is built on: the point is that the agent uses *your* session on *your*
-  machine.
+- **An opt-in VPS backend *as a second brain*** — gateway, Redis,
+  Postgres+pgvector or Qdrant, a Playwright container, device pairing and JWTs.
+  Still refused, and for the original reason: that is a separate project, and it
+  contradicts the local-only posture the rest of this browser is built on — the
+  point is that the agent uses *your* session on *your* machine.
+  **Narrowed, not reversed.** VPN Mode (`vpn.py`, `backend/`) reopened exactly one
+  slice of this on an explicit instruction: a *transport* proxy, and nothing else.
+  No database, no remote browser, no pairing, and no browsing data at rest on the
+  server — the VPS sees packets it is forwarding and keeps no log of them. The
+  distinction is the whole reason the entry above still stands: routing bytes
+  through a machine you own is not the same as moving the browser's knowledge onto
+  it. Anything that proposes storing history, page text or embeddings server-side
+  is the rejected architecture again and needs its own new fact.
 - **A model-written summary on the discard path.** A discarded tab keeps a
   standing summary (`tabnames.lead_extract` over `pagetext.text_for`, captured
   from an idle in `Browser._capture_summary`), and it is a lead extract on
