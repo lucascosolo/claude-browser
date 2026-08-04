@@ -485,6 +485,16 @@ class Browser(Gtk.Window):
         self.content.connect("script-message-received::cbpw", self._on_pw_message)
         self.pw_offer = None
 
+        # Active downloads, keyed by id(download) -- the dict entry is what
+        # keeps the WebKitDownload's Python wrapper alive for the life of the
+        # transfer, since nothing else holds a reference to it once the
+        # download-started signal returns.
+        self.downloads = {}
+        # Finished downloads this session, most recent first, for the hover
+        # popover under the toolbar's Downloads button. Session-only: nothing
+        # here is written to disk, since the file itself already is.
+        self.download_history = []
+
         # Context tuning must happen before the first WebView exists, since the
         # process model is fixed once a web process has been spawned. So must
         # the context itself: a WebContext's data manager -- which is what makes
@@ -641,6 +651,7 @@ class Browser(Gtk.Window):
         right.pack_start(
             self._icon_button("tab-new-symbolic", "New tab (Ctrl+T)",
                               lambda *_: self.new_tab(HOME)), False, False, 0)
+        right.pack_start(self._build_downloads_button(), False, False, 0)
         right.pack_start(self._build_menu(), False, False, 0)
         bar.pack_start(right, False, False, 0)
         root.pack_start(bar, False, False, 0)
@@ -652,6 +663,9 @@ class Browser(Gtk.Window):
 
         self.pw_bar = self._build_pw_bar()
         root.pack_start(self.pw_bar, False, False, 0)
+
+        self.dl_bar = self._build_dl_bar()
+        root.pack_start(self.dl_bar, False, False, 0)
 
         # Above the page rather than below it, where Firefox puts it: this
         # window already has a console docked at the bottom, and a second strip
@@ -1690,30 +1704,6 @@ class Browser(Gtk.Window):
                              origin is not None and origin.private))
         return None
 
-    def _on_download(self, _context, download):
-        """Refuse a download started by a private tab; leave the rest alone.
-
-        With no handler at all WebKitGTK writes into the user's Downloads
-        directory under the *server-suggested* filename, with no UI anywhere --
-        so a private tab was able to produce a permanent, remotely-named file.
-        This is deliberately not the start of a download manager: ordinary
-        downloads keep the default behaviour they have always had, and the only
-        decision made here is whether this one is allowed to happen.
-        """
-        try:
-            view = download.get_web_view()
-        except Exception:
-            return
-        tab = next((t for t in self.tabs if t.view is view), None)
-        if tab is None or not tab.private or storage.private_downloads_enabled():
-            return
-        try:
-            download.cancel()
-        except Exception:
-            pass
-        self._flash("Download cancelled — this tab is private. "
-                    "Allow it in cb:settings.")
-
     def close_tab(self, tab):
         if tab is None:
             return
@@ -2509,6 +2499,416 @@ class Browser(Gtk.Window):
         if self.pw_offer and self.vault:
             self.vault.set_never(self.pw_offer[0])
         self._pw_hide()
+
+    # -- downloads ------------------------------------------------------------
+    # Same furniture as the save-password bar -- a strip between the toolbar
+    # and the page -- but not the same cardinality: several downloads can be
+    # in flight at once, so `dl_bar` is a plain vertical box holding one row
+    # per download rather than one shared piece of state. Each row moves
+    # through three shapes in place (offer -> progress -> gone) rather than
+    # being replaced, so its position in the stack does not jump around while
+    # a sibling download finishes.
+    #
+    # The whole feature rests on `decide-destination` being handleable
+    # asynchronously: returning True from it without calling set_destination()
+    # tells WebKit "I'm handling this, wait for me" rather than "use the
+    # default ~/Downloads/<server-name> with no prompt", which is what a
+    # missing handler (and what this file had before) does. Nothing is written
+    # to disk until the offer bar's Save or Save To... button actually runs.
+
+    def _build_dl_bar(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        box.set_no_show_all(True)
+        return box
+
+    def _dl_row(self):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.get_style_context().add_class("cb-pwbar")
+        return row
+
+    def _dl_button(self, text, tip, handler, primary=False):
+        btn = Gtk.Button(label=text)
+        btn.set_tooltip_text(tip)
+        btn.get_style_context().add_class("cb-pwbtn")
+        if primary:
+            btn.get_style_context().add_class("cb-pwbtn-go")
+        btn.connect("clicked", lambda _b: handler())
+        return btn
+
+    def _build_downloads_button(self):
+        """The toolbar's Downloads button: hover, not click, opens the list.
+
+        A plain `Gtk.MenuButton` (what the hamburger uses) only opens on
+        click, and there is no property that changes that -- so this one
+        drives a `Gtk.Popover` by hand off enter/leave-notify, on both the
+        button and the popover's own content, with a short delay before
+        actually closing. Without the delay, the gap between the button and
+        the popover's edge reads as "left the button" and closes it before
+        the pointer ever reaches a row.
+        """
+        button = Gtk.Button()
+        button.set_relief(Gtk.ReliefStyle.NONE)
+        button.set_tooltip_text("Downloads")
+        button.set_image(Gtk.Image.new_from_icon_name(
+            "folder-download-symbolic", Gtk.IconSize.MENU))
+        button.get_style_context().add_class("cb-menubtn")
+        button.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+
+        popover = Gtk.Popover()
+        popover.set_relative_to(button)
+        popover.set_position(Gtk.PositionType.BOTTOM)
+        popover.get_style_context().add_class("cb-menu")
+
+        content = Gtk.EventBox()
+        content.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.get_style_context().add_class("cb-menucard")
+        content.add(card)
+        popover.add(content)
+
+        self.dl_popover = popover
+        self.dl_popover_list = card
+
+        hover = {"button": False, "popover": False}
+
+        def maybe_close():
+            if not hover["button"] and not hover["popover"]:
+                popover.popdown()
+            return GLib.SOURCE_REMOVE
+
+        def on_button_enter(*_a):
+            hover["button"] = True
+            self._refresh_dl_popover()
+            popover.popup()
+
+        def on_button_leave(*_a):
+            hover["button"] = False
+            GLib.timeout_add(180, maybe_close)
+
+        def on_popover_enter(*_a):
+            hover["popover"] = True
+
+        def on_popover_leave(*_a):
+            hover["popover"] = False
+            GLib.timeout_add(180, maybe_close)
+
+        button.connect("enter-notify-event", on_button_enter)
+        button.connect("leave-notify-event", on_button_leave)
+        content.connect("enter-notify-event", on_popover_enter)
+        content.connect("leave-notify-event", on_popover_leave)
+        # Click still opens it -- a touchscreen or a keyboard-focused button
+        # has no hover to speak of, and hover-only would leave both stranded.
+        button.connect("clicked", lambda *_: (self._refresh_dl_popover(), popover.popup()))
+
+        return button
+
+    def _refresh_dl_popover(self):
+        card = self.dl_popover_list
+        for child in card.get_children():
+            card.remove(child)
+
+        title = Gtk.Label(label="Recent downloads", xalign=0)
+        title.get_style_context().add_class("cb-menuhead")
+        card.pack_start(title, False, False, 0)
+
+        if not self.download_history:
+            empty = Gtk.Label(label="No downloads yet", xalign=0)
+            empty.get_style_context().add_class("cb-menuitem")
+            card.pack_start(empty, False, False, 0)
+        else:
+            for entry in self.download_history:
+                card.pack_start(self._dl_history_row(entry), False, False, 0)
+
+        card.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 4)
+        folder_row = self._dl_button_row(
+            "folder-symbolic", "Open Downloads folder",
+            lambda: self._dl_open_path(self._dl_downloads_dir()))
+        card.pack_start(folder_row, False, False, 0)
+        card.show_all()
+
+    def _dl_button_row(self, icon, text, handler):
+        row = Gtk.Button()
+        row.set_relief(Gtk.ReliefStyle.NONE)
+        row.get_style_context().add_class("cb-menuitem")
+        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=11)
+        inner.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU),
+                         False, False, 0)
+        inner.pack_start(Gtk.Label(label=text, xalign=0), True, True, 0)
+        row.add(inner)
+        row.connect("clicked", lambda *_: (handler(), self.dl_popover.popdown()))
+        return row
+
+    def _dl_history_row(self, entry):
+        return self._dl_button_row(
+            "text-x-generic-symbolic", entry["name"],
+            lambda: self._dl_open_path(entry["path"]))
+
+    def _dl_open_path(self, path):
+        """Open a downloaded file with its default app, or a folder in the
+        file manager -- the same call handles both, per Gio."""
+        if not path:
+            return
+        try:
+            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(path, None), None)
+        except GLib.Error as e:
+            self._flash("Could not open %s: %s" % (os.path.basename(path), e.message))
+
+    def _decide_response(self, decision):
+        """Convert an undisplayable or explicitly-attachment response into a
+        download instead of the dead end WebKit leaves it at otherwise.
+
+        `WebContext`'s `download-started` signal never fires on its own here --
+        there is no default-download fallback in this WebKitGTK version for a
+        RESPONSE decision nobody acts on. Left alone, an unhandled RESPONSE
+        decision surfaces as a `load-failed` with `WebKitPolicyError:
+        Frame load interrupted`, and nothing downloads, silently. That is the
+        actual shape of "downloads don't work" here, found by testing a bare
+        WebKitWebView with nothing else attached: `decision.download()` is the
+        one call that turns this response into the download machinery below.
+        """
+        try:
+            response = decision.get_response()
+        except Exception:
+            return False
+        if response is None:
+            return False
+        attachment = False
+        try:
+            headers = response.get_http_headers()
+            disposition = headers.get_one("Content-Disposition") if headers else None
+            attachment = bool(disposition and disposition.strip().lower().startswith("attachment"))
+        except Exception:
+            pass
+        if attachment or not decision.is_mime_type_supported():
+            decision.download()
+            return True
+        return False
+
+    def _on_download(self, _context, download):
+        """Offer to save a download, or refuse it outright for a private tab.
+
+        A private tab writing a download is a permanent, remotely-named file
+        surviving a session whose whole promise is that nothing is left behind,
+        so that case is still refused before any of the offer/progress
+        machinery below ever sees it -- unchanged from before this bar existed.
+        """
+        try:
+            view = download.get_web_view()
+        except Exception:
+            view = None
+        tab = next((t for t in self.tabs if t.view is view), None) if view else None
+        if tab is not None and tab.private and not storage.private_downloads_enabled():
+            try:
+                download.cancel()
+            except Exception:
+                pass
+            self._flash("Download cancelled — this tab is private. "
+                        "Allow it in cb:settings.")
+            return
+
+        record = {"download": download, "tab": tab, "row": None, "path": None,
+                  "suggested": None, "user_cancelled": False}
+        self.downloads[id(download)] = record
+        download.connect("decide-destination", self._dl_decide_destination, record)
+        download.connect("created-destination", self._dl_created_destination, record)
+        download.connect("failed", self._dl_failed, record)
+        download.connect("finished", self._dl_finished, record)
+
+    def _dl_decide_destination(self, _download, suggested_filename, record):
+        # Handled, but not yet: no destination is set here on purpose. WebKit
+        # waits for set_destination() (or cancel()) to be called from
+        # somewhere -- that "somewhere" is a button in the offer row this
+        # builds, whenever the user gets to it.
+        record["suggested"] = suggested_filename or "download"
+        self._dl_offer(record)
+        return True
+
+    def _dl_offer(self, record):
+        row = self._dl_row()
+        label = Gtk.Label(xalign=0)
+        label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        label.set_text("Download %s%s?" % (
+            record["suggested"], self._dl_size_hint(record["download"])))
+        row.pack_start(label, True, True, 0)
+        row.pack_start(self._dl_button(
+            "Save", "Save to ~/Downloads",
+            lambda: self._dl_save_default(record), primary=True), False, False, 0)
+        row.pack_start(self._dl_button(
+            "Save To…", "Choose where to save this file",
+            lambda: self._dl_save_as(record)), False, False, 0)
+        row.pack_start(self._dl_button(
+            "Cancel", "Cancel this download",
+            lambda: self._dl_cancel(record)), False, False, 0)
+        record["row"] = row
+        self.dl_bar.pack_start(row, False, False, 0)
+        row.show_all()
+        self.dl_bar.show()
+
+    @staticmethod
+    def _dl_size_hint(download):
+        try:
+            response = download.get_response()
+            total = response.get_content_length() if response else -1
+        except Exception:
+            total = -1
+        if total is None or total < 0:
+            return ""
+        size = float(total)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return " (%d %s)" % (size, unit) if unit == "B" else " (%.1f %s)" % (size, unit)
+            size /= 1024.0
+        return ""
+
+    def _dl_downloads_dir(self):
+        directory = os.path.expanduser("~/Downloads")
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError:
+            pass
+        return directory
+
+    @staticmethod
+    def _dl_unique_path(directory, filename):
+        filename = os.path.basename(filename) or "download"
+        candidate = os.path.join(directory, filename)
+        if not os.path.exists(candidate):
+            return candidate
+        stem, ext = os.path.splitext(filename)
+        n = 1
+        while True:
+            candidate = os.path.join(directory, "%s (%d)%s" % (stem, n, ext))
+            if not os.path.exists(candidate):
+                return candidate
+            n += 1
+
+    def _dl_save_default(self, record):
+        self._dl_start(record, self._dl_unique_path(
+            self._dl_downloads_dir(), record["suggested"]))
+
+    def _dl_save_as(self, record):
+        dialog = Gtk.FileChooserDialog(
+            title="Save file", parent=self, action=Gtk.FileChooserAction.SAVE,
+            buttons=("Cancel", Gtk.ResponseType.CANCEL,
+                     "Save", Gtk.ResponseType.OK))
+        dialog.set_do_overwrite_confirmation(True)
+        dialog.set_current_folder(self._dl_downloads_dir())
+        dialog.set_current_name(os.path.basename(record["suggested"]) or "download")
+        response = dialog.run()
+        path = dialog.get_filename() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        if path:
+            self._dl_start(record, path)
+        else:
+            self._dl_cancel(record)
+
+    def _dl_start(self, record, path):
+        record["path"] = path
+        download = record["download"]
+        # Overwrite is safe here: the default path was just deduplicated above,
+        # and the Save To... path was already confirmed by the file chooser's
+        # own overwrite prompt. Without this, WebKit refuses an existing path
+        # outright rather than clobbering it.
+        download.set_allow_overwrite(True)
+        download.set_destination(GLib.filename_to_uri(path, None))
+
+    def _dl_created_destination(self, download, destination, record):
+        # The authoritative path: what we asked for in set_destination(), read
+        # back once WebKit has actually opened it for writing. Swaps the offer
+        # row for a progress row in place.
+        record["path"] = self._dl_uri_to_path(destination) or record.get("path")
+        self._dl_show_progress(record)
+
+    @staticmethod
+    def _dl_uri_to_path(uri):
+        try:
+            path, _host = GLib.filename_from_uri(uri)
+            return path
+        except GLib.Error:
+            return None
+
+    def _dl_show_progress(self, record):
+        row = record.get("row")
+        if row is None:
+            return
+        for child in row.get_children():
+            row.remove(child)
+        label = Gtk.Label(xalign=0)
+        label.set_ellipsize(3)
+        label.set_text(os.path.basename(record["path"] or record["suggested"]))
+        row.pack_start(label, True, True, 0)
+        bar = Gtk.ProgressBar()
+        bar.get_style_context().add_class("cb-progress")
+        bar.set_size_request(90, -1)
+        row.pack_start(bar, False, False, 0)
+        record["bar"] = bar
+        row.pack_start(self._dl_button(
+            "Cancel", "Cancel this download and delete the partial file",
+            lambda: self._dl_cancel(record)), False, False, 0)
+        row.show_all()
+        record["download"].connect("notify::estimated-progress", self._dl_progress, record)
+
+    @staticmethod
+    def _dl_progress(download, _pspec, record):
+        bar = record.get("bar")
+        if bar is not None:
+            bar.set_fraction(max(0.0, min(1.0, download.get_estimated_progress())))
+
+    def _dl_remove_row(self, record):
+        row = record.get("row")
+        if row is not None:
+            self.dl_bar.remove(row)
+        record["row"] = None
+        self.downloads.pop(id(record["download"]), None)
+        if not self.dl_bar.get_children():
+            self.dl_bar.hide()
+
+    @staticmethod
+    def _dl_delete_partial(path):
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def _dl_cancel(self, record):
+        record["user_cancelled"] = True
+        path = record.get("path")
+        try:
+            record["download"].cancel()
+        except Exception:
+            pass
+        self._dl_remove_row(record)
+        self._dl_delete_partial(path)
+        self._flash("Download cancelled")
+
+    def _dl_failed(self, _download, _error, record):
+        # Fires for a genuine failure and for our own cancel() alike -- the
+        # `user_cancelled` flag set in _dl_cancel is what tells them apart,
+        # rather than parsing the GLib.Error's domain/code, which differs by
+        # WebKitGTK version and is not worth pinning to.
+        if id(record["download"]) not in self.downloads:
+            return  # already unwound by _dl_cancel
+        path = record.get("path")
+        cancelled = record.get("user_cancelled", False)
+        self._dl_remove_row(record)
+        self._dl_delete_partial(path)
+        if not cancelled:
+            self._flash("Download failed: %s" % os.path.basename(
+                path or record.get("suggested") or "download"))
+
+    def _dl_finished(self, _download, record):
+        # "finished" is emitted after "failed" on an unsuccessful download too,
+        # so this only means success if the record is still here to remove.
+        if id(record["download"]) not in self.downloads:
+            return
+        path = record.get("path")
+        self._dl_remove_row(record)
+        name = os.path.basename(path or record.get("suggested") or "download")
+        if path:
+            self.download_history.insert(0, {"name": name, "path": path})
+            del self.download_history[12:]
+        self._flash("Downloaded %s" % name)
 
     # -- the Claude panel ---------------------------------------------------
     # One panel, four modes. Each mode is just a different prompt over the same
@@ -3636,7 +4036,8 @@ class Browser(Gtk.Window):
         self.vpn_pill.show()
 
     def _on_policy(self, _view, decision, kind, tab):
-        """Refuse a navigation while VPN Mode is failed.
+        """Turn an undisplayable response into a download; refuse a
+        navigation while VPN Mode is failed.
 
         WebKit's own funnel, which is why it is here rather than at the six
         Python call sites that start a load: a link click, a redirect and a
@@ -3648,6 +4049,11 @@ class Browser(Gtk.Window):
         drops the Referer and turns a form POST into a GET; refusing outright
         has none of that, because nothing is sent at all.
         """
+        if kind == WebKit2.PolicyDecisionType.RESPONSE:
+            # Checked ahead of the VPN gate below -- a download decision is
+            # independent of it, and the gate only understands NAVIGATION_ACTION
+            # and NEW_WINDOW_ACTION.
+            return self._decide_response(decision)
         if not vpn.STATE.blocks_navigation:
             return False
         if kind not in (WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
