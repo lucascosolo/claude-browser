@@ -30,6 +30,7 @@ EVERY_KEY = (
     "CB_AUTH", "CB_AUTOSTART", "CB_BLOCK", "CB_COOKIES", "CB_GPU", "CB_HOME",
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
     "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
+    "CB_QUEUE_LIST",
     "CB_SCRUB", "CB_SEARCH", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_VPN",
     "CB_VPN_PROXY", "CB_WEBGL",
 )
@@ -99,7 +100,10 @@ class TestTable(Isolated):
                 # re-applies CB_THEME; CB_VPN_PROXY is read out of the file
                 # every time the mode is engaged, so correcting it and toggling
                 # is enough.
-                "CB_VPN", "CB_VPN_PROXY"}
+                "CB_VPN", "CB_VPN_PROXY",
+                # Read inside the worker that fetches the queue, on every
+                # fetch, so Refresh on cb:queue is enough to pick up a change.
+                "CB_QUEUE_LIST"}
         for knob in settings.SETTINGS:
             immediate = "restart" not in knob.effect.lower()
             self.assertEqual(immediate, knob.key in live,

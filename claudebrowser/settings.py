@@ -138,6 +138,22 @@ def _http_url(value):
         raise ValueError("this address has no host in it")
 
 
+def _playlist_id(value):
+    """A YouTube playlist id, or WL.
+
+    Written from what the consumer does with it: `watchlater.playlist_url`
+    pastes this straight into a query string, so anything outside the character
+    set YouTube uses for ids would either 404 or, worse, smuggle another
+    parameter onto the URL.
+    """
+    text = (value or "").strip()
+    if not text:
+        return "a playlist id, or WL for Watch Later"
+    if not all(c.isalnum() or c in "-_" for c in text):
+        return "playlist ids are letters, digits, - and _ only"
+    return None
+
+
 def _start_page(value):
     """CB_HOME is loaded with `raw=True` -- it skips the omnibox's
     search-or-navigate guess -- so it has to already be a location."""
@@ -299,6 +315,15 @@ SETTINGS = (
         "urls.py reads the template once at import, so this session keeps "
         "searching with the previous one.",
         check=_search_template),
+    Setting(
+        "CB_QUEUE_LIST", "Appearance", "Background queue playlist",
+        "Which playlist cb:queue plays. WL is your Watch Later queue; any "
+        "other playlist id works too, which is what makes moving off WL a "
+        "setting change rather than a code change.",
+        "text", "WL",
+        "Next refresh",
+        "cb:queue reads it when it fetches, so Refresh on the page is enough.",
+        check=_playlist_id),
 
     # -- Privacy ------------------------------------------------------------
     Setting(

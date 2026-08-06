@@ -14,6 +14,7 @@ wrong colour. These tests are the guard rails on that arrangement:
   * the ratios the look is built on are computed, not eyeballed.
 """
 
+import json
 import unittest
 
 from claudebrowser import pages, panel_html, style
@@ -265,3 +266,43 @@ class Contrast(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScriptLiterals(unittest.TestCase):
+    """`_js` and `_js_block` are two different contexts, not two spellings.
+
+    An HTML parser decodes entities inside an attribute and does not decode
+    them inside a <script>. Using the attribute helper in a script block is
+    what turned a queued video called "Rick & Morty" into
+    `SyntaxError: Unexpected token '&'` and took the whole page down.
+    """
+
+    def test_ampersand_survives_a_script_block(self):
+        self.assertNotIn("&amp;", pages._js_block(["Rick & Morty"]))
+        self.assertIn("&", pages._js_block(["Rick & Morty"]))
+
+    def test_a_script_end_tag_cannot_escape_the_block(self):
+        for payload in ("</script>", "<!--", "<script>"):
+            out = pages._js_block([payload])
+            self.assertNotIn("<", out, payload)
+            self.assertNotIn(">", out, payload)
+
+    def test_line_separators_are_escaped(self):
+        # Newlines to a JS parser, ordinary characters to a JSON one.
+        out = pages._js_block("a b c")
+        self.assertNotIn(" ", out)
+        self.assertNotIn(" ", out)
+
+    def test_it_still_round_trips_as_json(self):
+        value = ["Rick & Morty", "quote\" and \\ back", "emoji \U0001f600"]
+        decoded = json.loads(pages._js_block(value)
+                             .replace("\\u003c", "<").replace("\\u003e", ">"))
+        self.assertEqual(decoded, value)
+
+    def test_the_queue_page_puts_titles_through_it(self):
+        state = {"ok": True, "truncated": False, "items": [
+            {"video_id": "abc", "title": "Rick & Morty </script>",
+             "channel": "C & D", "duration": "1:00", "seconds": 60}]}
+        html_out = pages.queue_page(style.palette("dark"), "tok", state)
+        self.assertNotIn("&amp;\"", html_out.split("<script>")[-1])
+        self.assertNotIn("</script>\"", html_out)

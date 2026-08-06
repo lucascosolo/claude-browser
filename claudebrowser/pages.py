@@ -31,6 +31,8 @@ from . import pagetext
 NAV = (
     ("cb:home", "Home", "M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"),
     ("cb:deck", "Deck", "M3 5h8v6H3zm10 0h8v6h-8zM3 13h8v6H3zm10 0h8v6h-8z"),
+    ("cb:queue", "Queue",
+     "M3 6h11v2H3zm0 5h11v2H3zm0 5h7v2H3zM16 8l6 4-6 4z"),
     ("cb:bookmarks", "Saved", "M6 3h12v18l-6-4.5L6 21z"),
     ("cb:history", "History", "M12 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-7-7v4l5-5-5-5zM11 8v5l4 2"),
     ("cb:passwords", "Logins",
@@ -117,6 +119,26 @@ def _js(value):
     turns &quot; back into a quote before the JS is ever compiled.
     """
     return html.escape(json.dumps(value), quote=True)
+
+
+def _js_block(value):
+    """A JS literal that is safe *inside a `<script>` element*.
+
+    The opposite context from `_js`, and the two are not interchangeable: an
+    HTML parser decodes entities inside an attribute and does not decode them
+    inside a script, so `_js`'s `&amp;` reaches the JavaScript compiler
+    verbatim. A queued video called "Rick & Morty" was enough to take the whole
+    page's script down with `SyntaxError: Unexpected token '&'`.
+
+    What genuinely has to be neutralised here is anything that can end the
+    element early or open a comment -- `</script>`, `<!--` -- so `<` and `>`
+    go out as escapes. The line separators are escaped for the same reason
+    `extract._js_str` escapes them: they are newlines to a JS parser and not to
+    a JSON one.
+    """
+    return (json.dumps(value)
+            .replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
 
 def _tile(url, title, sub="", starred=False, nonce=""):
@@ -1795,6 +1817,240 @@ _DOC = """<!doctype html>
     if (e.key === '/' && document.activeElement === document.body) {
       var box = document.getElementById('q') || document.getElementById('go');
       if (box) { e.preventDefault(); box.focus(); }
+    }
+  });
+})();
+</script>
+"""
+
+
+#: The embed host. `youtube-nocookie.com` rather than `youtube.com` because a
+#: queue page that is playing in the background all afternoon should not also be
+#: a place cookies accumulate; the player itself is identical.
+EMBED = "https://www.youtube-nocookie.com/embed/"
+
+
+def queue_page(palette, nonce, state):
+    """cb:queue -- the Watch Later queue, played without YouTube's application.
+
+    The whole point of this page is what it does *not* load. Opening
+    youtube.com/playlist?list=WL on this machine took over 150 seconds and then
+    could not run a one-line script within 45; this page is a list of ids and
+    one <iframe>, so the only YouTube code that runs is the player itself.
+
+    The queue arrives already fetched and parsed -- rendering never touches the
+    network, because a cb: scheme handler answers on the main loop and a fetch
+    there would freeze the window. `browser.py` refreshes in a worker thread and
+    re-renders when it lands.
+    """
+    items = state.get("items") or []
+
+    if not state.get("ok") and not items:
+        note = state.get("error") or "The queue could not be read."
+        if state.get("signed_out"):
+            # An action, not just a diagnosis. The queue is read with this
+            # browser's own session, so "sign in here" is the entire fix, and
+            # the button goes to the page that offers it.
+            head, note = ("Sign in to YouTube in this browser",
+                          "The queue is read with this browser's own session, "
+                          "so it can only see what you are signed in to here.")
+            extra = ('<a class="pbbtn" href="https://www.youtube.com/">'
+                     'Open YouTube</a>')
+        else:
+            head, extra = "Watch Later is not available", ""
+        body = _empty("&#9888;", head, note) + (
+            '<div class="qrow">%s<button class="pbbtn" '
+            "onclick=\"return cbui.send({action:'queue_refresh'})\">"
+            "Try again</button></div>" % extra)
+        return shell("Watch later", palette, nonce, "cb:queue", body)
+
+    rows = "".join(
+        '<button class="qitem" data-i="%(i)d" data-v="%(vid)s">'
+        '<span class="qn">%(n)d</span>'
+        '<span class="qmeta"><b>%(title)s</b><em>%(channel)s</em></span>'
+        '<span class="qdur">%(dur)s</span></button>'
+        % {"i": i, "n": i + 1, "vid": _e(it["video_id"]),
+           "title": _e(it["title"] or it["video_id"]),
+           "channel": _e(it["channel"]), "dur": _e(it["duration"])}
+        for i, it in enumerate(items))
+
+    truncated = ('<p class="note">Showing the first %d. YouTube sends the rest '
+                 'behind a continuation, which this page does not follow.</p>'
+                 % len(items)) if state.get("truncated") else ""
+
+    body = _QUEUE_BODY % {
+        "count": len(items),
+        "rows": rows,
+        "truncated": truncated,
+        # `_js_block`, not `_js`: these go inside <script>. See the note there.
+        "queue": _js_block([it["video_id"] for it in items]),
+        "titles": _js_block([it["title"] or it["video_id"] for it in items]),
+        "embed": _js_block(EMBED),
+    }
+    return shell("Watch later", palette, nonce, "cb:queue", body)
+
+
+#: Body-level rather than folded into `_CSS`: this markup exists on one page,
+#: and the sheet in `_CSS` is shared by seven. Passed to `shell` as a *value*,
+#: so a literal `%` in here is never rescanned by the document's format pass.
+_QUEUE_BODY = """
+<style>
+  .qwrap{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}
+  @media (min-width:1000px){.qwrap{grid-template-columns:minmax(0,3fr) minmax(280px,2fr)}}
+  .qstage{position:sticky;top:12px;align-self:start}
+  .qframe{position:relative;width:100%%;aspect-ratio:16/9;background:#000;
+          border-radius:10px;overflow:hidden}
+  .qframe iframe{position:absolute;inset:0;width:100%%;height:100%%;border:0}
+  .qidle{display:flex;align-items:center;justify-content:center;height:100%%;
+         opacity:.55;font-size:13px}
+  .qnow{margin:10px 2px 0;font-size:13px;min-height:1.2em;opacity:.85}
+  .qrow{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+  .qlist{max-height:70vh;overflow:auto;border-radius:10px}
+  .qitem{display:flex;width:100%%;gap:10px;align-items:center;text-align:left;
+         padding:8px 10px;background:none;border:0;border-radius:8px;
+         color:inherit;font:inherit;cursor:pointer}
+  .qitem:hover{background:rgba(127,127,127,.14)}
+  .qitem.on{background:rgba(127,127,127,.22);outline:1px solid currentColor}
+  .qn{width:2.2em;text-align:right;opacity:.5;font-size:12px;flex:none}
+  .qmeta{min-width:0;flex:1}
+  .qmeta b{display:block;font-weight:600;font-size:13px;overflow:hidden;
+           text-overflow:ellipsis;white-space:nowrap}
+  .qmeta em{display:block;font-style:normal;font-size:11px;opacity:.55;
+            overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .qdur{flex:none;font-size:11px;opacity:.6;font-variant-numeric:tabular-nums}
+</style>
+<div class="qwrap">
+  <section class="qstage">
+    <div class="qframe" id="stage"><div class="qidle">Nothing playing</div></div>
+    <p class="qnow" id="now"></p>
+    <div class="qrow">
+      <button class="pbbtn" id="playall">Play all</button>
+      <button class="pbbtn" id="prev">Previous</button>
+      <button class="pbbtn" id="next">Next</button>
+      <button class="pbbtn" id="shuffle">Shuffle</button>
+      <button class="pbbtn" onclick="return cbui.send({action:'queue_refresh'})">Refresh</button>
+    </div>
+    <p class="note">Audio keeps playing while this tab is in the background.
+      Nothing here loads youtube.com's application &mdash; only the player.</p>
+  </section>
+  <section>
+    <h2>Queue <em>%(count)s</em></h2>
+    %(truncated)s
+    <div class="qlist" id="list">%(rows)s</div>
+  </section>
+</div>
+<script>
+(function(){
+  var IDS = %(queue)s, TITLES = %(titles)s, EMBED = %(embed)s;
+  var stage = document.getElementById('stage');
+  var now = document.getElementById('now');
+  var order = IDS.map(function(_, i){ return i; });
+  var at = -1;
+  /* The player's own state, as it reports it: 1 is PLAYING. Tracked because a
+     Space key that always sends pauseVideo is a play button that cannot play. */
+  var state = -1;
+
+  /* The player is talked to over postMessage rather than by loading YouTube's
+     iframe API script. The API script is another network fetch and another
+     megabyte of JavaScript to do what four lines of postMessage do, and this
+     page exists precisely because that machinery is what makes YouTube
+     unusable here. `enablejsapi=1` is what makes the embed answer. */
+  function frame(){ return stage.querySelector('iframe'); }
+
+  function command(func){
+    var f = frame();
+    if (!f) return;
+    f.contentWindow.postMessage(JSON.stringify(
+      {event:'command', func:func, args:[]}), '*');
+  }
+
+  function play(pos){
+    if (!IDS.length) return;
+    at = (pos + order.length) %% order.length;
+    var id = IDS[order[at]];
+    /* Replacing the whole iframe rather than reusing it: a src change on a
+       cross-origin frame leaves the old player's timers alive for a moment,
+       and on two cores that overlap is audible. */
+    stage.innerHTML = '';
+    var f = document.createElement('iframe');
+    f.allow = 'autoplay; encrypted-media; picture-in-picture';
+    f.setAttribute('allowfullscreen', '');
+    f.src = EMBED + encodeURIComponent(id) +
+            '?autoplay=1&enablejsapi=1&rel=0&modestbranding=1&playsinline=1';
+    f.addEventListener('load', function(){
+      /* The handshake: until the parent says it is listening, the embed sends
+         no state events, and without state events nothing advances. */
+      f.contentWindow.postMessage(JSON.stringify(
+        {event:'listening', id:1, channel:'widget'}), '*');
+    });
+    stage.appendChild(f);
+    now.textContent = (at + 1) + ' / ' + order.length + '  \\u00b7  ' +
+                      (TITLES[order[at]] || id);
+    mark();
+    try { localStorage.setItem('cb-queue-at', String(at)); } catch (e) {}
+  }
+
+  function mark(){
+    var live = order[at];
+    Array.prototype.forEach.call(
+      document.querySelectorAll('.qitem'), function(el){
+        el.classList.toggle('on', Number(el.dataset.i) === live);
+      });
+    var on = document.querySelector('.qitem.on');
+    if (on && on.scrollIntoView) on.scrollIntoView({block:'nearest'});
+  }
+
+  window.addEventListener('message', function(e){
+    var f = frame();
+    if (!f || e.source !== f.contentWindow) return;
+    var d;
+    try { d = JSON.parse(e.data); } catch (_) { return; }
+    /* playerState 0 is ENDED. This is the whole reason the page listens at
+       all: unattended advance is the feature. */
+    var info = d && d.info;
+    if (d.event !== 'infoDelivery' || !info) return;
+    if (typeof info.playerState === 'number') state = info.playerState;
+    if (info.playerState === 0) {
+      if (at + 1 < order.length) play(at + 1);
+      else { now.textContent = 'Queue finished'; }
+    }
+  });
+
+  document.getElementById('list').addEventListener('click', function(e){
+    var row = e.target.closest && e.target.closest('.qitem');
+    if (!row) return;
+    var i = Number(row.dataset.i);
+    order = IDS.map(function(_, n){ return n; });
+    at = -1;
+    play(order.indexOf(i));
+  });
+
+  document.getElementById('playall').addEventListener('click', function(){
+    order = IDS.map(function(_, i){ return i; });
+    play(0);
+  });
+  document.getElementById('next').addEventListener('click', function(){
+    if (at >= 0) play(at + 1); else play(0);
+  });
+  document.getElementById('prev').addEventListener('click', function(){
+    if (at >= 0) play(at - 1); else play(0);
+  });
+  document.getElementById('shuffle').addEventListener('click', function(){
+    for (var i = order.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+    play(0);
+  });
+
+  /* Space toggles, like every other player. Ignored while a field has focus so
+     it cannot eat a keystroke meant for the filter box. */
+  document.addEventListener('keydown', function(e){
+    var tag = (document.activeElement || {}).tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.key === ' ') {
+      e.preventDefault();
+      command(state === 1 ? 'pauseVideo' : 'playVideo');
     }
   });
 })();

@@ -1,0 +1,1187 @@
+{
+ "contents": {
+  "twoColumnBrowseResultsRenderer": {
+   "tabs": [
+    {
+     "tabRenderer": {
+      "content": {
+       "sectionListRenderer": {
+        "contents": [
+         {
+          "itemSectionRenderer": {
+           "contents": [
+            {
+             "lockupViewModel": {
+              "contentImage": {
+               "thumbnailViewModel": {
+                "image": {
+                 "sources": [
+                  {
+                   "url": "https://i.ytimg.com/vi/Vh4O04Bpovw/hqdefault.jpg?sqp=-oaymwEiCKgBEF5IWvKriqkDFQgBFQAAAAAYASUAAMhCPQCAokN4AQ==&rs=AOn4CLB4Ow1F9VxNjYqm9R0DFUubTP_TJg",
+                   "width": 168,
+                   "height": 94
+                  }
+                 ]
+                },
+                "overlays": [
+                 {
+                  "thumbnailBottomOverlayViewModel": {
+                   "badges": [
+                    {
+                     "thumbnailBadgeViewModel": {
+                      "text": "16:09",
+                      "badgeStyle": "THUMBNAIL_OVERLAY_BADGE_STYLE_DEFAULT",
+                      "animationActivationTargetId": "Vh4O04Bpovw",
+                      "animatedText": "Now playing",
+                      "animationActivationEntitySelectorType": "THUMBNAIL_BADGE_ANIMATION_ENTITY_SELECTOR_TYPE_PLAYER_STATE"
+                     }
+                    }
+                   ]
+                  }
+                 },
+                 {
+                  "thumbnailHoverOverlayToggleActionsViewModel": {
+                   "buttons": [
+                    {
+                     "toggleButtonViewModel": {
+                      "defaultButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "WATCH_LATER",
+                        "onTap": {
+                         "innertubeCommand": {
+                          "commandMetadata": {
+                           "webCommandMetadata": {
+                            "sendPost": true,
+                            "apiUrl": "/youtubei/v1/browse/edit_playlist"
+                           }
+                          },
+                          "playlistEditEndpoint": {
+                           "playlistId": "WL",
+                           "actions": [
+                            {
+                             "addedVideoId": "Vh4O04Bpovw",
+                             "action": "ACTION_ADD_VIDEO"
+                            }
+                           ]
+                          }
+                         }
+                        },
+                        "accessibilityText": "Watch later",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "toggledButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "CHECK",
+                        "onTap": {
+                         "innertubeCommand": {
+                          "commandMetadata": {
+                           "webCommandMetadata": {
+                            "sendPost": true,
+                            "apiUrl": "/youtubei/v1/browse/edit_playlist"
+                           }
+                          },
+                          "playlistEditEndpoint": {
+                           "playlistId": "WL",
+                           "actions": [
+                            {
+                             "action": "ACTION_REMOVE_VIDEO_BY_VIDEO_ID",
+                             "removedVideoId": "Vh4O04Bpovw"
+                            }
+                           ]
+                          }
+                         }
+                        },
+                        "accessibilityText": "Added",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "isToggled": false
+                     }
+                    },
+                    {
+                     "toggleButtonViewModel": {
+                      "defaultButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "ADD_TO_QUEUE_TAIL",
+                        "onTap": {
+                         "innertubeCommand": {
+                          "commandMetadata": {
+                           "webCommandMetadata": {
+                            "sendPost": true
+                           }
+                          },
+                          "signalServiceEndpoint": {
+                           "signal": "CLIENT_SIGNAL",
+                           "actions": [
+                            {
+                             "addToPlaylistCommand": {
+                              "openMiniplayer": true,
+                              "videoId": "Vh4O04Bpovw",
+                              "listType": "PLAYLIST_EDIT_LIST_TYPE_QUEUE",
+                              "onCreateListCommand": {
+                               "commandMetadata": {
+                                "webCommandMetadata": {
+                                 "sendPost": true,
+                                 "apiUrl": "/youtubei/v1/playlist/create"
+                                }
+                               },
+                               "createPlaylistServiceEndpoint": {
+                                "videoIds": [
+                                 "Vh4O04Bpovw"
+                                ],
+                                "params": "CAQ%3D"
+                               }
+                              },
+                              "videoIds": [
+                               "Vh4O04Bpovw"
+                              ],
+                              "videoCommand": {
+                               "commandMetadata": {
+                                "webCommandMetadata": {
+                                 "url": "/watch?v=Vh4O04Bpovw",
+                                 "webPageType": "WEB_PAGE_TYPE_WATCH",
+                                 "rootVe": 3832
+                                }
+                               },
+                               "watchEndpoint": {
+                                "videoId": "Vh4O04Bpovw",
+                                "watchEndpointSupportedOnesieConfig": {
+                                 "html5PlaybackOnesieConfig": {
+                                  "commonConfig": {
+                                   "url": "https://rr1---sn-n0qqxoapo3-nuwl.googlevideo.com/initplayback?source=youtube&oeis=1&c=WEB&oad=3200&ovd=3200&oaad=11000&oavd=11000&ocs=700&oewis=1&oputc=1&olis=1&ofpcc=1&msp=1&odepv=1&id=561e0ed38069a2fc&ip=47.214.55.67&initcwndbps=3852500&mt=1785991261&oweuc="
+                                  }
+                                 }
+                                }
+                               }
+                              }
+                             }
+                            }
+                           ]
+                          }
+                         }
+                        },
+                        "accessibilityText": "Add to queue",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "toggledButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "CHECK",
+                        "accessibilityText": "Added",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "isToggled": false
+                     }
+                    }
+                   ]
+                  }
+                 }
+                ]
+               }
+              },
+              "metadata": {
+               "lockupMetadataViewModel": {
+                "title": {
+                 "content": "I Explored A $200,000,000 Forgotten Space Colony"
+                },
+                "image": {
+                 "decoratedAvatarViewModel": {
+                  "avatar": {
+                   "avatarViewModel": {
+                    "image": {
+                     "sources": [
+                      {
+                       "url": "https://yt3.ggpht.com/bdI_oMvgn9Ib9rwv89h89Xd5TcOh2K2DEgzsJdi1dfzXPXLXj2ARFTGzs9oOu_xQLHsCjj2E=s68-c-k-c0x00ffffff-no-rj",
+                       "width": 68,
+                       "height": 68
+                      }
+                     ]
+                    },
+                    "avatarImageSize": "AVATAR_SIZE_M"
+                   }
+                  },
+                  "a11yLabel": "Go to channel Yes Theory"
+                 }
+                },
+                "metadata": {
+                 "contentMetadataViewModel": {
+                  "metadataRows": [
+                   {
+                    "metadataParts": [
+                     {
+                      "text": {
+                       "content": "Yes Theory",
+                       "styleRuns": [
+                        {
+                         "startIndex": 0,
+                         "length": 10,
+                         "weightLabel": "FONT_WEIGHT_NORMAL"
+                        },
+                        {
+                         "startIndex": 10,
+                         "styleRunExtensions": {
+                          "styleRunColorMapExtension": {
+                           "colorMap": [
+                            {
+                             "key": "USER_INTERFACE_THEME_DARK",
+                             "value": 4289374890
+                            },
+                            {
+                             "key": "USER_INTERFACE_THEME_LIGHT",
+                             "value": 4284506208
+                            }
+                           ]
+                          }
+                         }
+                        }
+                       ],
+                       "attachmentRuns": [
+                        {
+                         "startIndex": 10,
+                         "length": 0,
+                         "element": {
+                          "type": {
+                           "imageType": {
+                            "image": {
+                             "sources": [
+                              {
+                               "clientResource": {
+                                "imageName": "CHECK_CIRCLE_FILLED"
+                               },
+                               "width": 14,
+                               "height": 14
+                              }
+                             ]
+                            }
+                           }
+                          },
+                          "properties": {
+                           "layoutProperties": {
+                            "height": {
+                             "value": 14,
+                             "unit": "DIMENSION_UNIT_POINT"
+                            },
+                            "width": {
+                             "value": 14,
+                             "unit": "DIMENSION_UNIT_POINT"
+                            },
+                            "margin": {
+                             "left": {
+                              "value": 4,
+                              "unit": "DIMENSION_UNIT_POINT"
+                             }
+                            }
+                           }
+                          }
+                         },
+                         "alignment": "ALIGNMENT_VERTICAL_CENTER"
+                        }
+                       ]
+                      }
+                     }
+                    ]
+                   },
+                   {
+                    "metadataParts": [
+                     {
+                      "text": {
+                       "content": "7.4M views"
+                      }
+                     },
+                     {
+                      "text": {
+                       "content": "6 years ago"
+                      },
+                      "accessibilityLabel": "6 years ago"
+                     }
+                    ]
+                   }
+                  ],
+                  "delimiter": " \u2022 "
+                 }
+                },
+                "menuButton": {
+                 "buttonViewModel": {
+                  "iconName": "MORE_VERT",
+                  "onTap": {
+                   "innertubeCommand": {
+                    "showSheetCommand": {
+                     "panelLoadingStrategy": {
+                      "inlineContent": {
+                       "sheetViewModel": {
+                        "content": {
+                         "listViewModel": {
+                          "listItems": [
+                           {
+                            "listItemViewModel": {
+                             "title": {
+                              "content": "Add to queue"
+                             },
+                             "leadingImage": {
+                              "sources": [
+                               {
+                                "clientResource": {
+                                 "imageName": "ADD_TO_QUEUE_TAIL"
+                                }
+                               }
+                              ]
+                             }
+                            }
+                           },
+                           {
+                            "listItemViewModel": {
+                             "title": {
+                              "content": "Save to playlist"
+                             },
+                             "leadingImage": {
+                              "sources": [
+                               {
+                                "clientResource": {
+                                 "imageName": "BOOKMARK_BORDER"
+                                }
+                               }
+                              ]
+                             }
+                            }
+                           },
+                           {
+                            "listItemViewModel": {
+                             "title": {
+                              "content": "Share"
+                             },
+                             "leadingImage": {
+                              "sources": [
+                               {
+                                "clientResource": {
+                                 "imageName": "SHARE"
+                                }
+                               }
+                              ]
+                             }
+                            }
+                           }
+                          ]
+                         }
+                        }
+                       }
+                      }
+                     }
+                    }
+                   }
+                  },
+                  "accessibilityText": "More actions",
+                  "style": "BUTTON_VIEW_MODEL_STYLE_MONO",
+                  "type": "BUTTON_VIEW_MODEL_TYPE_TEXT",
+                  "buttonSize": "BUTTON_VIEW_MODEL_SIZE_DEFAULT",
+                  "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                 }
+                }
+               }
+              },
+              "contentId": "Vh4O04Bpovw",
+              "contentType": "LOCKUP_CONTENT_TYPE_VIDEO"
+             }
+            },
+            {
+             "lockupViewModel": {
+              "contentImage": {
+               "thumbnailViewModel": {
+                "image": {
+                 "sources": [
+                  {
+                   "url": "https://i.ytimg.com/vi/5TIp7oVKHq8/hqdefault.jpg?sqp=-oaymwEiCKgBEF5IWvKriqkDFQgBFQAAAAAYASUAAMhCPQCAokN4AQ==&rs=AOn4CLDBH2DjQs0-Qzu59NnvBunLZnzcCA",
+                   "width": 168,
+                   "height": 94
+                  }
+                 ]
+                },
+                "overlays": [
+                 {
+                  "thumbnailBottomOverlayViewModel": {
+                   "badges": [
+                    {
+                     "thumbnailBadgeViewModel": {
+                      "text": "19:18",
+                      "badgeStyle": "THUMBNAIL_OVERLAY_BADGE_STYLE_DEFAULT",
+                      "animationActivationTargetId": "5TIp7oVKHq8",
+                      "animatedText": "Now playing",
+                      "animationActivationEntitySelectorType": "THUMBNAIL_BADGE_ANIMATION_ENTITY_SELECTOR_TYPE_PLAYER_STATE"
+                     }
+                    }
+                   ]
+                  }
+                 },
+                 {
+                  "thumbnailHoverOverlayToggleActionsViewModel": {
+                   "buttons": [
+                    {
+                     "toggleButtonViewModel": {
+                      "defaultButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "WATCH_LATER",
+                        "onTap": {
+                         "innertubeCommand": {
+                          "commandMetadata": {
+                           "webCommandMetadata": {
+                            "sendPost": true,
+                            "apiUrl": "/youtubei/v1/browse/edit_playlist"
+                           }
+                          },
+                          "playlistEditEndpoint": {
+                           "playlistId": "WL",
+                           "actions": [
+                            {
+                             "addedVideoId": "5TIp7oVKHq8",
+                             "action": "ACTION_ADD_VIDEO"
+                            }
+                           ]
+                          }
+                         }
+                        },
+                        "accessibilityText": "Watch later",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "toggledButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "CHECK",
+                        "onTap": {
+                         "innertubeCommand": {
+                          "commandMetadata": {
+                           "webCommandMetadata": {
+                            "sendPost": true,
+                            "apiUrl": "/youtubei/v1/browse/edit_playlist"
+                           }
+                          },
+                          "playlistEditEndpoint": {
+                           "playlistId": "WL",
+                           "actions": [
+                            {
+                             "action": "ACTION_REMOVE_VIDEO_BY_VIDEO_ID",
+                             "removedVideoId": "5TIp7oVKHq8"
+                            }
+                           ]
+                          }
+                         }
+                        },
+                        "accessibilityText": "Added",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "isToggled": false
+                     }
+                    },
+                    {
+                     "toggleButtonViewModel": {
+                      "defaultButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "ADD_TO_QUEUE_TAIL",
+                        "onTap": {
+                         "innertubeCommand": {
+                          "commandMetadata": {
+                           "webCommandMetadata": {
+                            "sendPost": true
+                           }
+                          },
+                          "signalServiceEndpoint": {
+                           "signal": "CLIENT_SIGNAL",
+                           "actions": [
+                            {
+                             "addToPlaylistCommand": {
+                              "openMiniplayer": true,
+                              "videoId": "5TIp7oVKHq8",
+                              "listType": "PLAYLIST_EDIT_LIST_TYPE_QUEUE",
+                              "onCreateListCommand": {
+                               "commandMetadata": {
+                                "webCommandMetadata": {
+                                 "sendPost": true,
+                                 "apiUrl": "/youtubei/v1/playlist/create"
+                                }
+                               },
+                               "createPlaylistServiceEndpoint": {
+                                "videoIds": [
+                                 "5TIp7oVKHq8"
+                                ],
+                                "params": "CAQ%3D"
+                               }
+                              },
+                              "videoIds": [
+                               "5TIp7oVKHq8"
+                              ],
+                              "videoCommand": {
+                               "commandMetadata": {
+                                "webCommandMetadata": {
+                                 "url": "/watch?v=5TIp7oVKHq8",
+                                 "webPageType": "WEB_PAGE_TYPE_WATCH",
+                                 "rootVe": 3832
+                                }
+                               },
+                               "watchEndpoint": {
+                                "videoId": "5TIp7oVKHq8",
+                                "watchEndpointSupportedOnesieConfig": {
+                                 "html5PlaybackOnesieConfig": {
+                                  "commonConfig": {
+                                   "url": "https://rr2---sn-n0qqxoapo3-nuwl.googlevideo.com/initplayback?source=youtube&oeis=1&c=WEB&oad=3200&ovd=3200&oaad=11000&oavd=11000&ocs=700&oewis=1&oputc=1&olis=1&ofpcc=1&msp=1&odepv=1&id=e53229ee854a1eaf&ip=47.214.55.67&initcwndbps=3852500&mt=1785991261&oweuc="
+                                  }
+                                 }
+                                }
+                               }
+                              }
+                             }
+                            }
+                           ]
+                          }
+                         }
+                        },
+                        "accessibilityText": "Add to queue",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "toggledButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "CHECK",
+                        "accessibilityText": "Added",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "isToggled": false
+                     }
+                    }
+                   ]
+                  }
+                 }
+                ]
+               }
+              },
+              "metadata": {
+               "lockupMetadataViewModel": {
+                "title": {
+                 "content": "I spent a day with REALITY TV STARS"
+                },
+                "image": {
+                 "decoratedAvatarViewModel": {
+                  "avatar": {
+                   "avatarViewModel": {
+                    "image": {
+                     "sources": [
+                      {
+                       "url": "https://yt3.ggpht.com/W0_s1HaBB43cFZOtAYN1UEpiaOrG3VNl4kkUsGJx_Z3o4Q6nl8GGqsu50Dwlo6LjM8UhQ0qg=s68-c-k-c0x00ffffff-no-rj",
+                       "width": 68,
+                       "height": 68
+                      }
+                     ]
+                    },
+                    "avatarImageSize": "AVATAR_SIZE_M"
+                   }
+                  },
+                  "a11yLabel": "Go to channel Smosh Alike"
+                 }
+                },
+                "metadata": {
+                 "contentMetadataViewModel": {
+                  "metadataRows": [
+                   {
+                    "metadataParts": [
+                     {
+                      "text": {
+                       "content": "Smosh Alike",
+                       "styleRuns": [
+                        {
+                         "startIndex": 0,
+                         "length": 11,
+                         "weightLabel": "FONT_WEIGHT_NORMAL"
+                        },
+                        {
+                         "startIndex": 11,
+                         "styleRunExtensions": {
+                          "styleRunColorMapExtension": {
+                           "colorMap": [
+                            {
+                             "key": "USER_INTERFACE_THEME_DARK",
+                             "value": 4289374890
+                            },
+                            {
+                             "key": "USER_INTERFACE_THEME_LIGHT",
+                             "value": 4284506208
+                            }
+                           ]
+                          }
+                         }
+                        }
+                       ],
+                       "attachmentRuns": [
+                        {
+                         "startIndex": 11,
+                         "length": 0,
+                         "element": {
+                          "type": {
+                           "imageType": {
+                            "image": {
+                             "sources": [
+                              {
+                               "clientResource": {
+                                "imageName": "CHECK_CIRCLE_FILLED"
+                               },
+                               "width": 14,
+                               "height": 14
+                              }
+                             ]
+                            }
+                           }
+                          },
+                          "properties": {
+                           "layoutProperties": {
+                            "height": {
+                             "value": 14,
+                             "unit": "DIMENSION_UNIT_POINT"
+                            },
+                            "width": {
+                             "value": 14,
+                             "unit": "DIMENSION_UNIT_POINT"
+                            },
+                            "margin": {
+                             "left": {
+                              "value": 4,
+                              "unit": "DIMENSION_UNIT_POINT"
+                             }
+                            }
+                           }
+                          }
+                         },
+                         "alignment": "ALIGNMENT_VERTICAL_CENTER"
+                        }
+                       ]
+                      }
+                     }
+                    ]
+                   },
+                   {
+                    "metadataParts": [
+                     {
+                      "text": {
+                       "content": "1.2M views"
+                      }
+                     },
+                     {
+                      "text": {
+                       "content": "6 years ago"
+                      },
+                      "accessibilityLabel": "6 years ago"
+                     }
+                    ]
+                   }
+                  ],
+                  "delimiter": " \u2022 "
+                 }
+                },
+                "menuButton": {
+                 "buttonViewModel": {
+                  "iconName": "MORE_VERT",
+                  "onTap": {
+                   "innertubeCommand": {
+                    "showSheetCommand": {
+                     "panelLoadingStrategy": {
+                      "inlineContent": {
+                       "sheetViewModel": {
+                        "content": {
+                         "listViewModel": {
+                          "listItems": [
+                           {
+                            "listItemViewModel": {
+                             "title": {
+                              "content": "Add to queue"
+                             },
+                             "leadingImage": {
+                              "sources": [
+                               {
+                                "clientResource": {
+                                 "imageName": "ADD_TO_QUEUE_TAIL"
+                                }
+                               }
+                              ]
+                             }
+                            }
+                           },
+                           {
+                            "listItemViewModel": {
+                             "title": {
+                              "content": "Save to playlist"
+                             },
+                             "leadingImage": {
+                              "sources": [
+                               {
+                                "clientResource": {
+                                 "imageName": "BOOKMARK_BORDER"
+                                }
+                               }
+                              ]
+                             }
+                            }
+                           },
+                           {
+                            "listItemViewModel": {
+                             "title": {
+                              "content": "Share"
+                             },
+                             "leadingImage": {
+                              "sources": [
+                               {
+                                "clientResource": {
+                                 "imageName": "SHARE"
+                                }
+                               }
+                              ]
+                             }
+                            }
+                           }
+                          ]
+                         }
+                        }
+                       }
+                      }
+                     }
+                    }
+                   }
+                  },
+                  "accessibilityText": "More actions",
+                  "style": "BUTTON_VIEW_MODEL_STYLE_MONO",
+                  "type": "BUTTON_VIEW_MODEL_TYPE_TEXT",
+                  "buttonSize": "BUTTON_VIEW_MODEL_SIZE_DEFAULT",
+                  "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                 }
+                }
+               }
+              },
+              "contentId": "5TIp7oVKHq8",
+              "contentType": "LOCKUP_CONTENT_TYPE_VIDEO"
+             }
+            },
+            {
+             "lockupViewModel": {
+              "contentImage": {
+               "thumbnailViewModel": {
+                "image": {
+                 "sources": [
+                  {
+                   "url": "https://i.ytimg.com/vi/7u43Zlj9KK8/hqdefault.jpg?sqp=-oaymwEiCKgBEF5IWvKriqkDFQgBFQAAAAAYASUAAMhCPQCAokN4AQ==&rs=AOn4CLDAX3RNN8KgFRoXHkQi_uHhzQToqw",
+                   "width": 168,
+                   "height": 94
+                  }
+                 ]
+                },
+                "overlays": [
+                 {
+                  "thumbnailBottomOverlayViewModel": {
+                   "badges": [
+                    {
+                     "thumbnailBadgeViewModel": {
+                      "text": "15:42",
+                      "badgeStyle": "THUMBNAIL_OVERLAY_BADGE_STYLE_DEFAULT",
+                      "animationActivationTargetId": "7u43Zlj9KK8",
+                      "animatedText": "Now playing",
+                      "animationActivationEntitySelectorType": "THUMBNAIL_BADGE_ANIMATION_ENTITY_SELECTOR_TYPE_PLAYER_STATE"
+                     }
+                    }
+                   ]
+                  }
+                 },
+                 {
+                  "thumbnailHoverOverlayToggleActionsViewModel": {
+                   "buttons": [
+                    {
+                     "toggleButtonViewModel": {
+                      "defaultButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "WATCH_LATER",
+                        "onTap": {
+                         "innertubeCommand": {
+                          "commandMetadata": {
+                           "webCommandMetadata": {
+                            "sendPost": true,
+                            "apiUrl": "/youtubei/v1/browse/edit_playlist"
+                           }
+                          },
+                          "playlistEditEndpoint": {
+                           "playlistId": "WL",
+                           "actions": [
+                            {
+                             "addedVideoId": "7u43Zlj9KK8",
+                             "action": "ACTION_ADD_VIDEO"
+                            }
+                           ]
+                          }
+                         }
+                        },
+                        "accessibilityText": "Watch later",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "toggledButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "CHECK",
+                        "onTap": {
+                         "innertubeCommand": {
+                          "commandMetadata": {
+                           "webCommandMetadata": {
+                            "sendPost": true,
+                            "apiUrl": "/youtubei/v1/browse/edit_playlist"
+                           }
+                          },
+                          "playlistEditEndpoint": {
+                           "playlistId": "WL",
+                           "actions": [
+                            {
+                             "action": "ACTION_REMOVE_VIDEO_BY_VIDEO_ID",
+                             "removedVideoId": "7u43Zlj9KK8"
+                            }
+                           ]
+                          }
+                         }
+                        },
+                        "accessibilityText": "Added",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "isToggled": false
+                     }
+                    },
+                    {
+                     "toggleButtonViewModel": {
+                      "defaultButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "ADD_TO_QUEUE_TAIL",
+                        "onTap": {
+                         "innertubeCommand": {
+                          "commandMetadata": {
+                           "webCommandMetadata": {
+                            "sendPost": true
+                           }
+                          },
+                          "signalServiceEndpoint": {
+                           "signal": "CLIENT_SIGNAL",
+                           "actions": [
+                            {
+                             "addToPlaylistCommand": {
+                              "openMiniplayer": true,
+                              "videoId": "7u43Zlj9KK8",
+                              "listType": "PLAYLIST_EDIT_LIST_TYPE_QUEUE",
+                              "onCreateListCommand": {
+                               "commandMetadata": {
+                                "webCommandMetadata": {
+                                 "sendPost": true,
+                                 "apiUrl": "/youtubei/v1/playlist/create"
+                                }
+                               },
+                               "createPlaylistServiceEndpoint": {
+                                "videoIds": [
+                                 "7u43Zlj9KK8"
+                                ],
+                                "params": "CAQ%3D"
+                               }
+                              },
+                              "videoIds": [
+                               "7u43Zlj9KK8"
+                              ],
+                              "videoCommand": {
+                               "commandMetadata": {
+                                "webCommandMetadata": {
+                                 "url": "/watch?v=7u43Zlj9KK8",
+                                 "webPageType": "WEB_PAGE_TYPE_WATCH",
+                                 "rootVe": 3832
+                                }
+                               },
+                               "watchEndpoint": {
+                                "videoId": "7u43Zlj9KK8",
+                                "watchEndpointSupportedOnesieConfig": {
+                                 "html5PlaybackOnesieConfig": {
+                                  "commonConfig": {
+                                   "url": "https://rr2---sn-n0qqxoapo3-nuwl.googlevideo.com/initplayback?source=youtube&oeis=1&c=WEB&oad=3200&ovd=3200&oaad=11000&oavd=11000&ocs=700&oewis=1&oputc=1&olis=1&ofpcc=1&msp=1&odepv=1&id=eeee376658fd28af&ip=47.214.55.67&initcwndbps=3852500&mt=1785991261&oweuc="
+                                  }
+                                 }
+                                }
+                               }
+                              }
+                             }
+                            }
+                           ]
+                          }
+                         }
+                        },
+                        "accessibilityText": "Add to queue",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "toggledButtonViewModel": {
+                       "buttonViewModel": {
+                        "iconName": "CHECK",
+                        "accessibilityText": "Added",
+                        "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY_DARK",
+                        "type": "BUTTON_VIEW_MODEL_TYPE_TONAL",
+                        "buttonSize": "BUTTON_VIEW_MODEL_SIZE_COMPACT",
+                        "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                       }
+                      },
+                      "isToggled": false
+                     }
+                    }
+                   ]
+                  }
+                 }
+                ]
+               }
+              },
+              "metadata": {
+               "lockupMetadataViewModel": {
+                "title": {
+                 "content": "I Surprised Him With His Least Favorite TikToker"
+                },
+                "image": {
+                 "decoratedAvatarViewModel": {
+                  "avatar": {
+                   "avatarViewModel": {
+                    "image": {
+                     "sources": [
+                      {
+                       "url": "https://yt3.ggpht.com/sCCh2CGm-DBQPh7H35nKUc0ishDNLfnsMJCp_Rc33v6XCoBxuKmU4ZxtUxK3NDy8_avu5-dJfF0=s68-c-k-c0x00ffffff-no-rj",
+                       "width": 68,
+                       "height": 68
+                      }
+                     ]
+                    },
+                    "avatarImageSize": "AVATAR_SIZE_M"
+                   }
+                  },
+                  "a11yLabel": "Go to channel Dolan Twins"
+                 }
+                },
+                "metadata": {
+                 "contentMetadataViewModel": {
+                  "metadataRows": [
+                   {
+                    "metadataParts": [
+                     {
+                      "text": {
+                       "content": "Dolan Twins",
+                       "styleRuns": [
+                        {
+                         "startIndex": 0,
+                         "length": 11,
+                         "weightLabel": "FONT_WEIGHT_NORMAL"
+                        },
+                        {
+                         "startIndex": 11,
+                         "styleRunExtensions": {
+                          "styleRunColorMapExtension": {
+                           "colorMap": [
+                            {
+                             "key": "USER_INTERFACE_THEME_DARK",
+                             "value": 4289374890
+                            },
+                            {
+                             "key": "USER_INTERFACE_THEME_LIGHT",
+                             "value": 4284506208
+                            }
+                           ]
+                          }
+                         }
+                        }
+                       ],
+                       "attachmentRuns": [
+                        {
+                         "startIndex": 11,
+                         "length": 0,
+                         "element": {
+                          "type": {
+                           "imageType": {
+                            "image": {
+                             "sources": [
+                              {
+                               "clientResource": {
+                                "imageName": "CHECK_CIRCLE_FILLED"
+                               },
+                               "width": 14,
+                               "height": 14
+                              }
+                             ]
+                            }
+                           }
+                          },
+                          "properties": {
+                           "layoutProperties": {
+                            "height": {
+                             "value": 14,
+                             "unit": "DIMENSION_UNIT_POINT"
+                            },
+                            "width": {
+                             "value": 14,
+                             "unit": "DIMENSION_UNIT_POINT"
+                            },
+                            "margin": {
+                             "left": {
+                              "value": 4,
+                              "unit": "DIMENSION_UNIT_POINT"
+                             }
+                            }
+                           }
+                          }
+                         },
+                         "alignment": "ALIGNMENT_VERTICAL_CENTER"
+                        }
+                       ]
+                      }
+                     }
+                    ]
+                   },
+                   {
+                    "metadataParts": [
+                     {
+                      "text": {
+                       "content": "4.4M views"
+                      }
+                     },
+                     {
+                      "text": {
+                       "content": "6 years ago"
+                      },
+                      "accessibilityLabel": "6 years ago"
+                     }
+                    ]
+                   }
+                  ],
+                  "delimiter": " \u2022 "
+                 }
+                },
+                "menuButton": {
+                 "buttonViewModel": {
+                  "iconName": "MORE_VERT",
+                  "onTap": {
+                   "innertubeCommand": {
+                    "showSheetCommand": {
+                     "panelLoadingStrategy": {
+                      "inlineContent": {
+                       "sheetViewModel": {
+                        "content": {
+                         "listViewModel": {
+                          "listItems": [
+                           {
+                            "listItemViewModel": {
+                             "title": {
+                              "content": "Add to queue"
+                             },
+                             "leadingImage": {
+                              "sources": [
+                               {
+                                "clientResource": {
+                                 "imageName": "ADD_TO_QUEUE_TAIL"
+                                }
+                               }
+                              ]
+                             }
+                            }
+                           },
+                           {
+                            "listItemViewModel": {
+                             "title": {
+                              "content": "Save to playlist"
+                             },
+                             "leadingImage": {
+                              "sources": [
+                               {
+                                "clientResource": {
+                                 "imageName": "BOOKMARK_BORDER"
+                                }
+                               }
+                              ]
+                             }
+                            }
+                           },
+                           {
+                            "listItemViewModel": {
+                             "title": {
+                              "content": "Share"
+                             },
+                             "leadingImage": {
+                              "sources": [
+                               {
+                                "clientResource": {
+                                 "imageName": "SHARE"
+                                }
+                               }
+                              ]
+                             }
+                            }
+                           }
+                          ]
+                         }
+                        }
+                       }
+                      }
+                     }
+                    }
+                   }
+                  },
+                  "accessibilityText": "More actions",
+                  "style": "BUTTON_VIEW_MODEL_STYLE_MONO",
+                  "type": "BUTTON_VIEW_MODEL_TYPE_TEXT",
+                  "buttonSize": "BUTTON_VIEW_MODEL_SIZE_DEFAULT",
+                  "state": "BUTTON_VIEW_MODEL_STATE_ACTIVE"
+                 }
+                }
+               }
+              },
+              "contentId": "7u43Zlj9KK8",
+              "contentType": "LOCKUP_CONTENT_TYPE_VIDEO"
+             }
+            }
+           ]
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   ]
+  }
+ },
+ "header": {
+  "pageHeaderRenderer": {
+   "pageTitle": "Watch later"
+  }
+ }
+}

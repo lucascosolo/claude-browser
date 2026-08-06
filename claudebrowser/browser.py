@@ -11,7 +11,9 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
+import traceback
 
 import gi
 
@@ -19,9 +21,10 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import (agent, ai, auth, extract, findbar, pages, pagetext, panel_html,  # noqa: E402
-               passwords, perf, personas, playbooks, reader, resources, scrub,
-               settings, storage, store, style, tabnames, urls, vpn)
+from . import (agent, ai, auth, envfile, extract, findbar, pages, pagetext,  # noqa: E402
+               panel_html, passwords, perf, personas, playbooks, reader,
+               resources, scrub, settings, siterules, storage, store, style,
+               tabnames, urls, vpn, watchlater)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -70,6 +73,7 @@ MENU_SECTIONS = (
         ("document-open-recent-symbolic", "History", "Ctrl+H", "cb:history"),
         ("dialog-password-symbolic", "Saved logins", "", "cb:passwords"),
         ("media-playback-start-symbolic", "Playbooks", "", "cb:playbooks"),
+        ("view-media-playlist-symbolic", "Watch later", "Ctrl+Alt+W", "cb:queue"),
     )),
     ("This page", (
         ("edit-find-symbolic", "Find on page", "Ctrl+F", "find"),
@@ -85,7 +89,7 @@ MENU_SECTIONS = (
     )),
 )
 INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history", "cb:data",
-            "cb:playbooks", "cb:settings", "cb:vpn")
+            "cb:playbooks", "cb:queue", "cb:settings", "cb:vpn")
 
 #: The leak a proxy cannot close, and the only one of the three candidates that
 #: is real on this build.
@@ -411,6 +415,16 @@ class Browser(Gtk.Window):
         # omnibox flash is gone in a second and a half. Consumed by the next
         # render of cb:settings, which the write path triggers.
         self._settings_notice = None
+        # The Watch Later queue, as last read. NOT `_queue` -- that name is
+        # already the page-load admission FIFO in `_admit`, and taking it
+        # replaces the one thing keeping five simultaneous loads from
+        # peaking their memory in the same second. Held rather than fetched per
+        # render because a cb: scheme handler answers on the main loop, and a
+        # network round trip there freezes the window for as long as it takes.
+        # `None` means never fetched, which is what makes the first render of
+        # cb:queue kick off a refresh instead of reporting an empty queue.
+        self._watchlater = None
+        self._watchlater_loading = False
         for note in perf.tune_gtk(gtk_settings):
             print("perf: %s" % note, flush=True)
 
@@ -1031,6 +1045,10 @@ class Browser(Gtk.Window):
             ("n", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
                 lambda: self.new_tab(PRIVATE_HOME, private=True),
             ("Home", Gdk.ModifierType.MOD1_MASK): self._go_home,
+            # Ctrl+Alt+W joins reader mode and VPN Mode in the Ctrl+Alt row:
+            # Ctrl+W is close-tab everywhere and must stay that way.
+            ("w", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK):
+                lambda: self._open_internal("cb:queue"),
             ("q", Gdk.ModifierType.CONTROL_MASK): Gtk.main_quit,
             ("equal", Gdk.ModifierType.CONTROL_MASK): lambda: self._zoom(0.1),
             ("minus", Gdk.ModifierType.CONTROL_MASK): lambda: self._zoom(-0.1),
@@ -1305,9 +1323,13 @@ class Browser(Gtk.Window):
         try:
             data = self._render_internal(name, query).encode("utf-8")
         except Exception as e:
+            # The traceback, not just the exception: these pages are rendered
+            # inside a scheme handler, so nothing is printed anywhere else and
+            # a bare message leaves you guessing which of ten helpers raised.
             data = ("<meta charset=utf-8><body style='font:14px system-ui;padding:40px'>"
-                    "<h1>cb:%s failed to render</h1><pre>%s: %s</pre>"
-                    % (name, type(e).__name__, e)).encode("utf-8")
+                    "<h1>cb:%s failed to render</h1><pre>%s: %s</pre><pre>%s</pre>"
+                    % (name, type(e).__name__, e,
+                       pages._e(traceback.format_exc()))).encode("utf-8")
         stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data))
         request.finish(stream, len(data), "text/html; charset=utf-8")
 
@@ -1361,6 +1383,21 @@ class Browser(Gtk.Window):
         # not be able to depend on anything that can be broken.
         if name == "vpn":
             return pages.vpn_page(palette, self.nonce, vpn.snapshot())
+
+        # Answered before the store check, like cb:data and cb:settings: the
+        # queue is fetched from YouTube and has nothing to do with the history
+        # database. The first render kicks off the fetch and draws the waiting
+        # state -- rendering must not block on the network, because this handler
+        # is answering on the main loop.
+        if name == "queue":
+            if self._watchlater is None:
+                if not self._watchlater_loading:
+                    GLib.idle_add(lambda: (self._watchlater_refresh(),
+                                           GLib.SOURCE_REMOVE)[1])
+                return pages.queue_page(palette, self.nonce, {
+                    "ok": False, "items": [], "truncated": False,
+                    "error": "Reading your Watch Later queue…"})
+            return pages.queue_page(palette, self.nonce, self._watchlater)
 
         if name == "passwords":
             if self.vault is None:
@@ -1481,6 +1518,13 @@ class Browser(Gtk.Window):
             # {action, url, title}, and a fourth field would be one every other
             # sender has to ignore. A reset has no value at all.
             self._change_setting(url, None if action == "reset_setting" else title)
+        elif action == "queue_refresh":
+            # Cleared rather than left in place, so the page redraws as
+            # "reading" instead of showing a stale queue that is about to be
+            # replaced. The reload below is what makes that visible.
+            self._watchlater = None
+            self._reload_internal()
+            self._watchlater_refresh()
         elif action.startswith("vpn_"):
             # vpn_on / vpn_off / vpn_check, from the buttons on cb:vpn. The
             # state it wants rather than a flip, on the same reasoning as
@@ -1538,6 +1582,87 @@ class Browser(Gtk.Window):
             self._reload_internal()
 
         storage.domains(self.context, landed)
+
+    # -- the Watch Later queue ----------------------------------------------
+
+    def _watchlater_refresh(self):
+        """Re-read the Watch Later queue, off the main loop.
+
+        Three steps, and each one is where it is for a reason.
+
+        The **cookies** are asked of WebKit's own CookieManager rather than read
+        out of `cookies.sqlite`. The jar belongs to the engine that writes it,
+        and a second reader of a live SQLite file is a race for no gain; this
+        also keeps the credential inside the process that already holds it.
+
+        The **fetch** runs on a worker thread, because it is a network round
+        trip and this method can be called from a scheme handler that is
+        answering on the main loop.
+
+        The **result** comes back through `GLib.idle_add`, because everything
+        after it touches GTK -- and touching GTK off the main loop is the rule
+        this project breaks last.
+        """
+        if self._watchlater_loading:
+            return  # a second Refresh click while the first is in flight
+        self._watchlater_loading = True
+        manager = self.context.get_cookie_manager()
+        if manager is None:
+            self._watchlater_done({"ok": False, "items": [], "truncated": False,
+                              "error": "this build has no cookie manager"})
+            return
+
+        def got_cookies(mgr, result, _data=None):
+            try:
+                cookies = mgr.get_cookies_finish(result) or []
+                pairs = [(c.get_name(), c.get_value()) for c in cookies]
+            except GLib.Error as e:
+                pairs = []
+                print("queue: no cookies (%s)" % e.message, flush=True)
+            cookie = watchlater.cookie_header(pairs)
+            threading.Thread(target=self._watchlater_worker, args=(cookie,),
+                             daemon=True).start()
+
+        manager.get_cookies("https://www.youtube.com/", None, got_cookies)
+
+    def _watchlater_worker(self, cookie):
+        """The network half. Runs on a worker thread, touches nothing GTK."""
+        try:
+            # Read per fetch rather than captured at startup, so moving off WL
+            # to a normal playlist takes effect on the page's own Refresh.
+            list_id = (envfile.setting("CB_QUEUE_LIST", "")
+                       or watchlater.WATCH_LATER).strip()
+            state = watchlater.load(list_id=list_id, cookie=cookie)
+        except Exception as e:  # a parser bug must not take the thread down
+            state = {"ok": False, "items": [], "truncated": False,
+                     "error": "%s: %s" % (type(e).__name__, e)}
+        # One line, like storage: and perf:. This fetch happens on a worker
+        # thread against a site that changes shape, so "it said the queue was
+        # empty" needs to be answerable without attaching a debugger.
+        print("queue: %s, %d items%s (session cookies: %s)"
+              % ("ok" if state.get("ok") else state.get("error", "failed"),
+                 len(state.get("items") or []),
+                 ", truncated" if state.get("truncated") else "",
+                 "yes" if watchlater.signed_in(cookie) else "no"), flush=True)
+        if state.get("shape"):
+            print("queue: shape was %s" % state["shape"], flush=True)
+        if state.get("sample_keys"):
+            print("queue: sample item keys %s" % state["sample_keys"], flush=True)
+        GLib.idle_add(self._watchlater_done, state)
+
+    def _watchlater_done(self, state):
+        self._watchlater_loading = False
+        self._watchlater = {
+            "ok": state.get("ok", False),
+            "error": state.get("error", ""),
+            "truncated": state.get("truncated", False),
+            # Flattened here rather than in the page: `pages.py` renders
+            # dictionaries, and handing it `Item` objects would give it an
+            # opinion about a class it has no reason to import.
+            "items": [i.as_dict() for i in state.get("items") or []],
+        }
+        self._reload_internal()
+        return GLib.SOURCE_REMOVE
 
     def _reload_internal(self):
         """Re-render any open cb: page after the data behind it changed."""
