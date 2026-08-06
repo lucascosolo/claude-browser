@@ -202,6 +202,70 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(result["results"], [])
 
 
+class Language(unittest.TestCase):
+    """LangSearch takes no language parameter -- `language`, `lang`, `market`,
+    `mkt` and `setLang` were each sent to the live API and every one came back
+    with the same results in the same order -- so the filtering is ours."""
+
+    def hit(self, title, snippet=""):
+        return search.Result(title=title, url="https://x.test/", snippet=snippet)
+
+    def test_english_survives(self):
+        self.assertTrue(search.readable(
+            self.hit("Art Deco typography", "geometric letterforms of the 1920s")))
+
+    def test_cyrillic_and_cjk_are_dropped(self):
+        for title, snippet in (
+                ("Орнаментальная типографика", "визуальные исследования"),
+                ("全局解释器锁", "这是一种互斥锁"),
+                ("アールデコの書体", "幾何学的な文字")):
+            self.assertFalse(search.readable(self.hit(title, snippet)),
+                             title)
+
+    def test_a_latin_page_with_a_foreign_word_in_it_survives(self):
+        # The share is 0.65, not 1.0, precisely so this keeps working.
+        self.assertTrue(search.readable(
+            self.hit("Typesetting 北京 in Bezier curves",
+                     "A long English article about drawing letterforms.")))
+
+    def test_any_keeps_everything(self):
+        self.assertTrue(search.readable(self.hit("全局解释器锁"), lang="any"))
+
+    def test_digits_and_punctuation_are_not_evidence(self):
+        # No letters at all must mean "keep": a numeric headline says nothing
+        # about its language, and dropping it would be a guess.
+        self.assertTrue(search.readable(self.hit("2026 // 1.4.3 --- (!)")))
+
+    def test_the_filter_reports_what_it_removed(self):
+        kept, dropped = search.filter_language(
+            [self.hit("English one"), self.hit("Орнаментальная типографика"),
+             self.hit("English two")])
+        self.assertEqual([r.title for r in kept], ["English one", "English two"])
+        self.assertEqual(dropped, 1)
+
+    def test_it_never_turns_a_working_search_into_a_blank_page(self):
+        """If everything fails the filter, the filter is what is wrong."""
+        rows = [self.hit("全局解释器锁"), self.hit("Орнаментальная типографика")]
+        kept, dropped = search.filter_language(rows)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dropped, 0)
+
+    def test_search_applies_it_and_reports_the_count(self):
+        payload = envelope([row(name="English", snippet="words"),
+                            row(url="https://b/", name="Орнаментальная",
+                                snippet="типографика")])
+        result = search.search("x", key="KEY", lang="en",
+                               fetcher=lambda *a: (payload, ""))
+        self.assertEqual(len(result["results"]), 1)
+        self.assertEqual(result["dropped"], 1)
+
+    def test_a_failed_search_still_reports_a_count(self):
+        # The page reads `dropped` unconditionally; a missing key there would
+        # be a KeyError on the error path, which is the worst place for one.
+        result = search.search("x", key="KEY", fetcher=lambda *a: (None, "no"))
+        self.assertEqual(result["dropped"], 0)
+
+
 class OmniboxTemplate(unittest.TestCase):
     """cb:search has to be droppable into CB_SEARCH unchanged."""
 

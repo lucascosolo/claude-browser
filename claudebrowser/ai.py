@@ -802,7 +802,8 @@ SEARCH_SYSTEM = (
     "results'. Prefer what several results agree on. If the snippets do not "
     "actually answer the query, say that plainly and say what would -- an "
     "invented answer is worse than none, because the results are right below "
-    "you and the user can check. Never cite a result that is not in the list."
+    "you and the user can check. Never cite a result that is not in the list. "
+    "Answer in English even when the results are not in English."
 )
 
 #: The short answer's ceiling. Enough for two or three sentences; the point of

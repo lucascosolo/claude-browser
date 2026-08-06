@@ -146,6 +146,20 @@ def _http_url(value):
         raise ValueError("this address has no host in it")
 
 
+def _search_lang(text):
+    """`en` or `any`, case-insensitively. `None` for anything else.
+
+    A `choice` setting canonicalises rather than validates -- returning None is
+    how `_clean_choice` says "not one of these" -- so this is the whole
+    contract. Spelled here rather than imported from `search.py` for the same
+    reason every other validator is: this table is written from what the
+    consumer does with the value, and it must not depend on a module that
+    reaches the network.
+    """
+    low = (text or "").strip().lower()
+    return low if low in ("en", "any") else None
+
+
 def _playlist_id(value):
     """A YouTube playlist id, or WL.
 
@@ -325,6 +339,30 @@ SETTINGS = (
         "urls.py reads the template once at import, so this session keeps "
         "searching with the previous one.",
         check=_search_template),
+    Setting(
+        "CB_SEARCH_LANG", "Appearance", "Search result language",
+        "en keeps only results written in Latin script; any keeps everything. "
+        "The search API takes no language parameter -- language, lang, market, "
+        "mkt and setLang were all sent to it and changed nothing -- so this is "
+        "filtered here, after the results arrive.",
+        "choice", "en",
+        "Next search",
+        "Read on every search, so the next one already obeys it.",
+        choices=(("en", "Latin script only"), ("any", "Any language")),
+        canon=_search_lang),
+    Setting(
+        "CB_YT_EMBED", "Appearance", "Open YouTube videos in the bare player",
+        "A youtube.com/watch link loads the whole YouTube application -- the "
+        "player, a sidebar of suggestions with a thumbnail each, comments and "
+        "the shelves under them, which took over two minutes on this machine. "
+        "With this on, a video link goes straight to YouTube's own /embed/ "
+        "player instead: the same video, none of the rest. Home, search and "
+        "channel pages are untouched.",
+        "bool", "1",
+        "Next link",
+        "The rewrite happens as a navigation is decided, so the next video "
+        "link already obeys it.",
+        truth=_off_words),
     Setting(
         "CB_QUEUE_LIST", "Appearance", "Background queue playlist",
         "Which playlist cb:queue plays. WL is your Watch Later queue; any "

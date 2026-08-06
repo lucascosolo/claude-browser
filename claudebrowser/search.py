@@ -208,15 +208,110 @@ def fetch(query, key, provider=DEFAULT_PROVIDER, count=COUNT, route=None,
         return None, "could not reach the search API: %s" % e
 
 
+#: Which results to keep. `en` drops the ones not written in Latin script;
+#: `any` keeps everything. Read fresh on every search like the rest of the
+#: settings -- see the note on `envfile.values()`.
+LANG_ENV = "CB_SEARCH_LANG"
+DEFAULT_LANG = "en"
+
+#: How much of a result's lettering has to be Latin before it counts as
+#: readable. Not 1.0: an English page about Bézier curves or 北京 is still an
+#: English page, and a stray glyph in a title must not throw it out.
+LATIN_SHARE = 0.65
+
+#: The script ranges this rejects, by the first code point of each. Kept as an
+#: explicit list rather than `ord(ch) > 0x2000` so what is excluded can be read
+#: off the source: Greek, Cyrillic, Hebrew, Arabic, the Indic and South-East
+#: Asian blocks, Hangul, the CJK blocks and the Japanese kana.
+_NON_LATIN = (
+    (0x0370, 0x1CFF),   # Greek, Cyrillic, Hebrew, Arabic, Indic, Thai, ...
+    (0x2C80, 0x2DFF),   # Coptic, Ethiopic and Cyrillic supplements
+    (0x3040, 0x9FFF),   # kana, Hangul jamo, CJK
+    (0xA960, 0xD7FF),   # Hangul
+    (0xF900, 0xFAFF),   # CJK compatibility
+    (0x20000, 0x3FFFF),  # CJK extension planes
+)
+
+
+def language(path=None):
+    """The configured result language, normalised. Never raises."""
+    raw = (envfile.setting(LANG_ENV, DEFAULT_LANG, path=path) or "").strip().lower()
+    return raw if raw in ("en", "any") else DEFAULT_LANG
+
+
+def _latin_share(text):
+    """What fraction of this text's *letters* are Latin ones.
+
+    Digits, punctuation and spaces are not evidence either way -- a headline
+    that is mostly numerals says nothing about its language -- so they are not
+    counted at all. No letters at all returns 1.0: "no evidence" has to mean
+    "keep it", or a title of pure punctuation gets dropped for being foreign.
+    """
+    letters = latin = 0
+    for ch in text or "":
+        if not ch.isalpha():
+            continue
+        letters += 1
+        code = ord(ch)
+        if not any(low <= code <= high for low, high in _NON_LATIN):
+            latin += 1
+    return 1.0 if not letters else latin / letters
+
+
+def readable(result, lang=DEFAULT_LANG):
+    """Is this result in the language the user asked for?
+
+    Be honest about what this is: a *script* test, not a language test. It
+    keeps Spanish and German alongside English, and that is the deliberate
+    trade -- telling those apart needs a word list per language, and the
+    complaint it exists to answer is a page of Cyrillic and CJK results for an
+    English query, not a Spanish one. It reads the title and the snippet
+    together, because a translated headline over English prose is common and
+    the body is the better evidence.
+    """
+    if lang != "en":
+        return True
+    return _latin_share("%s %s" % (result.title, result.snippet)) >= LATIN_SHARE
+
+
+def filter_language(results, lang=DEFAULT_LANG):
+    """`(kept, dropped_count)` -- and never an empty page.
+
+    If every result fails, the filter is the thing that is wrong, not the
+    results: a query in another language, or a subject that simply is not
+    written about in Latin script. Handing back nothing there would look like
+    the search failed, so the unfiltered list is returned and the count is
+    zero. A filter must not be able to turn a working search into a blank
+    page.
+    """
+    kept = [r for r in results if readable(r, lang)]
+    if not kept:
+        return list(results), 0
+    return kept, len(results) - len(kept)
+
+
 def search(query, key=None, provider=DEFAULT_PROVIDER, count=COUNT, route=None,
-           fetcher=None, path=None):
-    """The one function the browser calls: fetch, then parse."""
+           fetcher=None, path=None, lang=None):
+    """The one function the browser calls: fetch, parse, then filter.
+
+    The filtering is ours because it has to be: LangSearch takes no language
+    parameter. `language`, `lang`, `market`, `mkt` and `setLang` were each sent
+    to the live API and every one came back with the same results in the same
+    order, so a request-side fix here would be a comment claiming something
+    that does not happen.
+    """
     if key is None:
         key = api_key(path)
     payload, error = (fetcher or fetch)(query, key, provider, count, route)
     if error:
-        return {"ok": False, "error": error, "results": []}
-    return parse(payload, provider)
+        return {"ok": False, "error": error, "results": [], "dropped": 0}
+    state = parse(payload, provider)
+    if state["ok"]:
+        state["results"], state["dropped"] = filter_language(
+            state["results"], language(path) if lang is None else lang)
+    else:
+        state["dropped"] = 0
+    return state
 
 
 #: What the omnibox writes for a search. `urls.SEARCH` pastes a quoted query

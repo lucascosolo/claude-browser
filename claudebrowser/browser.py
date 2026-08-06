@@ -9,6 +9,7 @@ thread on a GTK main-loop operation without either side knowing about the other.
 import io
 import json
 import os
+import random
 import re
 import secrets
 import threading
@@ -24,7 +25,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 from . import (agent, ai, auth, envfile, extract, findbar, pages, pagetext,  # noqa: E402
                panel_html, passwords, perf, personas, playbooks, reader,
                resources, scrub, search, settings, siterules, storage, store,
-               style, tabnames, urls, vpn, watchlater)
+               style, tabnames, urls, vpn, watchlater, youtube)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -257,6 +258,25 @@ def needs_tab(method):
 
 
 
+def _playing_audio(view):
+    """Is this view making a sound right now?
+
+    WebKit tracks this itself -- `is-playing-audio` is a property on the view,
+    maintained by the media engine -- so there is no polling of our own and
+    nothing injected into the page to ask. It goes false when playback pauses
+    or ends, which is what makes it the right signal rather than a sticky "has
+    played" flag: a queue that finished is a tab like any other.
+
+    Wrapped, because a build without the property must not be the reason the
+    memory guard stops working: `False` here means "cannot tell", and the
+    behaviour that follows from it is the behaviour this browser had before.
+    """
+    try:
+        return bool(view.is_playing_audio())
+    except Exception:
+        return False
+
+
 def _route_through_vpn(target):
     """Put one WebContext or WebsiteDataManager behind the VPN proxy.
 
@@ -427,6 +447,11 @@ class Browser(Gtk.Window):
         # cb:queue kick off a refresh instead of reporting an empty queue.
         self._watchlater = None
         self._watchlater_loading = False
+        # The tab the queue plays in, reused across plays so skipping through
+        # a queue does not leave a row of dead players behind. Checked against
+        # `self.tabs` before use rather than cleared on close: a tab can go
+        # away by six routes and only one of them is this class's own method.
+        self._player_tab = None
         # The last cb:search run, keyed by its query so that going back to an
         # earlier search does not render the newer one's results. `_websearch`
         # rather than `_search`, checked against the file first: `_queue` was
@@ -1551,6 +1576,15 @@ class Browser(Gtk.Window):
         elif action == "search_expand":
             if (url or "").strip() == (self._websearch.get("query") or ""):
                 self._websearch_answer(self._websearch_run, url, verbose=True)
+        elif action in ("queue_play", "queue_shuffle"):
+            # `url` carries the index to start from, as a string, on the same
+            # reasoning as clear_data's kind: the message shape is fixed at
+            # {action, url, title}.
+            try:
+                start = int(url or "0")
+            except ValueError:
+                start = 0
+            self._queue_play(start, shuffle=action == "queue_shuffle")
         elif action == "queue_refresh":
             # Cleared rather than left in place, so the page redraws as
             # "reading" instead of showing a stale queue that is about to be
@@ -1646,6 +1680,9 @@ class Browser(Gtk.Window):
             "error": state.get("error", ""),
             "configured": search.configured(),
             "results": [r.as_dict() for r in state.get("results") or []],
+            # Said on the page, not swallowed: a filter the user cannot see is
+            # one they cannot correct, and the correction is a setting.
+            "dropped": state.get("dropped", 0),
         }
         # The answer is *not* started here. Rendering the results replaces the
         # document, and a token injected into a document that is still loading
@@ -1743,6 +1780,43 @@ class Browser(Gtk.Window):
         threading.Thread(target=worker, daemon=True).start()
 
     # -- the Watch Later queue ----------------------------------------------
+
+    def _queue_play(self, start=0, shuffle=False):
+        """Play the queue from `start`, in its own tab.
+
+        The order is built here and handed to the player as its `playlist`
+        parameter, so the advance from one video to the next happens *inside*
+        YouTube's player with nothing of ours waiting on it. That is what makes
+        this cheap enough to leave running all afternoon: no page of ours is
+        listening for an `ended` event, because no page of ours is involved
+        after the click.
+
+        A tab of its own, reused across plays. Reused so a queue you skip
+        through does not leave a row of dead players behind; its own so the
+        list is still there when the video finishes, one tab away rather than
+        one history entry back.
+        """
+        items = (self._watchlater or {}).get("items") or []
+        if not items:
+            return
+        order = list(range(len(items)))
+        if shuffle:
+            random.shuffle(order)
+        elif 0 <= start < len(order):
+            order = order[start:] + order[:start]
+        ids = [items[i]["video_id"] for i in order
+               if (items[i].get("video_id") or "")]
+        if not ids:
+            return
+        player = youtube.embed_url(ids[0], queue=ids[1:])
+        if not player:
+            return
+        tab = self._player_tab if self._player_tab in self.tabs else None
+        if tab is None:
+            tab = self.new_tab(url=None)
+            self._player_tab = tab
+        self.notebook.set_current_page(self.notebook.page_num(tab.view))
+        self._load_player(tab, player)
 
     def _watchlater_refresh(self):
         """Re-read the Watch Later queue, off the main loop.
@@ -2318,7 +2392,8 @@ class Browser(Gtk.Window):
         current = self.current()
         return [{"id": t.id, "used": t.used, "current": t is current,
                  "discarded": bool(t.discarded), "loading": t.loading,
-                 "private": t.private, "url": t.view.get_uri() or ""}
+                 "private": t.private, "url": t.view.get_uri() or "",
+                 "playing": _playing_audio(t.view)}
                 for t in self.tabs]
 
     def _shed(self):
@@ -2326,7 +2401,7 @@ class Browser(Gtk.Window):
         states = self._tab_states()
         background = sum(1 for s in states
                          if not s["current"] and not s["discarded"]
-                         and not s["private"] and s["url"])
+                         and not s["private"] and not s["playing"] and s["url"])
         count = resources.discard_count(self.machine, background)
         for tab_id in resources.pick_victims(states, count):
             tab = self.find(tab_id)
@@ -2348,7 +2423,12 @@ class Browser(Gtk.Window):
         share one web process, so terminating it would take every other tab down
         with the one being discarded.
         """
-        if tab.discarded or tab.private or tab is self.current():
+        # `playing` is refused here and not only in `pick_victims`, on the same
+        # reasoning as `private`: this is the one door every discard goes
+        # through, and an agent calling `discard` on the tab the user is
+        # listening to would silence it just as thoroughly as the guard would.
+        if (tab.discarded or tab.private or tab is self.current()
+                or _playing_audio(tab.view)):
             return False
         url = tab.view.get_uri() or ""
         if not url or url.startswith("about:"):
@@ -3980,7 +4060,8 @@ class Browser(Gtk.Window):
         if self.discard_tab(tab):
             return done({"ok": True, "discarded": tab.id, **tab.info()})
         done({"ok": False, "error": "cannot discard this tab (it is focused, "
-                                    "private, empty, or already discarded)",
+                                    "private, playing audio, empty, or "
+                                    "already discarded)",
               **tab.info()})
 
     def api_recall(self, query, limit, done):
@@ -4422,6 +4503,8 @@ class Browser(Gtk.Window):
             # independent of it, and the gate only understands NAVIGATION_ACTION
             # and NEW_WINDOW_ACTION.
             return self._decide_response(decision)
+        if self._maybe_embed(decision, kind, tab):
+            return True
         if not vpn.STATE.blocks_navigation:
             return False
         if kind not in (WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
@@ -4447,6 +4530,59 @@ class Browser(Gtk.Window):
             GLib.idle_add(lambda: (tab.view.load_uri("cb:vpn"),
                                    GLib.SOURCE_REMOVE)[1])
         return True
+
+    def _maybe_embed(self, decision, kind, tab):
+        """Send a YouTube watch link to the bare player instead of the app.
+
+        Why it is worth intercepting at all: the watch page downloads and
+        hydrates the whole Polymer app -- player, a sidebar of suggestions with
+        a thumbnail each, comments, shelves -- which took over two minutes on
+        this machine and left every script evaluated against the tab timing
+        out. `/embed/<id>` is the same player without any of it.
+
+        Two things here are not optional. The load is **re-issued with a
+        `Referer`**, because the player answers a request without an http(s)
+        referrer with error 153 and no video; CLAUDE.md's warning about
+        re-issuing from decide-policy is about losing that header and about
+        turning a form POST into a GET, and neither applies to a GET whose
+        header we are the ones supplying. And it is started **from an idle**,
+        not from inside the decision: beginning a load while WebKit is still
+        deciding about another one is how a navigation half-happens.
+        """
+        if kind not in (WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+                        WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION):
+            return False
+        try:
+            uri = decision.get_navigation_action().get_request().get_uri() or ""
+        except Exception:
+            return False
+        player = youtube.redirect(uri)
+        if not player:
+            return False
+        decision.ignore()
+        # A link that asked for a new window still gets one. Rewriting it into
+        # the current tab would take the page the user was reading away from
+        # them, which is a different thing from making the video cheap.
+        fresh = kind == WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION
+        GLib.idle_add(lambda: (self._load_player(tab, player, fresh),
+                               GLib.SOURCE_REMOVE)[1])
+        return True
+
+    def _load_player(self, tab, player, fresh=False):
+        target = self.new_tab(url=None, private=tab.private) if fresh else tab
+        request = WebKit2.URIRequest.new(player)
+        headers = request.get_http_headers()
+        if headers is not None:
+            for name, value in youtube.headers().items():
+                headers.replace(name, value)
+            target.view.load_request(request)
+        else:
+            # No header list on this build: load it anyway rather than falling
+            # back to the two-minute page. The player may refuse with 153, and
+            # that is a visible failure the user can turn off with CB_YT_EMBED
+            # -- unlike silently reinstating the thing this exists to avoid.
+            target.view.load_uri(player)
+        self._flash("Playing without the YouTube app")
 
     def api_vpn(self, action, done):
         """Report VPN Mode, or turn it on or off.

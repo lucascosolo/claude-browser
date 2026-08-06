@@ -1824,12 +1824,6 @@ _DOC = """<!doctype html>
 """
 
 
-#: The embed host. `youtube-nocookie.com` rather than `youtube.com` because a
-#: queue page that is playing in the background all afternoon should not also be
-#: a place cookies accumulate; the player itself is identical.
-EMBED = "https://www.youtube-nocookie.com/embed/"
-
-
 def queue_page(palette, nonce, state):
     """cb:queue -- the Watch Later queue, played without YouTube's application.
 
@@ -1882,10 +1876,6 @@ def queue_page(palette, nonce, state):
         "count": len(items),
         "rows": rows,
         "truncated": truncated,
-        # `_js_block`, not `_js`: these go inside <script>. See the note there.
-        "queue": _js_block([it["video_id"] for it in items]),
-        "titles": _js_block([it["title"] or it["video_id"] for it in items]),
-        "embed": _js_block(EMBED),
     }
     return shell("Watch later", palette, nonce, "cb:queue", body)
 
@@ -1895,16 +1885,8 @@ def queue_page(palette, nonce, state):
 #: so a literal `%` in here is never rescanned by the document's format pass.
 _QUEUE_BODY = """
 <style>
-  .qwrap{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}
-  @media (min-width:1000px){.qwrap{grid-template-columns:minmax(0,3fr) minmax(280px,2fr)}}
-  .qstage{position:sticky;top:12px;align-self:start}
-  .qframe{position:relative;width:100%%;aspect-ratio:16/9;background:#000;
-          border-radius:10px;overflow:hidden}
-  .qframe iframe{position:absolute;inset:0;width:100%%;height:100%%;border:0}
-  .qidle{display:flex;align-items:center;justify-content:center;height:100%%;
-         opacity:.55;font-size:13px}
-  .qnow{margin:10px 2px 0;font-size:13px;min-height:1.2em;opacity:.85}
-  .qrow{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+  .qwrap{display:block}
+  .qrow{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px}
   .qlist{max-height:70vh;overflow:auto;border-radius:10px}
   .qitem{display:flex;width:100%%;gap:10px;align-items:center;text-align:left;
          padding:8px 10px;background:none;border:0;border-radius:8px;
@@ -1920,20 +1902,17 @@ _QUEUE_BODY = """
   .qdur{flex:none;font-size:11px;opacity:.6;font-variant-numeric:tabular-nums}
 </style>
 <div class="qwrap">
-  <section class="qstage">
-    <div class="qframe" id="stage"><div class="qidle">Nothing playing</div></div>
-    <p class="qnow" id="now"></p>
+  <section>
     <div class="qrow">
       <button class="pbbtn" id="playall">Play all</button>
-      <button class="pbbtn" id="prev">Previous</button>
-      <button class="pbbtn" id="next">Next</button>
       <button class="pbbtn" id="shuffle">Shuffle</button>
       <button class="pbbtn" onclick="return cbui.send({action:'queue_refresh'})">Refresh</button>
     </div>
-    <p class="note">Audio keeps playing while this tab is in the background.
-      Nothing here loads youtube.com's application &mdash; only the player.</p>
-  </section>
-  <section>
+    <p class="note">Playing opens the bare YouTube player in its own tab, with
+      the rest of the queue behind it, and advances there on its own. Audio
+      keeps going while that tab is in the background &mdash; the memory guard
+      will not reclaim a tab that is making sound. Nothing loads youtube.com's
+      application.</p>
     <h2>Queue <em>%(count)s</em></h2>
     %(truncated)s
     <div class="qlist" id="list">%(rows)s</div>
@@ -1941,117 +1920,33 @@ _QUEUE_BODY = """
 </div>
 <script>
 (function(){
-  var IDS = %(queue)s, TITLES = %(titles)s, EMBED = %(embed)s;
-  var stage = document.getElementById('stage');
-  var now = document.getElementById('now');
-  var order = IDS.map(function(_, i){ return i; });
-  var at = -1;
-  /* The player's own state, as it reports it: 1 is PLAYING. Tracked because a
-     Space key that always sends pauseVideo is a play button that cannot play. */
-  var state = -1;
+  /* This page no longer plays anything itself, and that is the fix rather
+     than a reduction. The embedded player answers a request from a `cb:`
+     document with *error 153* -- "Video player configuration error" -- because
+     a custom scheme is not an http(s) origin and the player will not run
+     without one. Measured three ways: the same video in an iframe served from
+     http://127.0.0.1 plays, the same URL opened top-level with no referrer
+     gives 153, and opening it from that loopback page plays. So playback is
+     handed to the browser, which loads the real player with a referrer
+     attached, and this page goes back to being what it is good at: a list of
+     titles that costs nothing to draw.
 
-  /* The player is talked to over postMessage rather than by loading YouTube's
-     iframe API script. The API script is another network fetch and another
-     megabyte of JavaScript to do what four lines of postMessage do, and this
-     page exists precisely because that machinery is what makes YouTube
-     unusable here. `enablejsapi=1` is what makes the embed answer. */
-  function frame(){ return stage.querySelector('iframe'); }
-
-  function command(func){
-    var f = frame();
-    if (!f) return;
-    f.contentWindow.postMessage(JSON.stringify(
-      {event:'command', func:func, args:[]}), '*');
+     The queue itself is not sent with the message. The browser already holds
+     it -- it is what rendered this page -- and a page that posts back a list
+     of ids is a page whose list can be edited before it arrives. */
+  function send(action, value){
+    return cbui.send({action: action, url: String(value)});
   }
-
-  function play(pos){
-    if (!IDS.length) return;
-    at = (pos + order.length) %% order.length;
-    var id = IDS[order[at]];
-    /* Replacing the whole iframe rather than reusing it: a src change on a
-       cross-origin frame leaves the old player's timers alive for a moment,
-       and on two cores that overlap is audible. */
-    stage.innerHTML = '';
-    var f = document.createElement('iframe');
-    f.allow = 'autoplay; encrypted-media; picture-in-picture';
-    f.setAttribute('allowfullscreen', '');
-    f.src = EMBED + encodeURIComponent(id) +
-            '?autoplay=1&enablejsapi=1&rel=0&modestbranding=1&playsinline=1';
-    f.addEventListener('load', function(){
-      /* The handshake: until the parent says it is listening, the embed sends
-         no state events, and without state events nothing advances. */
-      f.contentWindow.postMessage(JSON.stringify(
-        {event:'listening', id:1, channel:'widget'}), '*');
-    });
-    stage.appendChild(f);
-    now.textContent = (at + 1) + ' / ' + order.length + '  \\u00b7  ' +
-                      (TITLES[order[at]] || id);
-    mark();
-    try { localStorage.setItem('cb-queue-at', String(at)); } catch (e) {}
-  }
-
-  function mark(){
-    var live = order[at];
-    Array.prototype.forEach.call(
-      document.querySelectorAll('.qitem'), function(el){
-        el.classList.toggle('on', Number(el.dataset.i) === live);
-      });
-    var on = document.querySelector('.qitem.on');
-    if (on && on.scrollIntoView) on.scrollIntoView({block:'nearest'});
-  }
-
-  window.addEventListener('message', function(e){
-    var f = frame();
-    if (!f || e.source !== f.contentWindow) return;
-    var d;
-    try { d = JSON.parse(e.data); } catch (_) { return; }
-    /* playerState 0 is ENDED. This is the whole reason the page listens at
-       all: unattended advance is the feature. */
-    var info = d && d.info;
-    if (d.event !== 'infoDelivery' || !info) return;
-    if (typeof info.playerState === 'number') state = info.playerState;
-    if (info.playerState === 0) {
-      if (at + 1 < order.length) play(at + 1);
-      else { now.textContent = 'Queue finished'; }
-    }
-  });
 
   document.getElementById('list').addEventListener('click', function(e){
     var row = e.target.closest && e.target.closest('.qitem');
-    if (!row) return;
-    var i = Number(row.dataset.i);
-    order = IDS.map(function(_, n){ return n; });
-    at = -1;
-    play(order.indexOf(i));
+    if (row) send('queue_play', row.dataset.i);
   });
-
   document.getElementById('playall').addEventListener('click', function(){
-    order = IDS.map(function(_, i){ return i; });
-    play(0);
-  });
-  document.getElementById('next').addEventListener('click', function(){
-    if (at >= 0) play(at + 1); else play(0);
-  });
-  document.getElementById('prev').addEventListener('click', function(){
-    if (at >= 0) play(at - 1); else play(0);
+    send('queue_play', 0);
   });
   document.getElementById('shuffle').addEventListener('click', function(){
-    for (var i = order.length - 1; i > 0; i--) {
-      var j = Math.floor(Math.random() * (i + 1));
-      var t = order[i]; order[i] = order[j]; order[j] = t;
-    }
-    play(0);
-  });
-
-  /* Space toggles, like every other player. Ignored while a field has focus so
-     it cannot eat a keystroke meant for the filter box. */
-  document.addEventListener('keydown', function(e){
-    var tag = (document.activeElement || {}).tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-    if (e.key === ' ') {
-      e.preventDefault();
-      command(state === 1 ? 'pauseVideo' : 'playVideo');
-    }
+    send('queue_shuffle', 0);
   });
 })();
 </script>
@@ -2108,10 +2003,14 @@ def search_page(palette, nonce, query, state):
                "snippet": _e((hit.get("snippet") or "")[:280])}
             for i, hit in enumerate(results))
 
+    dropped = state.get("dropped") or 0
     body = _SEARCH_BODY % {
         "query": _e(query),
         "rows": rows,
         "count": len(results),
+        "filtered": ('<p class="sfilter">%d result%s not in Latin script '
+                     'hidden — CB_SEARCH_LANG</p>'
+                     % (dropped, "" if dropped == 1 else "s")) if dropped else "",
     } + _SEARCH_SCRIPT % {"q": _js_block(query)}
     return shell(query, palette, nonce, "cb:search", body)
 
@@ -2166,6 +2065,8 @@ _SEARCH_BODY = """
 
   /* The index. A narrow mono gutter carries the ordinal, so the eye has a
      rhythm to run down and the titles do not have to shout to separate. */
+  .sfilter{margin:-4px 0 16px;font-family:var(--mono,monospace);font-size:11px;
+           letter-spacing:.04em;color:var(--dim)}
   .hits{margin:0;padding:0;list-style:none;counter-reset:hit}
   .hit{display:grid;grid-template-columns:2.75rem minmax(0,1fr);
        column-gap:4px;margin:0 0 22px;max-width:46rem}
@@ -2217,6 +2118,7 @@ _SEARCH_BODY = """
 </section>
 <section>
   <h2>Results <em>%(count)s</em></h2>
+  %(filtered)s
   %(rows)s
 </section>
 """

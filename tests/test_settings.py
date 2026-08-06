@@ -31,8 +31,8 @@ EVERY_KEY = (
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
     "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
     "CB_QUEUE_LIST",
-    "CB_SCRUB", "CB_SEARCH", "CB_SITERULES", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_VPN",
-    "CB_VPN_PROXY", "CB_WEBGL",
+    "CB_SCRUB", "CB_SEARCH", "CB_SEARCH_LANG", "CB_SITERULES", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_VPN",
+    "CB_VPN_PROXY", "CB_WEBGL", "CB_YT_EMBED",
 )
 
 
@@ -106,7 +106,13 @@ class TestTable(Isolated):
                 "CB_QUEUE_LIST",
                 # Read by siterules.enabled() on every page commit, so the
                 # next load of a page picks up the change with no restart.
-                "CB_SITERULES"}
+                "CB_SITERULES",
+                # search.language() is read inside search.search(), which runs
+                # once per query, so the next search already obeys it.
+                "CB_SEARCH_LANG",
+                # youtube.enabled() is read inside the decide-policy handler,
+                # so the next link clicked already obeys it.
+                "CB_YT_EMBED"}
         for knob in settings.SETTINGS:
             immediate = "restart" not in knob.effect.lower()
             self.assertEqual(immediate, knob.key in live,

@@ -399,6 +399,13 @@ def pick_victims(tabs, count, now=None):
       * private -- its page is the only copy of that session. A private tab is
         not written to disk *anywhere*, so a discard is not a discard, it is a
         close, and the user did not ask for one;
+      * playing audio -- a tab making sound is a tab being used, whatever its
+        `used` timestamp says, and that timestamp only moves when the tab is
+        *touched*. Background listening is the one job where the tab is by
+        definition the one you are not looking at, so without this the guard
+        aims squarely at cb:queue and silences the thing it was built for.
+        Restoring it is not a reload the user can shrug at either: it is
+        silence, then a fresh player, back at the start of the queue;
       * used within the last MIN_IDLE_S. Without this the guard is correct and
         unusable: on a machine that sits at tight, flipping between two tabs
         discards each one the moment you leave it, so every switch is a reload.
@@ -413,7 +420,7 @@ def pick_victims(tabs, count, now=None):
     eligible = [t for t in tabs
                 if not t.get("current") and not t.get("discarded")
                 and not t.get("loading") and not t.get("private")
-                and t.get("url")
+                and not t.get("playing") and t.get("url")
                 and now - (t.get("used") or 0.0) >= MIN_IDLE_S]
     eligible.sort(key=lambda t: (t.get("used") or 0.0, t.get("id") or 0))
     return [t["id"] for t in eligible[:count]]

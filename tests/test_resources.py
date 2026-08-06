@@ -158,6 +158,7 @@ class TestDiscarding(unittest.TestCase):
             {"id": 5, "used": 1, "url": "https://e.example", "loading": True},
             {"id": 6, "used": 2, "url": "https://f.example", "discarded": True},
             {"id": 7, "used": 3, "url": ""},
+            {"id": 8, "used": 4, "url": "cb:queue", "playing": True},
         ]
 
     def pick(self, count, tabs=None):
@@ -196,6 +197,21 @@ class TestDiscarding(unittest.TestCase):
         self.assertNotIn(5, picked)   # mid-load: killing it wastes the bytes
         self.assertNotIn(6, picked)   # nothing left to reclaim
         self.assertNotIn(7, picked)   # no URL to come back to
+
+    def test_a_tab_playing_audio_is_never_discarded(self):
+        """Background listening is the one job where the tab in use is by
+        definition the one you are not looking at. Tab 8 is the oldest thing
+        in the fixture bar the exempt ones, so a guard that ignored `playing`
+        would take it first."""
+        self.assertNotIn(8, self.pick(99))
+
+    def test_playing_stops_mattering_once_the_sound_stops(self):
+        """`playing` is read live from the engine, not remembered, so a queue
+        that finished is a tab like any other -- otherwise one play would
+        exempt a tab for the rest of the session."""
+        quiet = [{"id": 1, "used": self.NOW, "current": True, "url": "https://a"},
+                 {"id": 8, "used": 4, "url": "cb:queue", "playing": False}]
+        self.assertEqual(resources.pick_victims(quiet, 9, now=self.NOW), [8])
 
     def test_it_is_deterministic(self):
         tabs = [{"id": 3, "used": 1, "url": "u"}, {"id": 2, "used": 1, "url": "u"}]
