@@ -2092,15 +2092,21 @@ def search_page(palette, nonce, query, state):
     elif not results:
         rows = _empty("&#9906;", "No results", "Nothing came back for that.")
     else:
-        rows = "".join(
-            '<article class="hit">'
-            '<a class="hurl" href="%(url)s">%(host)s</a>'
+        # A list, marked up as one: ten results *are* an ordered list, and the
+        # ordinals in the gutter are drawn by a CSS counter so the numbering
+        # cannot disagree with the markup. The host is a span rather than a
+        # second link to the same place -- two links with one destination is a
+        # tab stop and a screen-reader announcement bought for nothing.
+        rows = '<ol class="hits">%s</ol>' % "".join(
+            '<li class="hit" style="--i:%(i)d">'
+            '<div>'
+            '<span class="hurl">%(host)s</span>'
             '<a class="htitle" href="%(url)s">%(title)s</a>'
-            '<p class="hsnip">%(snippet)s</p></article>'
-            % {"url": _e(hit["url"]), "host": _e(_host(hit["url"])),
+            '<p class="hsnip">%(snippet)s</p></div></li>'
+            % {"i": i, "url": _e(hit["url"]), "host": _e(_host(hit["url"])),
                "title": _e(hit["title"]),
                "snippet": _e((hit.get("snippet") or "")[:280])}
-            for hit in results)
+            for i, hit in enumerate(results))
 
     body = _SEARCH_BODY % {
         "query": _e(query),
@@ -2110,49 +2116,100 @@ def search_page(palette, nonce, query, state):
     return shell(query, palette, nonce, "cb:search", body)
 
 
+#: The page. Laid out as a dispatch above a numbered index rather than as a
+#: stack of cards: the answer is one voice and gets a slab of its own, and the
+#: results are a *list of places to go*, which is what the mono ordinals in the
+#: gutter say at a glance. Everything is drawn with the three palette inks and
+#: the two families already in the theme -- there is no webfont here and there
+#: must not be, because a `cb:` page that fetches a font is a network request on
+#: a surface whose whole argument is that it costs nothing.
 _SEARCH_BODY = """
 <style>
-  .sform{margin:0 0 16px}
-  /* Three inks on this page, and each one means something. The card is
-     Claude's, so it is drawn in `--agent` -- the token that exists precisely
-     so "this came from the model" is not the same colour as "this has focus".
-     `--accent` is then left to do one job below: the link you are pointing at.
-     Ten result titles all painted in the chrome's accent is what made this
-     page hard to look at -- a colour that is on everything marks nothing. */
-  .answer{border:1px solid var(--edge,rgba(127,127,127,.3));
-          border-left:2px solid var(--agent);border-radius:10px;
-          background:var(--card);padding:14px 16px;margin:0 0 18px}
-  .answer h3{margin:0 0 8px;font-size:11px;letter-spacing:.1em;
-             text-transform:uppercase;color:var(--agent);opacity:.85}
-  .answer .txt{line-height:1.55;font-size:14px}
-  .answer .txt p{margin:0 0 10px}
+  .sform{margin:0 0 22px;max-width:44rem}
+  .sform .filter{width:100%%;font-size:15px;padding:10px 14px}
+
+  /* Three inks, each meaning one thing. The dispatch is Claude's, so it is
+     drawn in `--agent` -- the token that exists precisely so "this came from
+     the model" is not the same colour as "this has focus". `--accent` is then
+     left to do one job: the link you are pointing at. Ten result titles all
+     painted in the chrome's accent is what made this page hard to look at --
+     a colour that is on everything marks nothing. */
+  .answer{position:relative;margin:0 0 34px;max-width:44rem;
+          padding:16px 18px 16px 20px;background:var(--card);
+          border:1px solid var(--edge,rgba(127,127,127,.3));
+          border-left:3px solid var(--agent);border-radius:2px 12px 12px 2px}
+  .answer h3{display:flex;align-items:center;gap:8px;margin:0 0 10px;
+             font-family:var(--mono,monospace);font-size:10.5px;font-weight:400;
+             letter-spacing:.18em;text-transform:uppercase;color:var(--agent)}
+  /* A hairline running off the end of the label instead of a box around it:
+     structure without another rectangle on a page that is already rectangles. */
+  .answer h3::after{content:"";flex:1;height:1px;background:var(--agent);
+                    opacity:.28}
+  .answer .txt{line-height:1.6;font-size:15px;max-width:66ch}
+  .answer .txt p{margin:0 0 11px}
   .answer .txt p:last-child,.answer .txt ul:last-child,
-  .answer .txt ol:last-child{margin-bottom:0}
+  .answer .txt ol:last-child,.answer .txt pre:last-child{margin-bottom:0}
   .answer .txt h3,.answer .txt h4,.answer .txt h5,.answer .txt h6{
-    margin:14px 0 6px;font-size:13px;text-transform:none;letter-spacing:0;
-    opacity:1}
-  .answer .txt ul,.answer .txt ol{margin:0 0 10px;padding-left:20px}
-  .answer .txt li{margin:2px 0}
-  .answer .txt code{font-family:var(--mono,monospace);font-size:12.5px;
-    background:rgba(127,127,127,.14);border-radius:4px;padding:1px 4px}
-  .answer .txt pre{margin:0 0 10px;padding:10px 12px;overflow-x:auto;
-    background:rgba(127,127,127,.12);border-radius:8px}
-  .answer .txt pre code{background:none;padding:0}
-  .answer .more{margin-top:10px}
-  .hit{margin:0 0 20px;max-width:46em}
-  .hurl{display:block;font-size:11px;color:var(--dim);text-decoration:none}
-  .htitle{display:block;font-size:15px;font-weight:600;margin:1px 0 4px;
-          color:var(--text);text-decoration:none}
-  .htitle:visited{color:var(--dim)}
-  .htitle:hover{color:var(--accent);text-decoration:underline}
-  .hsnip{margin:0;font-size:13px;line-height:1.5;color:var(--dim)}
+    display:block;margin:16px 0 6px;font-family:inherit;font-size:14px;
+    font-weight:700;letter-spacing:0;text-transform:none;color:var(--text)}
+  .answer .txt h3::after{display:none}
+  .answer .txt ul,.answer .txt ol{margin:0 0 11px;padding-left:22px}
+  .answer .txt li{margin:3px 0}
   .answer .txt a{color:var(--accent)}
+  .answer .txt strong{font-weight:700;color:var(--text)}
+  .answer .txt code{font-family:var(--mono,monospace);font-size:13px;
+    background:rgba(127,127,127,.14);border-radius:4px;padding:1px 5px}
+  .answer .txt pre{margin:0 0 11px;padding:11px 13px;overflow-x:auto;
+    background:rgba(127,127,127,.12);border-radius:8px;line-height:1.45}
+  .answer .txt pre code{background:none;padding:0}
+  .answer .more{margin-top:14px}
+
+  /* The index. A narrow mono gutter carries the ordinal, so the eye has a
+     rhythm to run down and the titles do not have to shout to separate. */
+  .hits{margin:0;padding:0;list-style:none;counter-reset:hit}
+  .hit{display:grid;grid-template-columns:2.75rem minmax(0,1fr);
+       column-gap:4px;margin:0 0 22px;max-width:46rem}
+  .hit::before{counter-increment:hit;content:counter(hit,decimal-leading-zero);
+       font-family:var(--mono,monospace);font-size:11px;line-height:2.1;
+       color:var(--dim);opacity:.72;letter-spacing:.06em;
+       transition:color .18s ease,opacity .18s ease}
+  .hit:hover::before{color:var(--accent);opacity:1}
+  .hurl{display:block;font-family:var(--mono,monospace);font-size:11px;
+        letter-spacing:.04em;color:var(--dim)}
+  .htitle{display:block;margin:2px 0 5px;font-size:16px;font-weight:600;
+          line-height:1.3;color:var(--text);text-decoration:none;
+          text-underline-offset:3px}
+  .htitle:visited{color:var(--dim)}
+  .htitle:hover,.htitle:focus-visible{color:var(--accent);
+          text-decoration:underline}
+  .htitle:focus-visible{outline:2px solid var(--accent);outline-offset:4px;
+          border-radius:2px}
+  .hsnip{margin:0;font-size:13.5px;line-height:1.55;color:var(--dim);
+         max-width:70ch}
+
+  /* One orchestrated arrival rather than ten scattered ones: the dispatch
+     first, then the index falling in behind it a frame at a time. `--i` is set
+     per row so this is one rule instead of ten nth-child ones. */
+  @keyframes cbrise{from{opacity:0;transform:translateY(6px)}
+                    to{opacity:1;transform:none}}
+  .answer,.hit{animation:cbrise .34s cubic-bezier(.2,.7,.3,1) both}
+  .hit{animation-delay:calc(60ms + var(--i,0) * 28ms)}
+
+  @media (max-width:560px){
+    .hit{grid-template-columns:minmax(0,1fr)}
+    .hit::before{display:none}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .answer,.hit{animation:none}
+    .hit::before{transition:none}
+  }
 </style>
 <section class="sform">
   <input id="sq" class="filter" type="search" value="%(query)s"
-         placeholder="Search the web" autocomplete="off">
+         aria-label="Search the web" placeholder="Search the web"
+         autocomplete="off">
 </section>
-<section class="answer" id="answer">
+<section class="answer" id="answer" aria-live="polite">
   <h3>Claude</h3>
   <div class="txt" id="atxt">…</div>
   <div class="more" id="expandwrap">
