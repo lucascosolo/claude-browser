@@ -63,8 +63,9 @@ SECTIONS = (
 
 
 def _off_words(raw):
-    """perf.blocking_enabled / perf.light_enabled / scrub.enabled: on unless a
-    word that unambiguously means off. A typo keeps the default."""
+    """perf.blocking_enabled / perf.light_enabled / scrub.enabled /
+    siterules.enabled: on unless a word that unambiguously means off. A typo
+    keeps the default."""
     return (raw or "").strip().lower() not in ("0", "off", "false", "no")
 
 
@@ -324,6 +325,17 @@ SETTINGS = (
         "Next refresh",
         "cb:queue reads it when it fetches, so Refresh on the page is enough.",
         check=_playlist_id),
+    Setting(
+        "CB_SITERULES", "Appearance", "Declutter noisy sites",
+        "Hide the noise on sites this browser has a rule for -- YouTube's "
+        "Shorts, shelves, sidebar, comments and ad slots. Hides with CSS and "
+        "never removes anything that is also a control, so menus, dialogs and "
+        "Save to Watch Later keep working.",
+        "bool", "1",
+        "Next page load",
+        "The sheet is injected as a page commits, so pages already open keep "
+        "whatever they were loaded with until they are reloaded.",
+        truth=_off_words),
 
     # -- Privacy ------------------------------------------------------------
     Setting(

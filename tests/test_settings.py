@@ -31,7 +31,7 @@ EVERY_KEY = (
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
     "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
     "CB_QUEUE_LIST",
-    "CB_SCRUB", "CB_SEARCH", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_VPN",
+    "CB_SCRUB", "CB_SEARCH", "CB_SITERULES", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_VPN",
     "CB_VPN_PROXY", "CB_WEBGL",
 )
 
@@ -103,7 +103,10 @@ class TestTable(Isolated):
                 "CB_VPN", "CB_VPN_PROXY",
                 # Read inside the worker that fetches the queue, on every
                 # fetch, so Refresh on cb:queue is enough to pick up a change.
-                "CB_QUEUE_LIST"}
+                "CB_QUEUE_LIST",
+                # Read by siterules.enabled() on every page commit, so the
+                # next load of a page picks up the change with no restart.
+                "CB_SITERULES"}
         for knob in settings.SETTINGS:
             immediate = "restart" not in knob.effect.lower()
             self.assertEqual(immediate, knob.key in live,

@@ -222,6 +222,15 @@ OPS = [
                Param("width", "integer", "Line measure in px (360-1100).", cli="opt")],
        call=lambda c, a: ("api_reader", (_tab(a), a.get("font"), a.get("width")))),
 
+    # Like reader, a *display* change that reports state rather than content.
+    # An agent wanting the prose still calls text or markdown, which read the
+    # decluttered DOM like any other -- the sheet hides nodes, it never removes
+    # them, so nothing an agent can reach disappears because this is on.
+    Op("simplify", "/simplify", "POST", "Toggle the declutter sheet for sites "
+       "with a rule (YouTube and friends): hide Shorts, shelves, sidebars, "
+       "comments and ad slots. Reports the resulting state.",
+       call=lambda c, a: ("api_simplify", (_tab(a),))),
+
     Op("find", "/find", "GET", "Search the rendered page text for a regex and "
        "return matches with context.",
        params=[Param("q", required=True, help="Regex to search for.")],

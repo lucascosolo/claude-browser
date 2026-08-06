@@ -37,7 +37,27 @@ reasoning as everything in `perf.py`.
 
 from urllib.parse import urlsplit
 
-from . import extract
+from . import envfile, extract
+
+#: The switch. Read from the settings file on every call rather than captured
+#: at import, for the same reason `perf.light_enabled` is: the settings page
+#: writes that file, and a value read once would leave the browser decluttering
+#: pages the user has just asked it to leave alone until the next restart.
+RULES_ENV = "CB_SITERULES"
+
+
+def enabled(raw=None, path=None):
+    """Is the declutter layer on? Default yes.
+
+    On by default because the user's complaint was that YouTube is *unusable*,
+    not that it is occasionally noisy -- a mode you have to switch on for every
+    page is one you are switching on every time. Anything unrecognised means
+    on, matching `CB_LIGHT` and `CB_BLOCK`: a typo must not silently remove a
+    default nobody asked to lose.
+    """
+    if raw is None:
+        raw = envfile.setting(RULES_ENV, "", path=path)
+    return (raw or "").strip().lower() not in ("0", "off", "false", "no")
 
 #: The id of the injected style element. One per document; its presence is the
 #: whole of the on/off state, so nothing has to be tracked on the Python side.

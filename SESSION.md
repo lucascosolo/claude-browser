@@ -233,6 +233,19 @@ Two ways forward, and the first needs nothing from the user:
 - The playlist-page **declutter** selectors (task #2/#9) — still not read off a
   live page, because the machine could not run a script against YouTube.
 
+### Reported by the user, not yet investigated
+
+- **Password autofill does not always trigger.** Reproducing page:
+  `https://api-dashboard.search.brave.com/login`. Suspects, in order: the form
+  is rendered client-side *after* the load-finished hook that calls
+  `_pw_autofill`; the fields sit inside a component or shadow root the injected
+  selector does not reach; or the saved entry's origin
+  (`search.brave.com`?) does not match `api-dashboard.search.brave.com`. Any
+  fix must keep the rule that the origin is read natively from the focused
+  view and never supplied by the page. Task #7.
+- Brave Search appears to be where the `cb:search` API key is coming from,
+  which makes that dashboard worth getting right.
+
 ### Next steps, in order
 
 1. Browser side of the fetch: ask WebKit's `CookieManager` for youtube.com

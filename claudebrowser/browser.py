@@ -78,6 +78,8 @@ MENU_SECTIONS = (
     ("This page", (
         ("edit-find-symbolic", "Find on page", "Ctrl+F", "find"),
         ("view-paged-symbolic", "Reader mode", "Ctrl+Alt+R", "reader"),
+        ("view-fullscreen-symbolic", "Declutter this site", "Ctrl+Alt+D",
+         "siterules"),
     )),
     ("Machine", (
         # A toggle rather than a link to cb:vpn, because the thing people want
@@ -1049,6 +1051,8 @@ class Browser(Gtk.Window):
             # Ctrl+W is close-tab everywhere and must stay that way.
             ("w", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK):
                 lambda: self._open_internal("cb:queue"),
+            ("d", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK):
+                self.toggle_siterules,
             ("q", Gdk.ModifierType.CONTROL_MASK): Gtk.main_quit,
             ("equal", Gdk.ModifierType.CONTROL_MASK): lambda: self._zoom(0.1),
             ("minus", Gdk.ModifierType.CONTROL_MASK): lambda: self._zoom(-0.1),
@@ -1867,14 +1871,67 @@ class Browser(Gtk.Window):
         if event == WebKit2.LoadEvent.STARTED:
             tab.loading = True
             tab.failed = None
+        elif event == WebKit2.LoadEvent.COMMITTED:
+            # As the document commits, not when it finishes: the sheet has to
+            # be in place before the page paints, or the clutter appears and
+            # then visibly vanishes, which is worse than leaving it there.
+            self._apply_siterules(tab)
         elif event == WebKit2.LoadEvent.FINISHED:
             tab.loading = False
+            # Again at the end, for the single-page apps this mostly targets:
+            # a document that replaced its own head between commit and finish
+            # would otherwise have dropped the sheet. The snippet is idempotent
+            # by design, so the second call is a lookup and nothing more.
+            self._apply_siterules(tab)
             self._remember(tab)
             self._pw_expire(tab)
             self._pw_autofill(tab)
             self._settle(tab, {"ok": tab.failed is None, **tab.info(),
                                **({"error": tab.failed} if tab.failed else {})})
         self._refresh(tab)
+
+    def _apply_siterules(self, tab):
+        """Install the declutter sheet for whatever site this tab is on.
+
+        Silent when there is no rule for the URL and when the layer is off --
+        both are the ordinary case, and a browser that logged a line per
+        uncovered page load would log one for nearly every page load.
+        """
+        if not siterules.enabled():
+            return
+        script = siterules.apply_css(tab.view.get_uri() or "")
+        if script:
+            tab.view.evaluate_javascript(script, -1, None, None, None,
+                                         None, None)
+
+    def toggle_siterules(self):
+        """Show this page as the site sent it, or hide the noise again.
+
+        A per-page escape hatch rather than a setting, because the reason to
+        want the original is nearly always "the rule hid something I need on
+        *this* page" -- and having to open settings, flip a switch and reload
+        to see a comment thread is a worse answer than a keystroke.
+        """
+        tab = self.current()
+        if tab is None:
+            return
+        url = tab.view.get_uri() or ""
+        script = siterules.toggle(url)
+        if script is None:
+            rule_names = ", ".join(sorted({r.name for r in siterules.RULES}))
+            return self._flash("No declutter rule for this site (%s)"
+                               % rule_names)
+
+        def done(view, result, _data=None):
+            try:
+                value = view.evaluate_javascript_finish(result)
+                state = json.loads(value.to_string()) if value else {}
+            except (GLib.Error, json.JSONDecodeError, TypeError, AttributeError):
+                return self._flash("Could not change this page")
+            self._flash("Decluttered (%s)" % state.get("rule")
+                        if state.get("simplified") else "Showing the full page")
+
+        tab.view.evaluate_javascript(script, -1, None, None, None, done, None)
 
     def _remember(self, tab):
         """Record a visit -- unless this tab is private, which is the whole
@@ -2495,6 +2552,7 @@ class Browser(Gtk.Window):
             "private": lambda: self.new_tab(PRIVATE_HOME, private=True),
             "find": self.findbar.open,
             "reader": self.toggle_reader,
+            "siterules": self.toggle_siterules,
             "vpn": self.toggle_vpn,
         }[key]()
 
@@ -3634,6 +3692,36 @@ class Browser(Gtk.Window):
             done({"ok": True, "count": len(entries), "entries": entries})
 
         self.api_eval(tab_id, READ_CONSOLE, filter_entries)
+
+    def api_simplify(self, tab_id, done):
+        """Toggle the declutter sheet and report the state it ended in.
+
+        Undecorated for the same reason api_reader is: api_eval resolves the
+        tab, and resolving it twice lights the "Claude is driving" indicator
+        twice for one operation.
+
+        The URL is read natively from the tab rather than taken from the page,
+        which is the same rule autofill follows: the rule is chosen from what
+        the browser knows it loaded, never from what a document claims to be.
+        """
+        tab = self.find(tab_id)
+        if tab is None:
+            return done({"ok": False, "error": "no such tab"})
+        script = siterules.toggle(tab.view.get_uri() or "")
+        if script is None:
+            return done({"ok": True, "simplified": False, "rule": None,
+                         "note": "no declutter rule for this site"})
+
+        def summarize(payload):
+            if not payload.get("ok"):
+                return done(payload)
+            result = payload.get("result") or {}
+            if not isinstance(result, dict):
+                return done({"ok": False,
+                             "error": "declutter script returned no state"})
+            done(dict(result))
+
+        self.api_eval(tab_id, script, summarize)
 
     def api_reader(self, tab_id, font_px, width_px, done):
         """Toggle reader mode and report the state it ended in.
