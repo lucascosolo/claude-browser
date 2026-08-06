@@ -23,8 +23,8 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (agent, ai, auth, envfile, extract, findbar, pages, pagetext,  # noqa: E402
                panel_html, passwords, perf, personas, playbooks, reader,
-               resources, scrub, settings, siterules, storage, store, style,
-               tabnames, urls, vpn, watchlater)
+               resources, scrub, search, settings, siterules, storage, store,
+               style, tabnames, urls, vpn, watchlater)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -91,7 +91,7 @@ MENU_SECTIONS = (
     )),
 )
 INTERNAL = ("cb:home", "cb:deck", "cb:bookmarks", "cb:history", "cb:data",
-            "cb:playbooks", "cb:queue", "cb:settings", "cb:vpn")
+            "cb:playbooks", "cb:queue", "cb:search", "cb:settings", "cb:vpn")
 
 #: The leak a proxy cannot close, and the only one of the three candidates that
 #: is real on this build.
@@ -427,6 +427,12 @@ class Browser(Gtk.Window):
         # cb:queue kick off a refresh instead of reporting an empty queue.
         self._watchlater = None
         self._watchlater_loading = False
+        # The last cb:search run, keyed by its query so that going back to an
+        # earlier search does not render the newer one's results. `_websearch`
+        # rather than `_search`, checked against the file first: `_queue` was
+        # already taken by the load FIFO and taking it broke page admission.
+        self._websearch = {}
+        self._websearch_run = 0
         for note in perf.tune_gtk(gtk_settings):
             print("perf: %s" % note, flush=True)
 
@@ -1403,6 +1409,21 @@ class Browser(Gtk.Window):
                     "error": "Reading your Watch Later queue…"})
             return pages.queue_page(palette, self.nonce, self._watchlater)
 
+        # Answered before the store check, like cb:queue: a search talks to the
+        # search API and to Anthropic, and has nothing to do with the history
+        # database. Rendering never blocks -- results arrive on a worker thread
+        # and the answer is streamed in afterwards.
+        if name == "search":
+            wanted = search.query_of(query)
+            state = self._websearch
+            if wanted and state.get("query") != wanted:
+                state = {"query": wanted, "searching": True, "results": [],
+                         "error": "", "configured": search.configured()}
+                self._websearch = state
+                GLib.idle_add(lambda: (self._websearch_start(wanted),
+                                       GLib.SOURCE_REMOVE)[1])
+            return pages.search_page(palette, self.nonce, wanted, state)
+
         if name == "passwords":
             if self.vault is None:
                 return pages.passwords_page(palette, self.nonce, [], available=False)
@@ -1522,6 +1543,14 @@ class Browser(Gtk.Window):
             # {action, url, title}, and a fourth field would be one every other
             # sender has to ignore. A reset has no value at all.
             self._change_setting(url, None if action == "reset_setting" else title)
+        elif action == "search_ready":
+            # A cb:search page announcing that its script is live. `url`
+            # carries the query, on the same reasoning as clear_data's kind:
+            # the message shape is fixed at {action, url, title}.
+            self._websearch_ready((url or "").strip())
+        elif action == "search_expand":
+            if (url or "").strip() == (self._websearch.get("query") or ""):
+                self._websearch_answer(self._websearch_run, url, verbose=True)
         elif action == "queue_refresh":
             # Cleared rather than left in place, so the page redraws as
             # "reading" instead of showing a stale queue that is about to be
@@ -1586,6 +1615,132 @@ class Browser(Gtk.Window):
             self._reload_internal()
 
         storage.domains(self.context, landed)
+
+    # -- cb:search ----------------------------------------------------------
+
+    def _websearch_start(self, query):
+        """Fetch results on a worker thread, then stream Claude's answer.
+
+        Two network calls with very different latencies, so they are two
+        stages: the results re-render the page as soon as they land, and the
+        answer is injected token by token afterwards. Making either wait for
+        the other would make this slower than the search engine it replaces.
+        """
+        self._websearch_run += 1
+        run = self._websearch_run
+
+        def worker():
+            state = search.search(query)
+            GLib.idle_add(self._websearch_done, run, query, state)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _websearch_done(self, run, query, state):
+        # A superseded run is dropped rather than rendered: without this, a
+        # slow search for an earlier query lands on top of a newer one, which
+        # is the same stale-answer bug the recall suggestions guard against.
+        if run != self._websearch_run:
+            return GLib.SOURCE_REMOVE
+        self._websearch = {
+            "query": query, "searching": False,
+            "error": state.get("error", ""),
+            "configured": search.configured(),
+            "results": [r.as_dict() for r in state.get("results") or []],
+        }
+        # The answer is *not* started here. Rendering the results replaces the
+        # document, and a token injected into a document that is still loading
+        # lands on a `window.cbAnswer` that does not exist yet -- which is
+        # exactly what happened: the answer streamed into nothing and the page
+        # sat on its placeholder. The freshly loaded page asks for it instead,
+        # through `search_ready`, so there is no window to miss.
+        self._reload_internal()
+        return GLib.SOURCE_REMOVE
+
+    def _websearch_ready(self, query):
+        """A cb:search document has loaded and wants its answer.
+
+        Called from the page, which is the only thing that knows when its own
+        script is running. Catch-up is free because the whole answer so far is
+        re-sent rather than diffed -- see `_websearch_answer`.
+        """
+        state = self._websearch
+        if not query or query != state.get("query") or not state.get("results"):
+            return
+        if state.get("answer"):
+            self._websearch_push(query, "set", state["answer"])
+        if state.get("answer_done"):
+            self._websearch_push(query, "done", state.get("verbose", False))
+        elif not state.get("answering"):
+            self._websearch_answer(self._websearch_run, query, verbose=False)
+
+    def _websearch_push(self, query, call, value):
+        """Inject one `window.cbAnswer` call into every tab showing this query.
+
+        Filtered by the *query*, not by "is a cb:search page": two searches can
+        be open at once, and a second tab receiving the first one's answer is
+        the same stale-answer bug `_websearch_done` guards against, only harder
+        to see.
+        """
+        js = "window.cbAnswer&&window.cbAnswer.%s(%s)" % (
+            call, "true" if value is True else
+            "false" if value is False else pages._js_block(value))
+        for tab in self.tabs:
+            uri = tab.view.get_uri() or ""
+            if not uri.lower().startswith("cb:search"):
+                continue
+            if search.query_of(uri.partition("?")[2]) != query:
+                continue
+            tab.view.evaluate_javascript(js, -1, None, None, None, None, None)
+        return GLib.SOURCE_REMOVE
+
+    def _websearch_answer(self, run, query, verbose=False):
+        """Stream Claude's answer into whichever tabs are showing this search.
+
+        The page exposes `window.cbAnswer` and nothing else; the native side
+        injects calls to it. That keeps the page free of any polling and means
+        a tab that has been navigated away simply stops receiving tokens.
+
+        Every push carries the *whole* answer so far rather than the newest
+        token. It costs a few kilobytes of JS on a stream that is a couple of
+        thousand characters long, and it buys the one property that matters
+        here: a document that loads mid-stream, or reloads afterwards, catches
+        up by asking, with no per-tab bookkeeping and no token that has to
+        arrive exactly once.
+        """
+        results = list(self._websearch.get("results") or [])
+        self._websearch["answering"] = True
+        self._websearch["answer_done"] = False
+        self._websearch["verbose"] = verbose
+        self._websearch["answer"] = ""
+
+        def landed(text):
+            if run == self._websearch_run and self._websearch.get("query") == query:
+                self._websearch["answer"] = text
+            return self._websearch_push(query, "set", text)
+
+        def finished(failure=""):
+            if run == self._websearch_run:
+                self._websearch["answering"] = False
+                self._websearch["answer_done"] = True
+            if failure:
+                self._websearch["answer"] = failure
+                return self._websearch_push(query, "fail", failure)
+            return self._websearch_push(query, "done", verbose)
+
+        def worker():
+            whole = ""
+            try:
+                for chunk in ai.search_answer(query, results, verbose=verbose):
+                    if run != self._websearch_run:
+                        return  # a newer search has started; stop paying for
+                                # an answer nobody will see
+                    whole += chunk
+                    GLib.idle_add(landed, whole)
+                GLib.idle_add(finished)
+            except Exception as e:
+                GLib.idle_add(finished, "Claude could not answer: %s" % e)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # -- the Watch Later queue ----------------------------------------------
 

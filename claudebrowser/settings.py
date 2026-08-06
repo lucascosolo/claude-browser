@@ -127,8 +127,15 @@ def _search_template(value):
     if "claude-browser-probe" not in probe:
         raise ValueError("the %s in a search URL is where the query goes; "
                          "this template dropped it")
+    # `cb:search?q=%s` is the default, and it is not an http URL. It is
+    # allowed by name rather than by letting any scheme through: `cb:` is this
+    # browser's own, and a template pointing at `javascript:` or `data:` would
+    # turn the omnibox into an execution surface for whatever was typed.
+    if probe.lower().startswith("cb:search"):
+        return
     if not probe.lower().startswith(("http://", "https://")):
-        raise ValueError("a search URL has to start with http:// or https://")
+        raise ValueError("a search URL has to start with http:// or https://, "
+                         "or be cb:search?q=%s")
 
 
 def _http_url(value):
@@ -310,8 +317,10 @@ SETTINGS = (
     Setting(
         "CB_SEARCH", "Appearance", "Search engine",
         "Where the omnibox sends anything that is not an address. %s is the "
-        "query.",
-        "text", "https://duckduckgo.com/?q=%s",
+        "query. The default is this browser's own cb:search, which puts a "
+        "short Claude answer above real results; any https:// template "
+        "works too.",
+        "text", "cb:search?q=%s",
         "After a restart",
         "urls.py reads the template once at import, so this session keeps "
         "searching with the previous one.",

@@ -2056,3 +2056,247 @@ _QUEUE_BODY = """
 })();
 </script>
 """
+
+
+def search_page(palette, nonce, query, state):
+    """cb:search -- a Claude answer above real results.
+
+    Rendered synchronously from whatever is known at the time, and re-rendered
+    when the results land; the answer arrives separately, injected token by
+    token into `window.cbAnswer` by `browser.py`. That split is the whole
+    design: the results and the answer are two network calls with very
+    different latencies, and making either wait for the other would make the
+    page feel slower than the search engine it replaces.
+    """
+    results = state.get("results") or []
+    searching = state.get("searching")
+
+    if not query:
+        body = ('<section class="sform"><input id="sq" class="filter" '
+                'type="search" autofocus placeholder="Search the web" '
+                'autocomplete="off"></section>'
+                + _empty("&#9906;", "Search",
+                         "Results from LangSearch, with a short answer from "
+                         "Claude above them."))
+        return shell("Search", palette, nonce, "cb:search",
+                     body + _SEARCH_SCRIPT % {"q": _js_block("")})
+
+    if not state.get("configured", True):
+        rows = _empty("&#9888;", "No search API key",
+                      "Set CB_SEARCH_KEY in the settings file. It is a secret, "
+                      "so it is deliberately not editable from cb:settings.")
+    elif state.get("error"):
+        rows = _empty("&#9888;", "Search failed", state["error"])
+    elif searching:
+        rows = '<p class="note">Searching…</p>'
+    elif not results:
+        rows = _empty("&#9906;", "No results", "Nothing came back for that.")
+    else:
+        rows = "".join(
+            '<article class="hit">'
+            '<a class="hurl" href="%(url)s">%(host)s</a>'
+            '<a class="htitle" href="%(url)s">%(title)s</a>'
+            '<p class="hsnip">%(snippet)s</p></article>'
+            % {"url": _e(hit["url"]), "host": _e(_host(hit["url"])),
+               "title": _e(hit["title"]),
+               "snippet": _e((hit.get("snippet") or "")[:280])}
+            for hit in results)
+
+    body = _SEARCH_BODY % {
+        "query": _e(query),
+        "rows": rows,
+        "count": len(results),
+    } + _SEARCH_SCRIPT % {"q": _js_block(query)}
+    return shell(query, palette, nonce, "cb:search", body)
+
+
+_SEARCH_BODY = """
+<style>
+  .sform{margin:0 0 16px}
+  /* Three inks on this page, and each one means something. The card is
+     Claude's, so it is drawn in `--agent` -- the token that exists precisely
+     so "this came from the model" is not the same colour as "this has focus".
+     `--accent` is then left to do one job below: the link you are pointing at.
+     Ten result titles all painted in the chrome's accent is what made this
+     page hard to look at -- a colour that is on everything marks nothing. */
+  .answer{border:1px solid var(--edge,rgba(127,127,127,.3));
+          border-left:2px solid var(--agent);border-radius:10px;
+          background:var(--card);padding:14px 16px;margin:0 0 18px}
+  .answer h3{margin:0 0 8px;font-size:11px;letter-spacing:.1em;
+             text-transform:uppercase;color:var(--agent);opacity:.85}
+  .answer .txt{line-height:1.55;font-size:14px}
+  .answer .txt p{margin:0 0 10px}
+  .answer .txt p:last-child,.answer .txt ul:last-child,
+  .answer .txt ol:last-child{margin-bottom:0}
+  .answer .txt h3,.answer .txt h4,.answer .txt h5,.answer .txt h6{
+    margin:14px 0 6px;font-size:13px;text-transform:none;letter-spacing:0;
+    opacity:1}
+  .answer .txt ul,.answer .txt ol{margin:0 0 10px;padding-left:20px}
+  .answer .txt li{margin:2px 0}
+  .answer .txt code{font-family:var(--mono,monospace);font-size:12.5px;
+    background:rgba(127,127,127,.14);border-radius:4px;padding:1px 4px}
+  .answer .txt pre{margin:0 0 10px;padding:10px 12px;overflow-x:auto;
+    background:rgba(127,127,127,.12);border-radius:8px}
+  .answer .txt pre code{background:none;padding:0}
+  .answer .more{margin-top:10px}
+  .hit{margin:0 0 20px;max-width:46em}
+  .hurl{display:block;font-size:11px;color:var(--dim);text-decoration:none}
+  .htitle{display:block;font-size:15px;font-weight:600;margin:1px 0 4px;
+          color:var(--text);text-decoration:none}
+  .htitle:visited{color:var(--dim)}
+  .htitle:hover{color:var(--accent);text-decoration:underline}
+  .hsnip{margin:0;font-size:13px;line-height:1.5;color:var(--dim)}
+  .answer .txt a{color:var(--accent)}
+</style>
+<section class="sform">
+  <input id="sq" class="filter" type="search" value="%(query)s"
+         placeholder="Search the web" autocomplete="off">
+</section>
+<section class="answer" id="answer">
+  <h3>Claude</h3>
+  <div class="txt" id="atxt">…</div>
+  <div class="more" id="expandwrap">
+    <button class="pbbtn" id="expand" disabled>Expand</button></div>
+</section>
+<section>
+  <h2>Results <em>%(count)s</em></h2>
+  %(rows)s
+</section>
+"""
+
+#: The page's own script. Two jobs: send a new query, and receive the answer
+#: the native side streams in. `window.cbAnswer` is the whole interface -- the
+#: browser injects calls to it as tokens arrive, so nothing here polls and
+#: nothing waits on a socket the page cannot see.
+_SEARCH_SCRIPT = """
+<script>
+(function(){
+  var box = document.getElementById('sq');
+  if (box) {
+    box.addEventListener('keydown', function(e){
+      if (e.key !== 'Enter') return;
+      var v = box.value.trim();
+      if (v) location.href = 'cb:search?q=' + encodeURIComponent(v);
+    });
+  }
+
+  var txt = document.getElementById('atxt');
+  var expand = document.getElementById('expand');
+
+  /* A very small markdown renderer. Everything is escaped first and only the
+     tags built here are ever added, so a heading that came out of a search
+     result cannot become script -- and the only attribute written anywhere is
+     an href matched against http(s) with quotes and angle brackets excluded,
+     because that regex is the whole defence for that one attribute. */
+  function esc(s){
+    return String(s).replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function inline(s){
+    return esc(s)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)\\s"'<>]+)\\)/g,
+               '<a href="$2">$1</a>')
+      .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
+      .replace(/(^|[^*])\\*([^*\\n]+)\\*/g, '$1<em>$2</em>');
+  }
+
+  function md(text){
+    var lines = String(text).split('\\n');
+    var out = [], para = [], list = null, code = null;
+    function endPara(){
+      if (para.length) { out.push('<p>' + inline(para.join(' ')) + '</p>'); }
+      para = [];
+    }
+    function endList(){
+      if (list) {
+        out.push('<' + list.tag + '>' + list.items.join('') +
+                 '</' + list.tag + '>');
+      }
+      list = null;
+    }
+    function endCode(){
+      out.push('<pre><code>' + esc(code.join('\\n')) + '</code></pre>');
+      code = null;
+    }
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (/^\\s*```/.test(line)) {
+        if (code === null) { endPara(); endList(); code = []; } else { endCode(); }
+        continue;
+      }
+      if (code !== null) { code.push(line); continue; }
+      if (!line.trim()) { endPara(); endList(); continue; }
+      var head = line.match(/^(#{1,4})\\s+(.*)$/);
+      if (head) {
+        endPara(); endList();
+        var level = head[1].length + 2;
+        out.push('<h' + level + '>' + inline(head[2]) + '</h' + level + '>');
+        continue;
+      }
+      var bullet = line.match(/^\\s*[-*]\\s+(.*)$/);
+      var number = bullet ? null : line.match(/^\\s*\\d+[.)]\\s+(.*)$/);
+      if (bullet || number) {
+        endPara();
+        var tag = bullet ? 'ul' : 'ol';
+        if (!list || list.tag !== tag) { endList(); list = {tag: tag, items: []}; }
+        list.items.push('<li>' + inline((bullet || number)[1]) + '</li>');
+        continue;
+      }
+      para.push(line);
+    }
+    if (code !== null) endCode();
+    endPara(); endList();
+    return out.join('');
+  }
+
+  window.cbAnswer = {
+    /* The whole answer so far, not the newest token: the native side re-sends
+       everything on every push, which is what lets this document catch up on
+       a stream that started before it loaded. Re-rendering the lot each time
+       is also what makes markdown work mid-stream -- a half-written `**bold`
+       simply renders as itself until its closing marks arrive. */
+    set: function(text){ if (txt) txt.innerHTML = md(text); },
+    reset: function(){ if (txt) txt.textContent = '\\u2026'; },
+    fail: function(message){
+      if (txt) txt.textContent = message;
+      window.cbAnswer.done(false);
+    },
+    /* The end of a stream. Without it the button that says "Expanding" has
+       nothing that can ever contradict it, which reads as a hang even though
+       the answer arrived. The verbose answer is the last one there is, so the
+       control goes away rather than offering to fetch it again. */
+    done: function(verbose){
+      if (!expand) return;
+      if (verbose) {
+        var wrap = document.getElementById('expandwrap');
+        if (wrap) wrap.style.display = 'none';
+        return;
+      }
+      expand.disabled = false;
+      expand.textContent = 'Expand';
+    }
+  };
+
+  if (expand) {
+    expand.addEventListener('click', function(){
+      expand.disabled = true;
+      expand.textContent = 'Expanding\\u2026';
+      window.cbAnswer.reset();
+      cbui.send({action:'search_expand', url: %(q)s});
+    });
+  }
+
+  /* Ask for the answer rather than waiting to be given one. The native side
+     cannot know when this document's script started running, and a token
+     injected a moment too early lands on a window with no cbAnswer on it.
+     On DOMContentLoaded rather than here: `window.cbui` is defined by the
+     shell's script, which sits *below* this one in the document and so has
+     not run yet. */
+  document.addEventListener('DOMContentLoaded', function(){
+    if (window.cbui) cbui.send({action:'search_ready', url: %(q)s});
+  });
+})();
+</script>
+"""

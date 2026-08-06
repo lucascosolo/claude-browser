@@ -788,6 +788,95 @@ def synthesize(pages, question=None, tally=None):
     return _stream(SYNTHESIS_SYSTEM, body + "\n\n" + (question or "Synthesize these pages."))
 
 
+#: What cb:search asks for above the results. Deliberately not SYNTHESIS_SYSTEM:
+#: that one is written for pages the user has open and has read, while these are
+#: search snippets the user has not seen and Claude has not either -- the model
+#: is reading an index, not the web. Saying so is what keeps the answer from
+#: being stated with more confidence than a snippet can carry.
+SEARCH_SYSTEM = (
+    "You are answering above a list of web search results, in a browser. "
+    "You are shown only the search engine's snippets, not the pages "
+    "themselves, so treat them as second-hand and say when they are thin or "
+    "disagree. Answer the query directly in the first sentence. Do not open "
+    "with a restatement of the question, a preamble, or 'based on the search "
+    "results'. Prefer what several results agree on. If the snippets do not "
+    "actually answer the query, say that plainly and say what would -- an "
+    "invented answer is worse than none, because the results are right below "
+    "you and the user can check. Never cite a result that is not in the list."
+)
+
+#: The short answer's ceiling. Enough for two or three sentences; the point of
+#: the short answer is that it is read in the time it takes results to arrive.
+SEARCH_BRIEF_WORDS = 60
+
+#: How much of each result reaches the model. These three numbers *are* what a
+#: search costs: the prompt is sent once for the brief answer and again for the
+#: verbose one, and it dwarfs both answers put together. Chosen against real
+#: LangSearch responses, whose snippets run a couple of hundred characters and
+#: whose summaries run to tens of thousands.
+SNIPPET_CHARS = 500
+SUMMARY_CHARS = 700
+SUMMARY_RESULTS = 4
+
+
+def search_answer(query, results, verbose=False, tally=None):
+    """Answer a search query from its own results.
+
+    `results` are dicts with `title`, `url`, `snippet` and optionally
+    `summary`. Everything textual goes through `_redact` for the same reason
+    page text does -- a query and its snippets can carry personal data, and
+    `CB_SCRUB` has to mean the same thing on every path that leaves the
+    machine.
+
+    Everything here is shaped by what a search costs. The prompt is the
+    expensive half -- it is sent once for the brief answer and, if the user
+    presses Expand, once more for the verbose one, while the answers themselves
+    are a few hundred tokens between them. So the trimming happens on the way
+    *in* (`SNIPPET_CHARS`, `SUMMARY_CHARS`, `SUMMARY_RESULTS`), and the verbose
+    answer is generated only when it is asked for rather than produced with the
+    brief one and hidden.
+    """
+    blocks = []
+    for i, hit in enumerate(results[:10]):
+        text = (hit.get("snippet") or "")[:SNIPPET_CHARS]
+        # The summary is where the tokens are: LangSearch returns page-length
+        # summaries, so ten of them unabridged is half a megabyte of prompt
+        # for a sixty-word answer, on a metered API, on every search. Only the
+        # first few results get one, and only their opening -- a summary's
+        # first paragraph is what a search result is *for*, and the rest is
+        # the page, which the user can open. This is the single biggest lever
+        # on what a search costs.
+        if i < SUMMARY_RESULTS:
+            summary = (hit.get("summary") or "")[:SUMMARY_CHARS]
+            if summary and not summary.startswith(text[:80]):
+                text = "%s\n%s" % (text, summary)
+        blocks.append("<result number=%d url=%r title=%r>\n%s\n</result>"
+                      % (i + 1, hit.get("url", ""),
+                         _redact(hit.get("title", ""), tally),
+                         _redact(text, tally)))
+    body = "\n\n".join(blocks) or "(the search returned nothing)"
+    if verbose:
+        instruction = ("Answer this query thoroughly, in a few short "
+                       "paragraphs, noting where the results disagree: %s"
+                       % _redact(query, tally))
+    else:
+        # Two sentences that answer the question beat a summary of what an
+        # answer would contain, so the ceiling is a ceiling and not a target:
+        # a query with a short true answer gets that whole answer, and only a
+        # query that genuinely does not fit gets the gist plus an honest note
+        # that there is more behind Expand.
+        instruction = (
+            "Answer this query in one short paragraph of at most %d words. "
+            "If the complete answer fits in that, give the complete answer "
+            "and nothing else. If it genuinely does not, give the gist and "
+            "end with one short sentence naming what the longer answer adds. "
+            "No headings, no bullet lists, and no citations -- the results "
+            "are on screen directly below you. Plain prose, with markdown "
+            "only for emphasis or a code name. Query: %s"
+            % (SEARCH_BRIEF_WORDS, _redact(query, tally)))
+    return _stream(SEARCH_SYSTEM, body + "\n\n" + instruction)
+
+
 # -- tool use ---------------------------------------------------------------
 
 def _scrubbed_messages(messages, tally=None):

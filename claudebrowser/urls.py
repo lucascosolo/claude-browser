@@ -8,7 +8,11 @@ import os
 import re
 from urllib.parse import quote
 
-SEARCH = os.environ.get("CB_SEARCH", "https://duckduckgo.com/?q=%s")
+#: `cb:search` rather than a search *site*: the browser renders the results
+#: page itself, with a short Claude answer above them. Still a plain template
+#: with one `%s`, so nothing else in this module has to know that the default
+#: stopped being an external URL.
+SEARCH = os.environ.get("CB_SEARCH", "cb:search?q=%s")
 
 _SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*:", re.I)
 _FULL_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)

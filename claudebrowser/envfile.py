@@ -44,7 +44,7 @@ from pathlib import Path
 #: URL in os.environ is a password in os.environ, inherited by every child
 #: process, and a proxy URL a settings control could write is a password an
 #: API call could rewrite.
-SECRET_KEYS = frozenset({"ANTHROPIC_API_KEY", "CB_VPN_PROXY"})
+SECRET_KEYS = frozenset({"ANTHROPIC_API_KEY", "CB_VPN_PROXY", "CB_SEARCH_KEY"})
 
 
 def config_dir():
