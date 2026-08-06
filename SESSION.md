@@ -194,6 +194,39 @@ Two ways forward, and the first needs nothing from the user:
 - [x] 726 tests pass; `py_compile` clean.
 - [ ] Not yet committed.
 
+- [x] **`cb:search` is done and committed** (`b883cad`), verified live.
+      `search.py` (LangSearch, GTK-free, 24 tests), `CB_SEARCH_KEY` in
+      `envfile.SECRET_KEYS`, `ai.search_answer`, `pages.search_page`, and the
+      browser wiring. It is the default engine: `CB_SEARCH=cb:search?q=%s`.
+      Confirmed in the running browser: 10 results, the brief answer streams
+      in, Expand produces the verbose one and then removes itself, a reload
+      redisplays the stored answer with **no second API call**, and the
+      console is empty. Inspection tabs closed.
+      - The answer is **pulled, not pushed**. The first build streamed tokens
+        the moment results landed — straight into a document that was still
+        loading, so `window.cbAnswer` did not exist yet and the page sat on
+        its placeholder. The page now announces itself (`search_ready`) and
+        every push carries the *whole* answer so far, which is also what
+        makes a mid-stream load or a reload catch up for free.
+      - Pushes are filtered by **query**, not by "is a cb:search page". Two
+        searches open at once otherwise means one tab showing the other's
+        answer.
+      - **Token cost is designed for, not discovered.** The prompt dwarfs both
+        answers, so the trimming is on the way in: `SNIPPET_CHARS=500`,
+        `SUMMARY_CHARS=700`, `SUMMARY_RESULTS=4`. LangSearch summaries reach
+        tens of thousands of characters each; ten of them unabridged was half
+        a megabyte of prompt per search. The verbose answer is generated only
+        when Expand is pressed rather than produced with the brief one and
+        hidden.
+      - The brief answer is one paragraph, ≤60 words, and is instructed to be
+        the *complete* answer when the complete answer fits — the ceiling is a
+        ceiling, not a target — with markdown rendered on the page by a small
+        escape-first renderer (the only attribute it ever writes is an href
+        matched against http(s)).
+      - Colour: the answer card is `--agent`, result titles are `--text` and
+        turn `--accent` only on hover. Ten titles in the chrome's accent was
+        the "same two colours smashed together" the user reported.
+
 ### Corrections to earlier entries in this file
 
 - **"`playlistVideoRenderer` no longer exists" was wrong.** Both shapes are
@@ -258,8 +291,7 @@ Two ways forward, and the first needs nothing from the user:
    the tab `resources.py` would otherwise reclaim while it is playing.
 4. Back to the declutter sheet: wiring (task #2), then the other sites (task
    #9). Playlist-page selectors still need verifying on a quiet machine.
-5. `cb:search` — still blocked on the user's search API key for the results
-   half; the Claude-answer half is not blocked.
+5. ~~`cb:search`~~ — done and committed (`b883cad`). See the entry above.
 
 ## Verification command
 
