@@ -141,6 +141,37 @@ class Sheets(unittest.TestCase):
                 self.assertNotIn(selector, rule.css,
                                  "%s hides %s" % (rule.name, selector))
 
+    def test_a_products_sheet_does_not_land_on_its_neighbours(self):
+        """One domain, several unrelated products. A suffix match on
+        google.com puts the search-results sheet on Gmail, Docs, Drive and
+        Gemini, which is what `exact` exists to stop."""
+        named = {u: (siterules.for_url(u).name if siterules.for_url(u) else None)
+                 for u in ("https://www.google.com/search?q=x",
+                           "https://google.com/",
+                           "https://mail.google.com/",
+                           "https://docs.google.com/document/d/1",
+                           "https://gemini.google.com/app")}
+        self.assertEqual(named["https://www.google.com/search?q=x"], "google")
+        self.assertEqual(named["https://google.com/"], "google")
+        self.assertIsNone(named["https://mail.google.com/"])
+        self.assertIsNone(named["https://docs.google.com/document/d/1"])
+        # Gemini has its own rule and has to win, which it can only do by
+        # sitting ahead of google in the table.
+        self.assertEqual(named["https://gemini.google.com/app"], "gemini")
+
+    def test_a_suffix_rule_still_covers_its_own_subdomains(self):
+        for url in ("https://m.youtube.com/", "https://music.youtube.com/",
+                    "https://dash.cloudflare.com/"):
+            self.assertIsNotNone(siterules.for_url(url), url)
+
+    def test_no_rule_hides_a_consent_dialog_off_its_own_site(self):
+        """OneTrust is embedded by thousands of sites. Hiding its dialog is
+        scoped to one host on purpose: a browser that dismisses a consent
+        prompt everywhere has decided something on the user's behalf."""
+        for rule in siterules.RULES:
+            if "onetrust" in rule.css:
+                self.assertEqual(rule.hosts, ("cloudflare.com",))
+
     def test_the_masthead_itself_survives(self):
         # It carries search, which is how you leave the feed.
         css = siterules.RULES[0].css

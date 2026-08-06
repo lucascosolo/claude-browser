@@ -70,17 +70,25 @@ class Rule:
     `hosts` are matched as suffixes against the URL's hostname with any leading
     `www.` removed, so `youtube.com` covers `m.youtube.com` and
     `music.youtube.com` without three entries.
+
+    `exact` turns that off for the rules where the subdomains are *different
+    products*. Google's is the case that forced it: a suffix match on
+    `google.com` puts the search-results sheet on Gmail, Docs, Drive and
+    Gemini, which share a domain and nothing else.
     """
 
-    __slots__ = ("name", "hosts", "summary", "css")
+    __slots__ = ("name", "hosts", "summary", "css", "exact")
 
-    def __init__(self, name, hosts, summary, css):
+    def __init__(self, name, hosts, summary, css, exact=False):
         self.name = name
         self.hosts = tuple(hosts)
         self.summary = summary
         self.css = css
+        self.exact = exact
 
     def matches(self, host):
+        if self.exact:
+            return host in self.hosts
         return any(host == h or host.endswith("." + h) for h in self.hosts)
 
 
@@ -207,13 +215,121 @@ ytd-moving-thumbnail-renderer{display:none!important;}
 ytd-watch-flexy[flexy] #secondary.ytd-watch-flexy{display:none!important;}
 """
 
-#: Ordered, and matched first-wins. There is one entry today; the table exists
-#: so the second one is an entry rather than an `if`.
+#: Google results. Every id here was read off a live results page: Google's
+#: generated ids are random per response (`_yDd0atXQOae2ruEPkI6P-Qg_3`), and
+#: the handful that are not -- `#rhs`, `#botstuff`, `#bres`, `#taw` -- are the
+#: containers that have kept their names for years. Nothing is matched by
+#: class, because Google's classes are minified per deploy and a rule written
+#: against one is a rule that silently stops working.
+#:
+#: What is deliberately *not* hidden: `#appbar`, which carries the
+#: Images/Videos/News tabs and the tools row, and `#search` itself. The point
+#: is a page of results, not a page of nothing.
+#:
+#: And what could not be: **the AI Overview block**. Walking up from it on a
+#: live page gives a `<div>` carrying nothing but a minified class, and the
+#: first ancestor with an id is `#rcnt` -- the whole results column. There is
+#: no selector for it that will still mean the same thing next month, and a
+#: rule keyed to a minified class is one that stops working silently, which is
+#: worse than not having it. Left alone until Google gives it a name.
+_GOOGLE = """
+/* The right-hand column: knowledge panel, and where the sidebar ads go. */
+#rhs{display:none!important;}
+
+/* "People also search for" and the related-search block under the results. */
+#botstuff,
+#bres,
+.related-question-pair{display:none!important;}
+
+/* Ad slots, top and bottom, named individually. `#tvcap` is the shopping
+   carousel that appears above results on commercial queries. */
+#taw,
+#tvcap,
+#topads,
+#bottomads,
+#tads,
+#tadsb{display:none!important;}
+
+#footcnt{display:none!important;}
+
+/* With the right column gone the results have the width to themselves.
+   Capped, on the same reasoning as the YouTube player: a full-width line of
+   text on a wide window is a worse read, not a better one. */
+#center_col{margin-left:0!important;max-width:44em!important;}
+#rcnt{justify-content:flex-start!important;}
+"""
+
+#: Gemini. Angular custom elements, which is the happy case: the tag names are
+#: semantic and stable, so this hides things by what they *are*. Read off the
+#: live app -- `chat-app-announcement-banners`, `g1-dynamic-upsell-button` and
+#: the rest are element names, not classes.
+#:
+#: The disclaimers are left alone on purpose. "Gemini can make mistakes" is not
+#: clutter in the sense this mode means, and a browser that quietly hides a
+#: model's own caveat is making a claim on the model's behalf.
+_GEMINI = """
+/* Announcement and promo banners, at both the app and the empty-chat level. */
+chat-app-banners,
+chat-app-announcement-banners,
+bot-banner,
+zero-state-banners,
+gem-banner,
+chat-notifications{display:none!important;}
+
+/* The upsell buttons: the one in the top bar and the one in the side nav. */
+g1-dynamic-upsell-button,
+side-nav-sparkle-button{display:none!important;}
+"""
+
+#: Cloudflare's dashboard. Almost everything with a stable hook here is
+#: navigation -- `sidebar-nav-shortcut-*` is the sidebar itself -- so this is
+#: one rule and one rule only: the consent overlay, which is a fixed-position
+#: layer over the dashboard rather than part of it.
+#:
+#: `#onetrust-consent-sdk` is not Cloudflare's own markup; it is OneTrust,
+#: which many sites embed. Scoped to this host anyway rather than made global,
+#: because a rule that hides a consent dialog everywhere is a rule that decides
+#: on the user's behalf what they consented to on sites this browser has never
+#: been told anything about.
+_CLOUDFLARE = """
+#onetrust-consent-sdk,
+.onetrust-pc-dark-filter{display:none!important;}
+"""
+
+#: Ordered, and matched first-wins.
+#:
+#: Four sites on the list this table was written from have **no entry, on
+#: purpose**, and the reason is worth keeping so the next session does not
+#: spend an afternoon rediscovering it. `claude.ai` answers this browser with
+#: `{"error":{"type":"forbidden"}}` and never renders at all, so there is no
+#: page to read selectors off. `chatgpt.com` hangs everything it has a stable
+#: hook for -- `#history`, `#stage-slideover-sidebar` -- off navigation; the
+#: only things left to hide are the things you came for. The Claude docs site
+#: is Tailwind utility classes with no ids at all (`aside.hidden.lg:flex.w-66`),
+#: and a rule written against those breaks on their next deploy while looking
+#: like it still works -- reader mode already covers that page properly. In all
+#: three cases a rule would be theatre, and the same lesson as YouTube applies
+#: underneath: a stylesheet runs *after* the app has downloaded, parsed and
+#: hydrated, so it can hide noise but it cannot make a heavy app cheap.
 RULES = (
     Rule("youtube", ("youtube.com", "youtu.be"),
          "Hides Shorts, the shelves, the sidebar, comments and the suggestion "
          "rail. Keeps search, the feed's suggestions, and every menu.",
          _YOUTUBE),
+    Rule("gemini", ("gemini.google.com",),
+         "Hides the announcement banners and the upgrade buttons. Keeps the "
+         "conversation, the side nav and the model's own disclaimers.",
+         _GEMINI),
+    # `exact`, and ahead of nothing by accident: without it this sheet lands on
+    # every google.com subdomain there is, and Gmail is not a results page.
+    Rule("google", ("google.com",),
+         "Hides the knowledge panel, the ad slots, 'People also ask' and the "
+         "related searches. Keeps the results, the search box and the tabs.",
+         _GOOGLE, exact=True),
+    Rule("cloudflare", ("cloudflare.com",),
+         "Hides the consent overlay. Everything else on the dashboard with a "
+         "stable name is navigation.",
+         _CLOUDFLARE),
 )
 
 
