@@ -387,6 +387,36 @@ stronger gate; on those four, py_compile is the only one there is.
   pressure and discarded every background tab, repeatedly, on a healthy machine.
   `pswpin` from `/proc/vmstat`, differenced between readings, is the live
   signal — and `pswpin`, not `pgpgin`, which counts every ordinary file read.
+- **`comm` in `/proc/PID/stat` is truncated to 15 bytes, and all three WebKit
+  process names are longer than that.** The kernel reports `WebKitWebProces`,
+  `WebKitNetworkPr` and `WebKitGPUProces` — never the full spelling. So
+  `renice_children` testing those reads against the full `WEB_PROCESSES` names
+  matched nothing and was a **silent no-op for as long as the file existed**,
+  which is why a runaway page could still make the desktop unusable: measured on
+  a live browser, every content process sat at nice 0. Its test passed the whole
+  time, because the fixture supplied `WebKitWebProcess` as a `comm` — a string
+  the kernel cannot produce. `WEB_PROCESS_COMMS` holds the truncated forms and is
+  what matching uses; `WEB_PROCESSES` stays as the documentation of what WebKit
+  spawns. The general lesson is the one worth keeping: **a fixture more permissive
+  than the kernel hides the bug it was written to catch.** Any new name added
+  needs to survive the cut without colliding, which
+  `test_every_web_process_name_survives_truncation` holds.
+- **The CPU/memory cap lives in `cb`, not in `settings.py`.** A `systemd-run
+  --user --scope` wrapper gives the browser a `CPUWeight`, a `CPUQuota` backstop
+  and a `MemoryHigh` ceiling, because two cores shared with Claude Code means "the
+  browser is busy" must not mean "the desktop stops responding". It is in the
+  launcher because the limits have to exist *before* the process does — there is
+  no browser yet to ask, which is the same reason `CB_PORT` is read early. Every
+  launch path already funnels through `cb` (the `claude-browser` symlink, the
+  desktop entry, xdg-open, and `client.autostart`, which resolves to `<repo>/cb`
+  rather than spawning python itself), so this is the one place it can go; adding
+  a second launcher bypasses it. `CB_CAP=0` disables it, and `CB_CPU_WEIGHT` /
+  `CB_CPU_QUOTA` / `CB_MEM_HIGH` tune it. Two details are load-bearing:
+  **`MemoryHigh`, never `MemoryMax`** (High throttles and reclaims, Max kills a
+  browser mid-page on a machine that has swap to spend), and the **user-bus socket
+  check before `exec`** — without it `systemd-run` fails *after* `exec` has
+  replaced the shell and the browser simply never starts, which is a far worse
+  bug than running uncapped.
 - **`set_memory_pressure_settings` is a *static* function on
   WebsiteDataManager**, not a method — it configures every web process, not one
   manager. Fetching it off the class and calling it with the settings object

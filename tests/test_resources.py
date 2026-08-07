@@ -402,6 +402,44 @@ class TestRenice(unittest.TestCase):
         self.assertEqual(done, [101])
         self.assertEqual(calls, [(101, 5)])
 
+    def test_the_kernels_truncated_comm_is_what_gets_matched(self):
+        """The names /proc really reports, not the ones WebKit was given.
+
+        `comm` is capped at 15 bytes and all three WebKit names are longer, so
+        this is the *only* spelling a reader of /proc ever sees. The version of
+        this test that supplied the full names passed while the renice matched
+        nothing on a live machine -- the fixture was the bug. Every entry here
+        is copied from a real /proc/PID/stat.
+        """
+        root = self.fake_proc({
+            100: ("claude-browser", 1),
+            101: ("WebKitWebProces", 100),      # WebKitWebProcess, cut at 15
+            102: ("WebKitNetworkPr", 100),      # WebKitNetworkProcess
+            103: ("WebKitGPUProces", 100),      # WebKitGPUProcess
+            104: ("some-helper", 100),
+        })
+        done = resources.renice_children(nice=5, pid=100, root=root,
+                                        setter=lambda _p, _n: True)
+        self.assertEqual(sorted(done), [101, 102, 103])
+
+    def test_every_web_process_name_survives_truncation(self):
+        """A name added to WEB_PROCESSES must still be matchable.
+
+        Guards the case that made the original bug invisible: a prefix long
+        enough to be cut is fine, a prefix that collides with another after the
+        cut is not, and either way the comparison has to be done against the
+        truncated form.
+        """
+        for full in resources.WEB_PROCESSES:
+            comm = full[:resources.COMM_MAX]
+            self.assertTrue(
+                any(comm.startswith(known)
+                    for known in resources.WEB_PROCESS_COMMS),
+                "%r is unmatchable once the kernel truncates it" % full)
+        self.assertEqual(len(set(resources.WEB_PROCESS_COMMS)),
+                         len(resources.WEB_PROCESSES),
+                         "two web-process names collide after truncation")
+
     def test_a_process_that_exits_mid_walk_is_not_an_error(self):
         root = self.fake_proc({100: ("claude-browser", 1),
                                101: ("WebKitWebProcess", 100)})

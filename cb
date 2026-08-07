@@ -1,4 +1,51 @@
 #!/usr/bin/env bash
 # Launch the browser from a checkout, without installing anything.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
+
+# Run the browser inside a systemd user scope holding a CPU share and a memory
+# ceiling. The point is not to make the browser small; it is that this laptop has
+# two cores and Claude Code wants one of them, so "the browser is busy" must not
+# mean "the desktop stops responding".
+#
+# A *weight* rather than a quota does the day-to-day work. CPUWeight only decides
+# who wins when there is actual contention, so the browser still gets both cores
+# when nothing else wants them, and an ordinary heavy page is not made slower for
+# nothing. CPUQuota sits above it as a backstop for the runaway case -- a page
+# spinning in JS forever, which is what prompted this -- and is deliberately set
+# high enough that it is never the normal operating point.
+#
+# MemoryHigh, never MemoryMax: High throttles the allocator and pushes the kernel
+# to reclaim, Max kills the process. With 3.8GB and 1.5GB of swap the failure
+# worth preventing is the browser dragging the desktop into swap, not the browser
+# continuing to exist.
+#
+# This is the only place the cap is applied because every launch path funnels
+# through this script: the `claude-browser` symlink install.sh writes, the
+# desktop entry (which Execs this path), xdg-open, and `client.autostart`, which
+# resolves to `<repo>/cb` rather than spawning python itself. Bypassing it means
+# adding a second launcher, which is its own bug.
+#
+# CB_CAP=0 turns the whole thing off; the three CB_CPU_*/CB_MEM_HIGH knobs tune
+# it. All four are read here rather than in settings.py on purpose -- they have
+# to be applied before the process this script is about to become exists, so
+# there is no browser yet to ask.
+if [ -z "$CB_IN_SCOPE" ] && [ "${CB_CAP:-1}" != "0" ] \
+   && command -v systemd-run >/dev/null 2>&1 \
+   && [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus" ] \
+   && grep -qw cpu \
+        "/sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers" 2>/dev/null
+then
+    # All three preconditions hold -- systemd-run exists, the user bus it needs
+    # is there, and the cpu controller is actually delegated to this slice -- so
+    # exec is safe. Checking the bus socket is what makes it safe: without it
+    # systemd-run fails *after* exec has already replaced this shell, and the
+    # browser would simply never start. That is a worse bug than running uncapped.
+    CB_IN_SCOPE=1 exec systemd-run --user --quiet --collect --scope \
+        --unit="claude-browser-$$" \
+        -p CPUWeight="${CB_CPU_WEIGHT:-60}" \
+        -p CPUQuota="${CB_CPU_QUOTA:-120%}" \
+        -p MemoryHigh="${CB_MEM_HIGH:-1G}" \
+        -- "$0" "$@"
+fi
+
 exec python3 -m claudebrowser "$@"

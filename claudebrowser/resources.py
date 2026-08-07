@@ -108,6 +108,21 @@ WEB_PROCESS_NICE = 5
 #: Names of the processes WebKit spawns underneath us.
 WEB_PROCESSES = ("WebKitWebProcess", "WebKitNetworkProcess", "WebKitGPUProcess")
 
+#: The kernel truncates `comm` to TASK_COMM_LEN-1 = 15 bytes, and *every* name
+#: above is longer than that -- /proc/PID/stat says `WebKitWebProces` and
+#: `WebKitNetworkPr`, never the full spelling. So testing a comm read out of
+#: /proc against the full names matched nothing, and `renice_children` was a
+#: silent no-op for as long as it existed: measured on a live browser, all four
+#: content processes sat at nice 0 while the desktop lost every scheduling
+#: contest to a runaway page, which is the exact symptom the function was
+#: written to prevent. Its test passed throughout, because the fixture supplied
+#: `WebKitWebProcess` as a comm -- a string the kernel cannot produce. Compare
+#: against these truncated prefixes instead, which is what a reader of /proc
+#: actually gets. Keep both tuples: WEB_PROCESSES is the documentation of what
+#: WebKit spawns, this is the string matching has to use.
+COMM_MAX = 15
+WEB_PROCESS_COMMS = tuple(name[:COMM_MAX] for name in WEB_PROCESSES)
+
 
 # -- reading the machine ----------------------------------------------------
 
@@ -510,7 +525,7 @@ def renice_children(nice=WEB_PROCESS_NICE, pid=None, root="/proc", setter=None):
     setter = setter or _set_nice
     done = []
     for child, name in child_pids(pid=pid, root=root):
-        if not any(name.startswith(known) for known in WEB_PROCESSES):
+        if not any(name.startswith(known) for known in WEB_PROCESS_COMMS):
             continue
         try:
             if setter(child, nice):
