@@ -2844,9 +2844,32 @@ class Browser(Gtk.Window):
         if passwords.origin_of(tab.view.get_uri() or "") != self.pw_offer[0]:
             self._pw_hide()
 
-    def _pw_autofill(self, tab):
-        """Put a saved login into a page that just finished loading."""
-        if self.vault is None or tab.failed:
+    #: How long autofill keeps looking for a login form, and how often. The
+    #: reason there is a second attempt at all: on a client-rendered login page
+    #: the form does not exist when the document finishes loading. Measured on
+    #: api-dashboard.search.brave.com, which was the report -- at `FINISHED`
+    #: there is no `input[type=password]` in the document at all, so the one
+    #: shot the browser took found nothing and nothing ever looked again. The
+    #: same fill call, run by hand a few seconds later, filled it correctly.
+    PW_RETRY_MS = 400
+    PW_RETRIES = 10          # ~4 seconds, then it gives up for good
+
+    def _pw_autofill(self, tab, attempt=0):
+        """Put a saved login into a page, retrying while the form is built.
+
+        Bounded on purpose, and by four separate conditions: it stops on the
+        first successful fill, when the page navigates away from the origin it
+        started on, when the tab is gone, and after `PW_RETRIES` either way. An
+        unbounded watcher here would be a timer per tab that never ends, on a
+        machine that cannot afford one.
+
+        The credential is re-read from the vault for each attempt and handed to
+        the page as an argument, so it is only ever in page scope for the
+        duration of the call. Holding it in a JS closure for four seconds and
+        letting a MutationObserver spend it -- the obvious alternative -- would
+        leave the secret sitting in the page the whole time.
+        """
+        if self.vault is None or tab.failed or tab not in self.tabs:
             return
         origin = passwords.origin_of(tab.view.get_uri() or "")
         if origin is None:
@@ -2857,8 +2880,32 @@ class Browser(Gtk.Window):
             # account on the user's behalf, and picking wrong signs them into
             # the other one without ever saying so. Silence beats a coin flip.
             return
+
+        def landed(raw):
+            if (raw or "").strip() in ("1", "true"):
+                return                      # filled; nothing more to look for
+            if attempt + 1 >= self.PW_RETRIES:
+                return
+            GLib.timeout_add(self.PW_RETRY_MS,
+                             lambda: (self._pw_retry(tab, origin, attempt + 1),
+                                      GLib.SOURCE_REMOVE)[1])
+
         self._pw_js(tab, "window.__cbPwFill ? window.__cbPwFill(%s, %s) : 0" % (
-            json.dumps(found[0]["username"]), json.dumps(found[0]["password"])))
+            json.dumps(found[0]["username"]), json.dumps(found[0]["password"])),
+            landed)
+
+    def _pw_retry(self, tab, origin, attempt):
+        """One more attempt, unless the page has moved on.
+
+        The origin check is the interesting half: a single-page app that routed
+        somewhere else between attempts is no longer the page the user opened,
+        and filling a form there is filling a form nobody was looking at.
+        """
+        if tab not in self.tabs:
+            return
+        if passwords.origin_of(tab.view.get_uri() or "") != origin:
+            return
+        self._pw_autofill(tab, attempt)
 
     def _on_pw_message(self, _manager, _result):
         """A page reports that it has a credential worth offering.
