@@ -23,9 +23,9 @@ gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (agent, ai, auth, envfile, extract, findbar, pages, pagetext,  # noqa: E402
-               panel_html, passwords, perf, personas, playbooks, reader,
-               resources, scrub, search, settings, siterules, storage, store,
-               style, tabnames, urls, vpn, watchlater, youtube)
+               panel_html, passwords, perf, personas, playbooks, progress,
+               reader, resources, scrub, search, settings, siterules, storage,
+               store, style, tabnames, urls, vpn, watchlater, youtube)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -366,6 +366,12 @@ class Tab:
         self.waiters = []
         self.loading = False
         self.failed = None
+        # The bar's own curve, per tab, because the displayed fraction has to
+        # survive switching away and back -- it is state about this load, not
+        # about whichever tab happens to be in front. See progress.py for why the
+        # raw estimate is not painted directly.
+        self.bar = progress.Ease()
+        self.bar_at = 0.0        # monotonic stamp of the last advance
         # Bumped on every navigation we initiate. WebKit keeps delivering events
         # for a load after a newer one has replaced it, so a waiter records the
         # generation it belongs to and stale events are dropped instead of
@@ -2100,6 +2106,12 @@ class Browser(Gtk.Window):
         if event == WebKit2.LoadEvent.STARTED:
             tab.loading = True
             tab.failed = None
+            # Put the bar on screen now, not when the first byte lands. Between
+            # the keystroke and the network answering there is otherwise no
+            # evidence the browser heard the request at all, and on a slow link
+            # that gap is the whole of the wait that feels worst.
+            tab.bar.start()
+            tab.bar_at = time.monotonic()
         elif event == WebKit2.LoadEvent.COMMITTED:
             # As the document commits, not when it finishes: the sheet has to
             # be in place before the page paints, or the clutter appears and
@@ -2107,6 +2119,7 @@ class Browser(Gtk.Window):
             self._apply_siterules(tab)
         elif event == WebKit2.LoadEvent.FINISHED:
             tab.loading = False
+            tab.bar.finish()   # the only path to a full bar; see progress.py
             # Again at the end, for the single-page apps this mostly targets:
             # a document that replaced its own head between commit and finish
             # would otherwise have dropped the sheet. The snippet is idempotent
@@ -2296,11 +2309,19 @@ class Browser(Gtk.Window):
         (root.add_class if tab.private else root.remove_class)("cb-private")
         self.btn_back.set_sensitive(tab.view.can_go_back())
         self.btn_fwd.set_sensitive(tab.view.can_go_forward())
-        progress = tab.view.get_estimated_load_progress()
-        if tab.loading and progress < 1.0:
-            self.progress.set_fraction(progress)
+        if tab.loading:
+            # Stepped from this repaint rather than from a timer of its own. The
+            # repaint is already coalesced to ~10/s and already happens on every
+            # progress tick, so the animation costs no extra wakeups -- which on
+            # two cores is the difference between a nicety and a cost.
+            now = time.monotonic()
+            dt = max(0.0, now - tab.bar_at)
+            tab.bar_at = now
+            self.progress.set_fraction(
+                tab.bar.observe(tab.view.get_estimated_load_progress(), dt))
             self.progress.show()
         else:
+            tab.bar.reset()
             self.progress.hide()
 
     # -- "Claude is driving" indicator --------------------------------------

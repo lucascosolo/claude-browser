@@ -24,6 +24,7 @@ claudebrowser/
   findbar.py   Ctrl+F, driving WebKit's per-view FindController
   personas.py  named answering styles composed onto ai.py's prompts (GTK-free)
   playbooks.py recorded op sequences: capture, validation, JSON store (GTK-free)
+  progress.py  the load bar's curve, which is not the load's (GTK-free)
   tabnames.py  tab labelling (GTK-free so it is testable)
   urls.py      omnibox intent: navigate or search (GTK-free)
   reader.py    reader mode: article extraction + reading typography (GTK-free)

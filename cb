@@ -14,6 +14,17 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # spinning in JS forever, which is what prompted this -- and is deliberately set
 # high enough that it is never the normal operating point.
 #
+# The browser's weight is deliberately *higher* than the one the shell function in
+# ~/.bashrc gives Claude Code, and the reason is the symptom that motivated this:
+# typing into a form and waiting seconds for the characters to appear. The browser
+# is the foreground interactive program -- a keystroke has a human waiting on it --
+# while an agent turn is batch work that loses nothing real by yielding for the
+# moment someone is typing. Weighted the other way round, which is how this landed
+# first, the page being typed into loses the CPU to the agent *and* runs at nice 5
+# behind it, and the input latency is the thing that gets worse. Since a weight
+# only applies under contention, the agent still gets the whole machine back the
+# moment the browser goes idle, so this costs it close to nothing in throughput.
+#
 # MemoryHigh, never MemoryMax: High throttles the allocator and pushes the kernel
 # to reclaim, Max kills the process. With 3.8GB and 1.5GB of swap the failure
 # worth preventing is the browser dragging the desktop into swap, not the browser
@@ -42,9 +53,9 @@ then
     # browser would simply never start. That is a worse bug than running uncapped.
     CB_IN_SCOPE=1 exec systemd-run --user --quiet --collect --scope \
         --unit="claude-browser-$$" \
-        -p CPUWeight="${CB_CPU_WEIGHT:-60}" \
-        -p CPUQuota="${CB_CPU_QUOTA:-120%}" \
-        -p MemoryHigh="${CB_MEM_HIGH:-1G}" \
+        -p CPUWeight="${CB_CPU_WEIGHT:-150}" \
+        -p CPUQuota="${CB_CPU_QUOTA:-180%}" \
+        -p MemoryHigh="${CB_MEM_HIGH:-1200M}" \
         -- "$0" "$@"
 fi
 
