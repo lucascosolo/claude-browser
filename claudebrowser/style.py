@@ -260,6 +260,78 @@ window, .cb-root {{ background: {bg}; }}
 }}
 .cb-nav button.cb-vpnpill.bad:hover {{ background: {warn}; color: {bg}; }}
 
+/* ---- toast ----
+   Status floated over the page, bottom-left, where a browser's link preview
+   normally sits -- a place people already read without it feeling like an
+   interruption, and nowhere near the address bar it used to overwrite.
+
+   An opaque background rather than a translucent one: this label sits over
+   arbitrary page content, and a wash that is readable over a white article is
+   unreadable over a photograph. `bar` is the chrome's own strip colour, so the
+   toast reads as part of the browser rather than as part of the page -- which
+   is exactly the distinction that was lost when this text lived in the
+   omnibox. */
+.cb-toast {{
+    background: {bar};
+    color: {text};
+    border: 1px solid {line};
+    border-top-right-radius: 7px;
+    padding: 4px 12px;
+    margin: 0;
+    font-size: 0.82em;
+}}
+
+/* ---- resource-mode segments ----
+   Three segments reading as one control, so the group has the border and the
+   buttons have none but the dividers between them. `accent` and not `agent`:
+   this is chrome state -- which mode the *browser* is in for this site -- and
+   `agent` is reserved for Claude doing something. See the note in style.py's
+   header about why those two inks may never merge.
+
+   `background-image: none` and `box-shadow: none` on every state, not just the
+   active one: the stock theme draws a button's bevel with a gradient *and* an
+   inset shadow, so clearing `background` alone leaves a ghost outline on what
+   is meant to be a flat segment. */
+.cb-modes {{
+    border: 1px solid {line};
+    border-radius: 7px;
+    margin: 0 6px;
+    padding: 0;
+}}
+.cb-modes button.cb-mode {{
+    background: transparent;
+    background-image: none;
+    box-shadow: none;
+    border: none;
+    border-radius: 0;
+    color: {dim};
+    padding: 1px 9px;
+    min-height: 0;
+    min-width: 0;
+    font-size: 0.74em;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+}}
+/* The divider is a left border on every segment but the first, so the group
+   keeps its own outer radius and no segment has to know how many there are. */
+.cb-modes button.cb-mode:not(:first-child) {{ border-left: 1px solid {line}; }}
+.cb-modes button.cb-mode:hover {{ color: {text}; background: {field_focus}; }}
+.cb-modes button.cb-mode:checked {{
+    background: {accent};
+    background-image: none;
+    box-shadow: none;
+    color: {on_accent};
+}}
+.cb-modes button.cb-mode:checked:hover {{ background: {accent}; color: {on_accent}; }}
+/* A page with no site to set a mode on -- cb: pages, about:blank. The control
+   stays put and goes quiet rather than disappearing, so it never takes its own
+   explanation off screen. */
+.cb-modes button.cb-mode:disabled {{
+    color: {edge};
+    background: transparent;
+    background-image: none;
+}}
+
 /* ---- omnibox ---- */
 .cb-omnibox {{
     background: {field};

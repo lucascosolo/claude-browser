@@ -770,7 +770,24 @@ class Browser(Gtk.Window):
         # drag the divider.
         self.split = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
         self.split.get_style_context().add_class("cb-split")
-        root.pack_start(self.split, True, True, 0)
+        # The toast floats *over* the content rather than taking a strip of its
+        # own, so a message appearing never reflows the page underneath it. A
+        # Gtk.Overlay is the only way to get that in GTK3 -- packing a label into
+        # the vertical box would move the viewport every time the browser had
+        # something to say.
+        overlay = Gtk.Overlay()
+        overlay.add(self.split)
+        self.toast = Gtk.Label(xalign=0)
+        self.toast.get_style_context().add_class("cb-toast")
+        self.toast.set_no_show_all(True)
+        self.toast.set_halign(Gtk.Align.START)
+        self.toast.set_valign(Gtk.Align.END)
+        self.toast.set_ellipsize(3)              # PANGO_ELLIPSIZE_END
+        # Never let a long message stretch the overlay to the window's width and
+        # sit across the page; it is a status line, not a dialog.
+        self.toast.set_max_width_chars(64)
+        overlay.add_overlay(self.toast)
+        root.pack_start(overlay, True, True, 0)
 
         self.notebook = Gtk.Notebook()
         self.notebook.get_style_context().add_class("cb-tabs")
@@ -1982,23 +1999,38 @@ class Browser(Gtk.Window):
         self._star_url = url
         self._paint_star(bool(self.store and self.store.is_bookmarked(url)))
 
+    #: How long a toast stays up. Longer than the 1400ms this had while it was
+    #: overwriting the omnibox: back then the message was actively in the way,
+    #: so it had to leave quickly. A toast that is not covering anything can
+    #: afford to be readable.
+    TOAST_MS = 3200
+
     def _flash(self, message):
-        """A short confirmation in the omnibox's place. Bookmarking with no
-        feedback at all leaves you pressing Ctrl+D twice to check."""
-        self.omnibox.set_text(message)
-        self._flashing = True
+        """A short confirmation, floated over the content.
+
+        This used to write into the omnibox, and that was wrong for a reason
+        worth recording: the address bar is an *input*. Putting transient status
+        in it meant that reaching for the keyboard to type a URL could collide
+        with a background event -- a tab being freed, a mode being applied -- and
+        the text you were about to replace turned into a sentence about
+        something else mid-keystroke. Feedback the user did not ask for must
+        never land in a control the user is about to use.
+
+        The token is kept: a second message arriving while the first is up
+        replaces it and restarts the clock, and the earlier timeout must not
+        then hide the newer message when it fires.
+        """
+        self.toast.set_text(message)
+        self.toast.show()
         self._flash_token = getattr(self, "_flash_token", 0) + 1
         token = self._flash_token
 
-        def restore():
+        def fade():
             if token == self._flash_token:
-                self._flashing = False
-                tab = self.current()
-                if tab and not self.omnibox.has_focus():
-                    self.omnibox.set_text(tab.view.get_uri() or "")
+                self.toast.hide()
             return GLib.SOURCE_REMOVE
 
-        GLib.timeout_add(1400, restore)
+        GLib.timeout_add(self.TOAST_MS, fade)
 
     # -- tabs ---------------------------------------------------------------
 
