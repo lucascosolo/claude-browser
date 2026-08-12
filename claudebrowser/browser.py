@@ -230,6 +230,19 @@ STUCK_LOAD_S = 40
 # machine that is already struggling.
 MAX_AGENT_TABS = int(os.environ.get("CB_MAX_TABS", "10"))
 
+# How a dead web process is described to the user, by WebKit's own reason code.
+# Worth distinguishing rather than saying "crashed" for all three: "ran out of
+# memory" is a sentence someone can act on -- close a tab, turn on Light mode --
+# and "crashed" is not. Built by name so a WebKit that adds a fourth reason
+# degrades to the generic string instead of raising at import.
+_CRASH_REASONS = {
+    getattr(WebKit2.WebProcessTerminationReason, name): text
+    for name, text in (("CRASHED", "crashed"),
+                       ("EXCEEDED_MEMORY_LIMIT", "ran out of memory"),
+                       ("TERMINATED_BY_API", "was stopped"))
+    if hasattr(WebKit2.WebProcessTerminationReason, name)
+}
+
 
 def needs_tab(method):
     """Resolve the leading tab id, or answer "no such tab" and stop.
@@ -387,6 +400,22 @@ class Tab:
         self.used = time.monotonic()
         self.discarded = None
         self.scroll = 0
+
+        # -- crash state -----------------------------------------------------
+        # What this tab was showing when it was last known good, kept so a web
+        # process that dies can be recovered from a record of our own rather
+        # than from the corpse. A terminated view keeps its URI in practice --
+        # which is why a manual reload gets the page back, and is what made this
+        # look like a lost tab rather than a crash -- but its title is already
+        # gone by then, and relying on a wreck to describe itself is how a
+        # recovery ends up reloading `about:blank` over the page it was meant to
+        # restore.
+        self.last_good = None
+        # Monotonic stamp of the last crash *recovery*, so a page that kills the
+        # web process every time it loads is reloaded once and then left alone.
+        # Without this the handler is an infinite loop that reloads the very
+        # thing doing the killing, on the machine least able to afford it.
+        self.crashed_at = 0.0
         # The WebKitSettings values VPN Mode overrode on this view, so turning
         # the mode off can put back what was there rather than what this file
         # guesses the defaults are. None means "not hardened".
@@ -1988,7 +2017,14 @@ class Browser(Gtk.Window):
         view.connect("decide-policy", self._on_policy, tab)
         view.connect("load-changed", self._on_load, tab)
         view.connect("load-failed", self._on_fail, tab)
-        view.connect("notify::title", lambda *_: (self._retitle(tab), self._refresh(tab)))
+        # `web-process-terminated`, not the older `web-process-crashed`: both
+        # names are in libwebkit2gtk-4.1, the old one is deprecated, and only the
+        # new one carries the reason. Without this connection a dead web process
+        # is entirely silent and the tab simply goes blank -- see _on_gone.
+        view.connect("web-process-terminated", self._on_gone, tab)
+        view.connect("notify::title", lambda *_: (self._mark_good(tab),
+                                                  self._retitle(tab),
+                                                  self._refresh(tab)))
         view.connect("notify::uri", lambda *_: self._refresh(tab))
         # Progress fires many times a second per frame. Repainting the whole bar
         # each time is work stolen from the layout we are waiting on, so this one
@@ -2125,6 +2161,7 @@ class Browser(Gtk.Window):
             # would otherwise have dropped the sheet. The snippet is idempotent
             # by design, so the second call is a lookup and nothing more.
             self._apply_siterules(tab)
+            self._mark_good(tab)
             self._remember(tab)
             self._pw_expire(tab)
             self._pw_autofill(tab)
@@ -2217,6 +2254,30 @@ class Browser(Gtk.Window):
         except GLib.Error:
             pass
 
+    def _mark_good(self, tab):
+        """Record where this tab actually is, for a crash to come back to.
+
+        Called from load FINISHED *and* from the title notification, because as
+        `_retitle` says a page's title usually arrives after its load finishes:
+        capturing only at FINISHED reliably stored the URL with an empty title,
+        and a recovered tab then had no name to show while it was asleep.
+
+        Never `about:` -- a blank is not a page to restore, and recording it
+        would overwrite the real destination during the moment every navigation
+        passes through blank on its way somewhere.
+
+        Private tabs are included, and that is not a leak: this is a dict on a
+        Python object that dies with the window, holding a URL the WebView next
+        to it is already displaying. Nothing here reaches `store.recordable`'s
+        side of the line, and excluding private tabs would mean the one kind of
+        tab whose contents cannot be recovered from history is also the one kind
+        a crash loses outright.
+        """
+        url = tab.view.get_uri() or ""
+        if not url or url.startswith("about:"):
+            return
+        tab.last_good = {"url": url, "title": tab.view.get_title() or ""}
+
     def _retitle(self, tab):
         """Titles usually arrive after the load finishes. Update in place --
         recording again would count one page load as several visits and skew
@@ -2241,6 +2302,84 @@ class Browser(Gtk.Window):
         self._settle(tab, {"ok": False, "error": tab.failed, **tab.info()})
         self._refresh(tab)
         return False
+
+    #: How soon a second crash counts as the page crashing *again* rather than
+    #: bad luck. Below this, the tab is left recoverable-on-select instead of
+    #: being reloaded into the same crash.
+    CRASH_LOOP_S = 30
+
+    def _on_gone(self, _view, reason, tab):
+        """The web process behind this tab died. Never leave a blank tab.
+
+        This is the fix for the bug that read as "my tab turned into a New Tab".
+        Nothing was unloading it: WebKit's web process had terminated, and a
+        WebView whose process is gone paints white and drops its title while
+        *keeping* its URI -- which is why a manual reload brought the page back
+        and made the state look recoverable, because it was. What was missing
+        was anything listening. There was no handler for this signal anywhere in
+        the project, so a crash was silent and the tab sat blank until the user
+        happened to hit reload.
+
+        Every tab is deliberately created *related* to the first (see Tab), so
+        they share one web process and one death takes all of them. The signal
+        arrives once per view, so this runs per tab and each decides for itself.
+
+        The foreground tab reloads immediately -- that is the one the user is
+        looking at, and it is the whole complaint. Background tabs are put into
+        the same recoverable state a memory discard uses, so they come back when
+        selected. Reloading all of them here would put every page this machine
+        was holding back into a brand-new web process in the same second, which
+        is the load pattern `_admit` exists to prevent and a good way to kill the
+        replacement process as well.
+
+        What cannot be recovered, and is not claimed to be: text typed into a
+        form. That lived in the dead process's heap and went with it. The URL,
+        the title and the page itself come back; unsaved input does not.
+        """
+        now = time.monotonic()
+        looping = now - tab.crashed_at < self.CRASH_LOOP_S
+        tab.crashed_at = now
+        tab.loading = False
+        tab.bar.finish()
+
+        target = (tab.last_good or {}).get("url") or tab.view.get_uri() or ""
+        if target.startswith("about:"):
+            target = ""
+        why = _CRASH_REASONS.get(reason, "stopped")
+
+        # Before anything reloads: an agent waiting on a load in this tab is
+        # waiting on a process that no longer exists, and the control timeout is
+        # a worse way to find that out.
+        self._settle(tab, {"ok": False,
+                           "error": "the page's web process %s" % why,
+                           **tab.info()})
+
+        if not target:
+            tab.last_good = None
+            self._refresh(tab)
+            return
+        if tab is self.current() and not looping:
+            tab.discarded = None
+            self._begin_load(tab)
+            perf.load_url(tab.view, target)
+            self._flash("The page %s — reloading it." % why)
+        else:
+            # The same shape `discard_tab` writes, so selecting the tab restores
+            # it through `restore_tab` and nothing else has to learn a second
+            # kind of sleeping tab. No summary is captured: that reads the
+            # page-text cache to describe a tab the user did not ask about, and
+            # a crash is not the moment to spend a disk read on decoration.
+            tab.discarded = {"url": target,
+                             "title": (tab.last_good or {}).get("title") or "",
+                             "summary": ""}
+            if tab is self.current():
+                # Crash-looping *and* in front. Reloading is what kills it, so
+                # the tab is left asleep and the user is told, rather than the
+                # browser fighting the page in a cycle it cannot win.
+                self._flash("This page keeps crashing — select the tab to try "
+                            "it again.")
+        self._relabel_tabs()
+        self._refresh(tab)
 
     def _settle(self, tab, payload):
         """Resolve everyone waiting on this tab's *current* load, once.
