@@ -2133,10 +2133,19 @@ class Browser(Gtk.Window):
 
     # -- tabs ---------------------------------------------------------------
 
-    def new_tab(self, url=HOME, background=False, private=False):
+    def new_tab(self, url=HOME, background=False, private=False,
+                related_view=None, load_initial=True):
         # A private tab must not be created *related* to a normal one, or it
         # inherits the very storage it exists to avoid.
-        related = self.tabs[0].view if (self.tabs and not private) else None
+        # A popup is the exception to the ordinary first-tab relationship: its
+        # opener must be the view that requested it. OAuth providers use that
+        # relationship to post the result back to the login page. Private
+        # popups still get an ephemeral view, so they deliberately do not use
+        # WebKit's related-view constructor and inherit persistent storage.
+        related = (related_view if related_view is not None else
+                   (self.tabs[0].view if (self.tabs and not private) else None))
+        if private:
+            related = None
         tab = Tab(self.content, self.context, related=related, private=private)
         self.privacy.opened(tab.id, tab.private)
         view = tab.view
@@ -2187,7 +2196,7 @@ class Browser(Gtk.Window):
             self.privacy.focused(tab.id)
         if url:
             perf.load_url(view, normalize(url))
-        else:
+        elif load_initial:
             view.load_uri("about:blank")
         return tab
 
@@ -2238,12 +2247,21 @@ class Browser(Gtk.Window):
         cache, and a row in history -- with no badge to show it had happened.
         """
         origin = next((t for t in self.tabs if t.view is view), None)
-        uri = action.get_request().get_uri()
-        if uri:
-            self.new_tab(uri, background=True,
-                         private=storage.child_is_private(
-                             origin is not None and origin.private))
-        return None
+        child = self.new_tab(
+            url=None,
+            background=True,
+            private=storage.child_is_private(origin is not None and origin.private),
+            related_view=view,
+            load_initial=False,
+        )
+        # Returning the actual child is load-bearing. Returning None creates a
+        # tab that is merely adjacent to the popup request, not its WebKit
+        # child; `window.opener` and the postMessage callback then disappear.
+        # That is exactly how Google login can complete visibly and still hand
+        # the platform the generic "There was an error logging you in" page.
+        # WebKit loads action's request into this returned view, including when
+        # the request has no URI yet (window.open() followed by location.href).
+        return child.view
 
     def close_tab(self, tab):
         if tab is None:
