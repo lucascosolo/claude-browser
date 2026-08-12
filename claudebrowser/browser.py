@@ -25,7 +25,8 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 from . import (agent, ai, auth, envfile, extract, findbar, pages, pagetext,  # noqa: E402
                panel_html, passwords, perf, personas, playbooks, progress,
                reader, resources, scrub, search, settings, siterules, storage,
-               store, style, tabnames, urls, vpn, watchlater, youtube)
+               modes, store, style, tabnames, urls, vpn, watchlater,
+               youtube)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -718,6 +719,8 @@ class Browser(Gtk.Window):
         self._build_completion()
         bar.pack_start(self.omnibox, True, True, 0)
 
+        bar.pack_start(self._build_mode_pills(), False, False, 0)
+
         right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         right.get_style_context().add_class("cb-nav")
         self.btn_star = self._icon_button("non-starred-symbolic",
@@ -816,6 +819,102 @@ class Browser(Gtk.Window):
         self.split.connect("button-release-event", self._on_split_released)
         self._reclamp_id = None
         self.connect("configure-event", self._on_configure)
+
+    def _build_mode_pills(self):
+        """The resource-mode control: three segments, always on screen.
+
+        Always visible rather than appearing once a site is set lighter, which
+        was the alternative. A control that hides on `normal` is missing at the
+        exact moment someone reaches for it -- a heavy page they want to lighten
+        is by definition a page still in the default mode.
+
+        `Gtk.RadioButton` in `draw_indicator=False` mode rather than three
+        `ToggleButton`s wired together: the radio group already enforces "exactly
+        one is chosen", which is the invariant a hand-rolled trio gets wrong the
+        first time two clicks arrive in the same frame. Drawn as buttons, not as
+        radio dots, so it reads as a segmented control.
+        """
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        box.get_style_context().add_class("cb-modes")
+        self.mode_buttons = {}
+        group = None
+        for mode in modes.SLIDER:
+            button = Gtk.RadioButton.new_with_label_from_widget(
+                group, modes.LABELS[mode])
+            group = group or button
+            button.set_mode(False)             # segment, not a radio dot
+            button.set_can_focus(False)
+            button.get_style_context().add_class("cb-mode")
+            button.get_style_context().add_class("cb-mode-%s" % mode)
+            button.set_tooltip_text(modes.SUMMARIES[mode])
+            # `toggled` fires for the segment being *un*set as well, and during
+            # the programmatic sync in `_paint_modes`. Both are filtered in the
+            # handler rather than by blocking the signal, because blocking has
+            # to be undone on every early return and one missed path leaves the
+            # control permanently inert.
+            button.connect("toggled", self._on_mode_pill, mode)
+            self.mode_buttons[mode] = button
+            box.pack_start(button, False, False, 0)
+        #: Set while `_paint_modes` is moving the buttons to match the page, so
+        #: the resulting `toggled` is not read as the user asking for anything.
+        self._syncing_modes = False
+        return box
+
+    def _on_mode_pill(self, button, mode):
+        if self._syncing_modes or not button.get_active():
+            return
+        self.set_mode_for_current(mode)
+
+    def set_mode_for_current(self, mode):
+        """Put the current tab's site in `mode`, remember it, and reload.
+
+        The choice is stored per site, so returning to it later comes back in
+        the mode it was left in. Choosing the default *removes* the stored entry
+        rather than writing it -- see `modes.with_site` -- so the settings file
+        only ever accumulates the sites that actually depart from it, and a
+        later change of default is not silently pinned out by every site ever
+        visited.
+
+        A reload is the honest way to apply it. Several of these settings are
+        read as a document is built -- images, media -- so flipping them under a
+        page that has already loaded gets a view whose settings and content
+        disagree, which is worse than a visible reload.
+        """
+        tab = self.current()
+        if tab is None:
+            return
+        url = tab.view.get_uri() or ""
+        host = modes.host_of(url)
+        if not host:
+            self._flash("This page has no site to set a mode for.")
+            self._paint_modes()
+            return
+        sites, host = modes.with_site(url, mode)
+        envfile.put(modes.SITES_SETTING, modes.format_sites(sites))
+        perf.apply_mode(tab.view, mode)
+        self._flash("%s is %s" % (host, modes.LABELS[mode]))
+        self._paint_modes()
+        self._begin_load(tab)
+        tab.view.reload()
+
+    def _paint_modes(self):
+        """Move the segments to match whatever the current tab is showing."""
+        tab = self.current()
+        url = (tab.view.get_uri() or "") if tab else ""
+        mode = modes.for_url(url)
+        self._syncing_modes = True
+        try:
+            button = self.mode_buttons.get(mode)
+            if button is not None and not button.get_active():
+                button.set_active(True)
+            # A page with no site -- cb:home, about:blank -- has nothing to set
+            # a mode on. The control stays visible and goes insensitive, which
+            # says "not here" rather than vanishing and taking its own
+            # explanation with it.
+            for widget in self.mode_buttons.values():
+                widget.set_sensitive(bool(modes.host_of(url)))
+        finally:
+            self._syncing_modes = False
 
     def _build_panel(self):
         """A console docked at the bottom, in the shape of an inspector:
@@ -2043,6 +2142,9 @@ class Browser(Gtk.Window):
         view = tab.view
 
         perf.tune_view(view)
+        # Before the first load rather than waiting for STARTED: a tab created
+        # straight onto a potato site should never have had images enabled.
+        perf.apply_mode(view, modes.for_url(normalize(url) if url else ""))
         if vpn.STATE.engaged:
             self._vpn_harden(tab)
         if tab.vpn_error:
@@ -2181,6 +2283,13 @@ class Browser(Gtk.Window):
         if event == WebKit2.LoadEvent.STARTED:
             tab.loading = True
             tab.failed = None
+            # The mode belongs to the *site being loaded*, not to the view, so
+            # it is re-applied per navigation: following a link from a potato
+            # site to a normal one has to move this view up. STARTED rather than
+            # COMMITTED because several of these decide what the document is
+            # allowed to fetch (images, media), and by COMMITTED the parser has
+            # already begun asking for them.
+            perf.apply_mode(tab.view, modes.for_url(tab.view.get_uri() or ""))
             # Put the bar on screen now, not when the first byte lands. Between
             # the keystroke and the network answering there is otherwise no
             # evidence the browser heard the request at all, and on a slow link
@@ -2478,11 +2587,13 @@ class Browser(Gtk.Window):
             return
         self.set_title("%s — claude-browser%s"
                        % (title, " (private)" if tab.private else ""))
-        # A flash message owns the omnibox for its second; repainting the URL
-        # over it on the next progress tick would make it invisible.
-        if not self.omnibox.has_focus() and not getattr(self, "_flashing", False):
+        # Status no longer lands here -- it goes to the toast -- so the only
+        # thing to avoid painting over is the user's own typing. The address bar
+        # belongs to whoever has focus in it.
+        if not self.omnibox.has_focus():
             self.omnibox.set_text(tab.view.get_uri() or "")
         self._sync_star()
+        self._paint_modes()
         root = self.get_style_context()
         (root.add_class if tab.private else root.remove_class)("cb-private")
         self.btn_back.set_sensitive(tab.view.can_go_back())
@@ -4132,6 +4243,40 @@ class Browser(Gtk.Window):
             return done({"ok": tab.failed is None, **tab.info(),
                          **({"error": tab.failed} if tab.failed else {})})
         tab.waiters.append((tab.generation, done))
+
+    @needs_tab
+    def api_mode(self, tab, mode, done):
+        """Read the resource mode for this tab's site, or set it.
+
+        Setting goes through the same `set_mode_for_current` the toolbar uses
+        when the tab is the current one, so a mode set over the API and a mode
+        set by clicking are the same operation with the same reload and the same
+        persistence. A background tab is handled here instead, because moving
+        the user's view to whatever an agent is working on would be a worse
+        surprise than a tab that reloads quietly.
+        """
+        url = tab.view.get_uri() or ""
+        host = modes.host_of(url)
+        if mode is None:
+            return done({"ok": True, "mode": modes.for_url(url), "site": host,
+                         "available": list(modes.SLIDER), **tab.info()})
+        wanted = (mode or "").strip().lower()
+        if wanted not in modes.MODES:
+            return done({"ok": False, "error": "unknown mode %r -- one of %s"
+                                               % (mode, ", ".join(modes.MODES)),
+                         **tab.info()})
+        if not host:
+            return done({"ok": False, "error": "this page has no site to set a "
+                                               "mode for", **tab.info()})
+        if tab is self.current():
+            self.set_mode_for_current(wanted)
+        else:
+            sites, host = modes.with_site(url, wanted)
+            envfile.put(modes.SITES_SETTING, modes.format_sites(sites))
+            perf.apply_mode(tab.view, wanted)
+            self._begin_load(tab)
+            tab.view.reload()
+        done({"ok": True, "mode": wanted, "site": host, **tab.info()})
 
     @needs_tab
     def api_eval(self, tab, script, done):

@@ -222,6 +222,23 @@ OPS = [
                Param("width", "integer", "Line measure in px (360-1100).", cli="opt")],
        call=lambda c, a: ("api_reader", (_tab(a), a.get("font"), a.get("width")))),
 
+    # Reports the mode with no argument, sets it with one. Reading and writing
+    # through one op rather than two because the answer to "what mode is this
+    # site in" and "put it in one" is the same dict, and a separate read op
+    # would be a second place for the resolution order to be implemented.
+    #
+    # `scraper` is accepted here even though the toolbar does not offer it: the
+    # slider is the surface a person uses and this is the surface an agent uses,
+    # and an agent asking for a page without a renderer is the whole point of
+    # that mode existing.
+    Op("mode", "/mode", "POST", "Read or set the resource mode for the current "
+       "tab's site: normal (the full web platform), light (heavy graphics and "
+       "media off), potato (HTML and basic JavaScript only). Omit the mode to "
+       "report the current one. The choice is remembered per site.",
+       params=[Param("mode", "string", "normal, light or potato. Omit to read.",
+                     cli="optarg")],
+       call=lambda c, a: ("api_mode", (_tab(a), a.get("mode")))),
+
     # Like reader, a *display* change that reports state rather than content.
     # An agent wanting the prose still calls text or markdown, which read the
     # decluttered DOM like any other -- the sheet hides nodes, it never removes

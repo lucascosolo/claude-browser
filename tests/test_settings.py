@@ -28,7 +28,8 @@ from claudebrowser import envfile, pages, personas, settings, style  # noqa: E40
 #: becoming uneditable again.
 EVERY_KEY = (
     "CB_AUTH", "CB_AUTOSTART", "CB_BLOCK", "CB_COOKIES", "CB_GPU", "CB_HOME",
-    "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
+    "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_MODE",
+    "CB_MODE_SITES", "CB_PACE",
     "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
     "CB_QUEUE_LIST",
     "CB_SCRUB", "CB_SEARCH", "CB_SEARCH_LANG", "CB_SITERULES", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_VPN",
@@ -112,7 +113,11 @@ class TestTable(Isolated):
                 "CB_SEARCH_LANG",
                 # youtube.enabled() is read inside the decide-policy handler,
                 # so the next link clicked already obeys it.
-                "CB_YT_EMBED"}
+                "CB_YT_EMBED",
+                # modes.for_url() reads both out of the file on every page
+                # load, which is what lets the toolbar slider take effect on
+                # the next navigation rather than at the next restart.
+                "CB_MODE", "CB_MODE_SITES"}
         for knob in settings.SETTINGS:
             immediate = "restart" not in knob.effect.lower()
             self.assertEqual(immediate, knob.key in live,

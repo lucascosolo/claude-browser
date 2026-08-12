@@ -31,7 +31,7 @@ import gi
 gi.require_version("WebKit2", "4.1")
 from gi.repository import GLib, WebKit2  # noqa: E402
 
-from . import envfile  # noqa: E402
+from . import envfile, modes  # noqa: E402
 
 CACHE = Path(GLib.get_user_cache_dir()) / "claude-browser"
 
@@ -346,6 +346,35 @@ def tune_context(context):
             notes.append("memory pressure handler unavailable (%s)" % e)
 
     return notes
+
+
+def apply_mode(view, mode):
+    """Put this view in a resource mode. Returns the names actually applied.
+
+    The whole of the policy is `modes.settings_for`, which is GTK-free and
+    tested; this is the three lines that cannot be. Properties are set by name
+    through `set_property` rather than through a `set_enable_*` method per
+    switch, so adding a rung to the ladder is an entry in that table and nothing
+    here.
+
+    `hasattr`-free by design: `list_properties` is asked what this build
+    actually has. A `set_property` for a name WebKit does not carry raises, and
+    the ladder is written against 2.52 -- so an older or newer library drops the
+    switch it lacks and keeps the rest, rather than failing to open a tab.
+
+    Called on every navigation and not once per view, because the mode is a
+    property of the *site* being loaded: following a link from a potato site to
+    a normal one has to move the view up, and a view that kept the mode it was
+    created in would strand every tab on whatever it first visited.
+    """
+    settings = view.get_settings()
+    available = {p.name for p in settings.list_properties()}
+    applied = []
+    for name, value in modes.settings_for(mode).items():
+        if name in available:
+            settings.set_property(name, value)
+            applied.append(name)
+    return applied
 
 
 def tune_view(view):

@@ -115,6 +115,30 @@ def _choice_canon(values, aliases=None):
     return canon
 
 
+def _modes_check(value):
+    """Validator for the per-site mode list, written from what reads it.
+
+    `modes.parse_sites` is deliberately tolerant -- it drops an entry it cannot
+    read rather than failing the whole map, because this is a value a person
+    edits by hand and losing one line is better than losing the list. So a
+    validator that rejected any malformed entry would be stricter than the
+    consumer, and would refuse to save a list the browser would have been
+    perfectly happy with.
+
+    What it does catch is the case that is certainly a mistake and currently
+    silent: text was typed and *nothing at all* survived parsing. That is
+    someone who has got the format wrong end to end -- `example.com potato`
+    instead of `example.com=potato` -- and saving it would set every site back
+    to the default while reporting success.
+    """
+    from . import modes
+    if not modes.parse_sites(value):
+        raise ValueError(
+            "no host=mode pairs in that. Write them as `example.com=potato`, "
+            "separated by spaces or commas; modes are %s."
+            % ", ".join(modes.SLIDER))
+
+
 def _search_template(value):
     """urls.normalize does `SEARCH % quote(query)`. Anything that raises there
     turns every search into a traceback, so it is tried here instead."""
@@ -310,6 +334,33 @@ SETTINGS = (
                  ("dark", "Dark"), ("light", "Light"),
                  ("system", "Follow the desktop")),
         canon=_choice_canon(("", "phosphor", "dark", "light", "system"))),
+    Setting(
+        "CB_MODE", "Performance", "Default resource mode",
+        "How much of the web platform a site gets before you say otherwise. "
+        "Normal is the full suite with the waste removed; Light drops heavy "
+        "graphics and media; Potato is HTML and basic JavaScript. Individual "
+        "sites override this from the slider in the toolbar.",
+        "choice", "",
+        "Next page load",
+        "A mode is applied to a view as its page load begins, so tabs already "
+        "open keep the mode they were loaded in until they navigate.",
+        # The blank entry is the default rather than a fourth mode: an unset
+        # value means nobody has chosen, and the answer to that is
+        # modes.DEFAULT_MODE. `scraper` is deliberately absent -- it is not a
+        # mode a person may put a tab in. See modes.py.
+        choices=(("", "Normal \u2014 default"), ("normal", "Normal"),
+                 ("light", "Light"), ("potato", "Potato")),
+        canon=_choice_canon(("", "normal", "light", "potato"))),
+    Setting(
+        "CB_MODE_SITES", "Performance", "Per-site resource modes",
+        "Which sites depart from the default, as host=mode pairs. Written by "
+        "the toolbar slider; editable here when it is easier to fix a list "
+        "than to visit five sites.",
+        "text", "",
+        "Next page load",
+        "Read fresh on every page load, so a change here reaches the next "
+        "navigation without a restart.",
+        allow_empty=True, check=_modes_check),
     Setting(
         "CB_LIGHT", "Appearance", "Ask sites for a lighter page",
         "Sends Save-Data: on with each page this browser loads, and asks for "
