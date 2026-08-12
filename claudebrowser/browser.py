@@ -74,7 +74,14 @@ MENU_SECTIONS = (
         ("document-open-recent-symbolic", "History", "Ctrl+H", "cb:history"),
         ("dialog-password-symbolic", "Saved logins", "", "cb:passwords"),
         ("media-playback-start-symbolic", "Playbooks", "", "cb:playbooks"),
-        ("view-media-playlist-symbolic", "Watch later", "Ctrl+Alt+W", "cb:queue"),
+        # media-playlist-consecutive, not view-media-playlist: the latter is not
+        # in the Adwaita set this desktop ships, and a GtkImage asked for a name
+        # the theme does not have draws the broken-image glyph and says nothing
+        # anywhere -- which is exactly how this row sat iconless. See
+        # test_style.MenuIcons, which checks every name in this file against the
+        # live theme so the next missing one fails a test instead of shipping.
+        ("media-playlist-consecutive-symbolic", "Watch later", "Ctrl+Alt+W",
+         "cb:queue"),
     )),
     ("This page", (
         ("edit-find-symbolic", "Find on page", "Ctrl+F", "find"),

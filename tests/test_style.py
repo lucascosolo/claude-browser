@@ -217,3 +217,47 @@ class Motion(unittest.TestCase):
         # Nonsense lands on the default, so compare dark against itself by
         # name -- the point of the assertion is that dark is untouched.
         self.assertEqual(style.css("dark"), style.css(" DARK "))
+
+
+class MenuIcons(unittest.TestCase):
+    """Every icon name in browser.py exists in the icon theme.
+
+    A GtkImage handed a name the theme does not carry draws the broken-image
+    glyph. There is no exception, no return value to check and no warning --
+    the row simply looks wrong, which is how the Watch Later row shipped
+    iconless for as long as it did. The theme is queryable with no display and
+    no window, exactly like the CssProvider above, so this runs headless.
+
+    browser.py is read as *text* rather than imported: it needs a display, and
+    so is never importable from the suite. That makes this a regex over source,
+    which is coarse -- it checks every `"...-symbolic"` string in the file, not
+    only the menu table -- and coarse is the right side to err on here, since
+    an icon name anywhere in that file has the same failure mode.
+    """
+
+    #: Names that are deliberately not the theme's problem. Empty today; a
+    #: bundled icon shipped with the project would go here rather than turning
+    #: the assertion below into a warning.
+    EXEMPT = frozenset()
+
+    def setUp(self):
+        if Gtk is None:                               # pragma: no cover
+            self.skipTest("GTK unavailable")
+        self.theme = Gtk.IconTheme.get_default()
+        # A machine with no icon theme at all would fail every name and say
+        # nothing useful. Anchor on a name Adwaita has carried for a decade:
+        # if that is missing, the theme is absent, not the icons wrong.
+        if not self.theme.has_icon("go-previous-symbolic"):
+            self.skipTest("no usable icon theme on this machine")
+
+    def test_every_icon_name_resolves(self):
+        import os
+        import re
+        source = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "claudebrowser", "browser.py")
+        with open(source, encoding="utf-8") as handle:
+            names = set(re.findall(r'"([a-z0-9-]+-symbolic)"', handle.read()))
+        self.assertTrue(names, "found no icon names -- the pattern has rotted")
+        missing = sorted(n for n in names - self.EXEMPT
+                         if not self.theme.has_icon(n))
+        self.assertEqual([], missing, "icon names absent from the theme")
