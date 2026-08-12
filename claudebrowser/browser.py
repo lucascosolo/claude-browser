@@ -4561,7 +4561,7 @@ class Browser(Gtk.Window):
         back/forward all arrive through this signal and through nothing else
         the browser owns.
 
-        `ignore()` and not a re-issued request. CLAUDE.md's warning about
+        `ignore()` and not a re-issued request. AGENTS.md's warning about
         decide-policy is about re-issuing a load with `load_request`, which
         drops the Referer and turns a form POST into a GET; refusing outright
         has none of that, because nothing is sent at all.
@@ -4610,7 +4610,7 @@ class Browser(Gtk.Window):
 
         Two things here are not optional. The load is **re-issued with a
         `Referer`**, because the player answers a request without an http(s)
-        referrer with error 153 and no video; CLAUDE.md's warning about
+        referrer with error 153 and no video; AGENTS.md's warning about
         re-issuing from decide-policy is about losing that header and about
         turning a form POST into a GET, and neither applies to a GET whose
         header we are the ones supplying. And it is started **from an idle**,

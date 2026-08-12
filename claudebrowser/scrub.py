@@ -19,7 +19,7 @@ What it deliberately does NOT try to catch:
 
 - **Names.** "Lucas" and "Fedora" are the same shape to a regex. Detecting a
   person's name needs a model, which this project does not have and will not
-  add (see CLAUDE.md's rejected architectures).
+  add (see AGENTS.md's rejected architectures).
 - **Street addresses.** Same problem, plus every country writes them
   differently. "12 Mill Lane" and "12 pull requests" differ only in vocabulary.
 - **Dates of birth**, which are indistinguishable from any other date.

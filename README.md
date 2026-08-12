@@ -20,7 +20,7 @@ library, and it idles in roughly the memory one Chrome tab uses.
    agents drive this over HTTP            Ctrl+K asks Claude
 ```
 
-Working on the code? Read **`CLAUDE.md`** instead — it is the short version,
+Working on the code? Read **`AGENTS.md`** instead — it is the short version,
 plus the constraints that are not visible from the source.
 
 ## Why it exists

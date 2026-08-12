@@ -572,7 +572,7 @@ notebook.cb-tabs > header > tabs > tab:checked:hover {{ background: {tab_active}
 /* Persona selector: a quiet combo that reads as part of the mode row rather
    than as a form control dropped into it. The button inside carries the theme's
    bevel, so its gradient and inset shadow are cleared too -- see the note in
-   CLAUDE.md about "flat" buttons keeping a ghost outline. */
+   AGENTS.md about "flat" buttons keeping a ghost outline. */
 .cb-persona, .cb-persona button {{
     background: transparent;
     background-image: none;

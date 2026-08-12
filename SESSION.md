@@ -37,7 +37,7 @@ Started 2026-08-05. Branch `master`.
     exactly what `AUDIT.md` and the local-only posture exist to prevent;
   - YouTube is a Polymer app, so a server-side GET returns an app skeleton, not
     a feed. Real content would need a headless browser on the VPS, which is the
-    Playwright container already recorded as rejected in `CLAUDE.md`;
+    Playwright container already recorded as rejected in `AGENTS.md`;
   - a VPS round trip is slower and heavier than the local alternative, which
     costs one style recalculation.
   VPN Mode narrowed the VPS to a *transport* proxy on purpose. Fetching and
@@ -246,7 +246,7 @@ Two ways forward, and the first needs nothing from the user:
 
 1. **`self._queue` was already the page-load admission FIFO** in `_admit`, and
    the new queue state clobbered it — i.e. it disabled the one mechanism
-   `CLAUDE.md` credits with preventing a twenty-minute machine freeze. Renamed
+   `AGENTS.md` credits with preventing a twenty-minute machine freeze. Renamed
    to `_watchlater`, with a comment at the definition so it cannot recur.
 2. **`pages._js` is for HTML *attributes*, not `<script>` blocks.** An entity
    is decoded in an attribute and not in a script, so a queued video called

@@ -170,7 +170,7 @@ class TestRecorder(unittest.TestCase):
 
 
 class TestSecretsAreNeverRecorded(unittest.TestCase):
-    """The rule from CLAUDE.md, applied to a new on-disk sink: secrets go to
+    """The rule from AGENTS.md, applied to a new on-disk sink: secrets go to
     the Secret Service, never to a file this project invents."""
 
     def setUp(self):

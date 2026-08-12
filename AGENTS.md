@@ -272,6 +272,38 @@ stronger gate; on those four, py_compile is the only one there is.
   change of default. A setter that could write `ANTHROPIC_API_KEY` would be a
   route from an API call to the user's credential, which is why it raises
   instead.
+- **A dead web process is silent, and nothing recovers from it on its own.**
+  WebKit emits `web-process-terminated` (the older `web-process-crashed` is
+  deprecated and carries no reason); for as long as this project had no handler
+  for it, a crash left the view painting white with its title dropped and its URI
+  *intact* -- which is why a manual reload brought the page back and why it read
+  as "my tab turned into a New Tab" rather than as a crash. Every tab is created
+  *related* to the first, so they share one web process and one death takes all
+  of them. `Browser._on_gone` reloads the foreground tab, puts the rest into the
+  same recoverable state a memory discard uses (reloading every page the machine
+  was holding into one brand-new web process is the load pattern `_admit` exists
+  to prevent), settles waiters, and refuses to reload twice inside
+  `CRASH_LOOP_S` so a page that crashes on load is not fought in a loop. What
+  cannot be recovered is typed-but-unsaved form input: it was in the dead
+  process's heap. Say so rather than implying otherwise.
+- **Status never goes in the omnibox, because the omnibox is an input.**
+  `_flash` used to write into the address bar, so a background event -- a tab
+  being freed, a mode being applied -- could overwrite a URL mid-keystroke. It
+  paints a `.cb-toast` floated over the content on a `Gtk.Overlay` instead:
+  bottom-left, opaque (it sits over arbitrary page content, and a translucent
+  wash readable over a white article is unreadable over a photograph), and
+  reflowing nothing. The general rule is the one to keep -- feedback the user did
+  not ask for must never land in a control the user is about to use.
+- **A resource mode is a name resolved per navigation, never a property of a
+  view.** `modes.py` holds the whole policy and is GTK-free; `perf.apply_mode` is
+  the three lines that cannot be. The ladder is written as *deltas* composed in
+  order, so a switch added to `light` is automatically in `potato` and cannot be
+  forgotten. Two things are load-bearing and pinned by tests: no slider mode may
+  disable JavaScript (that is the `scraper` tier, which is a different
+  implementation), and **no mode at all** may disable service workers, IndexedDB,
+  WebAssembly or storage -- they are idle until used, so switching them off buys
+  nothing and its failure mode is silent, a site deciding the browser is
+  automated and showing a challenge that never passes.
 - Named exports of intent in comments: explain *why*, especially where a choice
   looks arbitrary but encodes a real constraint.
 
@@ -547,6 +579,40 @@ stronger gate; on those four, py_compile is the only one there is.
   alongside the rest of `perf.py`'s defaults, which are tuned for a Celeron N3060
   with 3.8GB and **no swap at all** — check `swapon --show` before assuming
   `resources.py`'s swap-in signal has anything to read.
+- **An icon name absent from the theme fails silently.** A `GtkImage` asked for
+  one draws the broken-image glyph -- no exception, no return value, no warning.
+  That is how the Watch Later row shipped iconless on
+  `view-media-playlist-symbolic`, which Adwaita does not carry (the real name is
+  `media-playlist-consecutive-symbolic`). `test_style.MenuIcons` now checks every
+  `*-symbolic` string in `browser.py` against the live theme; `Gtk.IconTheme` is
+  queryable with no display, like `Gtk.CssProvider`, so it runs headless.
+- **VPN Mode's SSRF chain needs a conntrack exemption, or the proxy can never
+  answer anyone.** `CB-VPN-EGRESS` denies by *destination*, which is right for a
+  connection the container dials and wrong for one it merely answers: a tailnet
+  client connects to `100.91.16.6:8888`, and the container's SYN-ACK back to
+  `100.91.16.6` matches the `-d 100.64.0.0/10` rule meant to stop the container
+  reaching the tailnet. Since the port is published on the tailnet address, every
+  legitimate client is a tailnet client, so the proxy accepted connections and
+  could answer none. `-m conntrack --ctstate ESTABLISHED,RELATED -j RETURN` goes
+  *first* in the chain; a container-initiated connection is still `NEW` and still
+  rejected, so nothing is loosened. The symptom is a plain TCP timeout with the
+  container "Up", tinyproxy listening and its log empty -- no handshake ever
+  completes, so there is never a request to log. **The tell is a socket in
+  `SYN_RECV`** in the container's `/proc/net/tcp`; `docker exec` has no `ss` or
+  `ps`, so read that file directly.
+- **`MemoryPressureSettings` kill threshold `0.0` is the API's own default and
+  means disabled.** It looks like "kill at 0%" and it is not. Do not "fix" it.
+- **Test against an isolated instance, never the user's daily browser.**
+  `XDG_CONFIG_HOME` picks the settings file (and so `CB_PORT`), `XDG_DATA_HOME`
+  and `XDG_CACHE_HOME` pick the profile, so a second browser runs on its own port
+  and profile with the real one untouched. Identify its processes by matching
+  `/proc/PID/environ` against that config path -- **not** `pgrep -n -f
+  "m claudebrowser"`, which matches the shell running the command itself. This is
+  the same trap as the `pkill -f` note above, in a new place.
+- **A root-window grab cannot capture an occluded window.** `Gdk.pixbuf_get_from_-
+  window` on the root returns whatever is visually on top of those coordinates,
+  so screenshotting a test instance that sits under the real browser silently
+  photographs the wrong one. Raise it first and confirm the title in the grab.
 - **Screenshotting the chrome needs a cropped root grab.** `xwd -name` matches
   the legacy `WM_NAME`, which GTK does not set (it sets `_NET_WM_NAME`), and
   `xwd -id` on the toplevel misses popovers because a GTK popover is its own X

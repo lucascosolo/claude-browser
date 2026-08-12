@@ -5,13 +5,13 @@ already is — Python 3 + GTK3 + WebKit2GTK, standard library only, no pip, no
 node, no build step. Anything that needed a different product (a Tauri/React
 front end, a Rust or FastAPI service, an embedding model, an opt-in VPS with
 Postgres and Playwright) has been removed rather than parked; the reasoning for
-those refusals lives in `CLAUDE.md` under *Architectures already rejected*, so
+those refusals lives in `AGENTS.md` under *Architectures already rejected*, so
 it does not get re-proposed here every six months.
 
 Ideas that have since been built — reader mode, the page-text cache, `recall`
 full-text search, the visible agent cursor, the outbound PII scrubber, playbooks,
 Claude personas, discard-path tab summaries, private-mode hardening and VPN
-Mode — are documented in `README.md` and `CLAUDE.md` and are no longer
+Mode — are documented in `README.md` and `AGENTS.md` and are no longer
 suggestions.
 
 ## Perceived speed and feel
