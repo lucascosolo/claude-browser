@@ -112,8 +112,88 @@ PROBE_TIMEOUT = 12
 USER_AGENT = "claude-browser/vpn-check"
 
 
+# -- why it failed -----------------------------------------------------------
+# Four kinds, because "VPN mode failed" is the one sentence that tells a user
+# nothing they can act on. Each of these has a different fix, and the fix is in
+# a different place: the settings file, the tailnet, the VPS, or the network
+# beyond it. They are values rather than free text so the page, the pill and the
+# `vpn` op cannot describe the same failure three different ways.
+
+#: The proxy URL is missing, unparseable, the wrong scheme, or its credential
+#: was rejected. Nothing was wrong with the network -- the fix is in settings.
+#: A 407 lands here and not in BACKEND on purpose: the proxy was reached and
+#: answered, so the server is fine and the password is not.
+CONFIG = "config"
+
+#: Nothing answered at the proxy's address at all: refused, timed out, or the
+#: name did not resolve. The fix is reachability -- is the tailnet up, is the
+#: host awake -- and not the proxy's own configuration.
+CONNECTION = "connection"
+
+#: The proxy answered, and could not do its job: it failed to reach the site
+#: beyond it. The VPS is up and the tunnel works; the exit does not.
+BACKEND = "backend"
+
+#: The tunnel carried a reply and the reply was not an address -- a captive
+#: portal, an error page, an empty body. This is the one case where traffic may
+#: well be flowing and the browser still refuses, because "VPN on" means an
+#: external echo *confirmed* the exit address, not that the proxy accepted a
+#: connection. Refusing here is the whole point of the mode.
+VERIFY = "verify"
+
+#: Shown when a failure has no kind -- an older caller, or a path not yet
+#: classified. Never a silent empty string: an unlabelled failure should read as
+#: unlabelled rather than as one of the four.
+UNKNOWN = "unknown"
+
+KINDS = (CONFIG, CONNECTION, BACKEND, VERIFY, UNKNOWN)
+
+#: The short headline each kind gets in the UI. The detail line stays the
+#: redacted `reason`; this is the part someone reads first and decides from.
+HEADLINES = {
+    CONFIG: "VPN Mode is misconfigured",
+    CONNECTION: "The VPN proxy could not be reached",
+    BACKEND: "The VPN backend could not reach the internet",
+    VERIFY: "VPN Mode could not be verified",
+    UNKNOWN: "VPN Mode failed",
+}
+
+#: What to try, per kind. Kept here beside the headline rather than in the page,
+#: so the pill's tooltip and cb:vpn cannot drift apart.
+ADVICE = {
+    CONFIG: "Check CB_VPN_PROXY in settings — its address, and its credential.",
+    CONNECTION: "Check that the proxy host is up and that you can reach it "
+                "(for a tailnet address, that the tailnet is connected).",
+    BACKEND: "The proxy is answering but cannot reach the site. Check the "
+             "server's own network and its egress rules.",
+    VERIFY: "Something answered but would not confirm the exit address. "
+            "Traffic is not being sent until it does.",
+    UNKNOWN: "Open cb:vpn for what was recorded.",
+}
+
+
+def headline(kind):
+    """The one-line name of a failure kind. Never raises on a new kind."""
+    return HEADLINES.get(kind) or HEADLINES[UNKNOWN]
+
+
+def advice(kind):
+    """What to do about a failure kind. Never raises on a new kind."""
+    return ADVICE.get(kind) or ADVICE[UNKNOWN]
+
+
 class ProbeError(Exception):
-    """The exit check did not produce an address. Its message is redacted."""
+    """The exit check did not produce an address. Its message is redacted.
+
+    `kind` is one of the four above, so the caller can say *which* way it failed
+    without parsing the message. It defaults to VERIFY rather than UNKNOWN
+    because every raise site inside the probe is, by definition, a check that
+    did not confirm an address; UNKNOWN is for failures that never got here.
+    """
+
+    def __init__(self, message, kind=VERIFY):
+        super().__init__(message)
+        self.kind = kind
 
 
 # -- the proxy ---------------------------------------------------------------
@@ -310,6 +390,9 @@ class State:
         self._lock = threading.Lock()
         self.mode = OFF
         self.reason = ""
+        # Which of the four ways it failed. Empty unless `mode` is FAILED, so a
+        # stale kind cannot outlive the failure it described.
+        self.kind = ""
         self.proxy = None
         self.exit_ip = None
         self.service = ""
@@ -324,6 +407,7 @@ class State:
             self.mode = CONNECTING
             self.proxy = proxy
             self.reason = ""
+            self.kind = ""
             self.exit_ip = None
             self.service = ""
             return self.attempt
@@ -335,11 +419,12 @@ class State:
                 return False
             self.mode = ON
             self.reason = ""
+            self.kind = ""
             self.exit_ip = exit_ip
             self.service = service
             return True
 
-    def fail(self, attempt, reason):
+    def fail(self, attempt, reason, kind=UNKNOWN):
         """A probe, or an apply, did not work. True if it was still wanted.
 
         There is no transition out of here except `engage` or `disengage`. That
@@ -351,11 +436,12 @@ class State:
                 return False
             self.mode = FAILED
             self.reason = reason or "the exit check did not succeed"
+            self.kind = kind or UNKNOWN
             self.exit_ip = None
             self.service = ""
             return True
 
-    def refuse(self, reason):
+    def refuse(self, reason, kind=CONFIG):
         """Fail without ever having had a proxy: the configuration is unusable.
 
         Still `failed` and not `off`, which is the whole point. The user asked
@@ -368,6 +454,9 @@ class State:
             self.mode = FAILED
             self.proxy = None
             self.reason = reason
+            # CONFIG by default and in every current caller: `refuse` is the
+            # path taken when there was never a usable proxy to dial.
+            self.kind = kind or CONFIG
             self.exit_ip = None
             self.service = ""
 
@@ -382,6 +471,7 @@ class State:
             self.mode = OFF
             self.proxy = None
             self.reason = ""
+            self.kind = ""
             self.exit_ip = None
             self.service = ""
 
@@ -411,6 +501,13 @@ class State:
                 "mode": self.mode,
                 "on": self.mode == ON,
                 "reason": self.reason,
+                # Only meaningful while failed, and only ever one of vpn.KINDS.
+                # `headline`/`advice` are carried alongside so every surface --
+                # the pill, cb:vpn, `cbctl vpn` -- says the same sentence about
+                # the same failure instead of each writing its own.
+                "kind": self.kind,
+                "headline": headline(self.kind) if self.mode == FAILED else "",
+                "advice": advice(self.kind) if self.mode == FAILED else "",
                 "proxy": self.proxy.safe() if self.proxy else "",
                 "exit_ip": self.exit_ip,
                 "service": self.service,
@@ -498,8 +595,11 @@ def open_tunnel(proxy, host, port, timeout, context=None):
     request, which is what lets the caller own the timing and the failure.
     """
     if not proxy.tunnels:
+        # CONFIG, not CONNECTION: nothing was dialled and nothing was wrong with
+        # the network. The proxy URL simply names a scheme this build cannot
+        # tunnel through, and the fix is one line in the settings file.
         raise ProbeError("this build can only tunnel through an http:// proxy, "
-                         "not %s://" % proxy.scheme)
+                         "not %s://" % proxy.scheme, CONFIG)
     conn = http.client.HTTPSConnection(proxy.host, proxy.port, timeout=timeout,
                                        context=context)
     conn.set_tunnel(host, port, headers=proxy.connect_headers())
@@ -519,16 +619,27 @@ def _as_ip(body):
         return str(ipaddress.ip_address(token))
     except ValueError:
         if not token:
-            raise ProbeError("answered with nothing")
+            raise ProbeError("answered with nothing", VERIFY)
         shown = token[:60] + ("…" if len(token) > 60 else "")
-        raise ProbeError("answered with %r, which is not an address" % shown)
+        raise ProbeError("answered with %r, which is not an address" % shown,
+                         VERIFY)
 
 
 def _echo_once(proxy, url, timeout, opener=None):
     parts = urllib.parse.urlsplit(url)
     host, port = parts.hostname, parts.port or 443
     path = parts.path or "/"
-    conn = (opener or open_tunnel)(proxy, host, port, timeout)
+    # Opening the tunnel is the one step that is purely about reachability: it
+    # is the CONNECT to the proxy itself, before any echo service is involved.
+    # Classifying it here rather than in the caller is what separates "the proxy
+    # is not there" from "the proxy is there and something later went wrong" --
+    # the distinction that made the tailnet outage read as a generic failure.
+    try:
+        conn = (opener or open_tunnel)(proxy, host, port, timeout)
+    except ProbeError:
+        raise                          # already classified (a bad scheme, say)
+    except (OSError, http.client.HTTPException) as e:
+        raise ProbeError(str(e) or type(e).__name__, CONNECTION)
     try:
         conn.request("GET", path, headers={
             "Host": host,
@@ -543,10 +654,24 @@ def _echo_once(proxy, url, timeout, opener=None):
         if response.status != 200:
             # 407 is the interesting one: the tunnel reached the proxy and the
             # credential was wrong, which is a different fix from "unreachable".
+            # It is CONFIG rather than BACKEND for exactly that reason -- the
+            # server is healthy and answering; the password in the settings file
+            # is what is wrong, and that is where the user has to go.
+            #
+            # 502/503/504 are the proxy saying it could not reach the site
+            # beyond it, which is the one shape that is genuinely the backend's
+            # problem. Anything else got through the tunnel and came back
+            # unusable, so it is a verification failure like a captive portal.
+            if response.status == 407:
+                kind = CONFIG
+            elif response.status in (502, 503, 504):
+                kind = BACKEND
+            else:
+                kind = VERIFY
             raise ProbeError("HTTP %s from the proxy or the echo service%s"
                              % (response.status,
                                 " (the proxy rejected the credential)"
-                                if response.status == 407 else ""))
+                                if response.status == 407 else ""), kind)
         return _as_ip(body)
     finally:
         try:
@@ -565,11 +690,43 @@ def probe_exit_ip(proxy, echoes=ECHOES, timeout=PROBE_TIMEOUT, opener=None):
     Returns `(exit_ip, service)`. Raises `ProbeError` naming what each service
     said, with the password stripped out of every one of those messages.
     """
-    problems = []
+    problems, kinds = [], []
     for url in echoes:
         host = urllib.parse.urlsplit(url).hostname or url
         try:
             return _echo_once(proxy, url, timeout, opener), host
         except Exception as e:
             problems.append("%s: %s" % (host, proxy.redact(str(e) or type(e).__name__)))
-    raise ProbeError("; ".join(problems) or "no echo service was tried")
+            # An exception that is not a ProbeError got past every classified
+            # raise site above, so the honest label is VERIFY -- the check did
+            # not confirm an address -- and not a guess at a cause.
+            kinds.append(getattr(e, "kind", VERIFY))
+    raise ProbeError("; ".join(problems) or "no echo service was tried",
+                     combine_kinds(kinds))
+
+
+def combine_kinds(kinds):
+    """One kind for a whole sweep, from the per-echo kinds.
+
+    All three echoes go through the *same* proxy hop and then to three different
+    services, and that asymmetry is what makes the answer decidable. A failure
+    they all share is a statement about the shared hop; a failure only some of
+    them have cannot be.
+
+    - Unanimous: say that. Three CONNECTIONs mean nothing answered at the proxy.
+    - Only CONNECTION and BACKEND, mixed: at least one echo got a reply out of
+      the proxy, so the proxy hop is up and the exit is what is failing.
+      Reporting CONNECTION here would send someone to check a tailnet that is
+      demonstrably working.
+    - Anything else: VERIFY. Mixed causes mean no single one is established, and
+      "could not be verified" is the one description that is true regardless --
+      which is also exactly what the mode enforces.
+    """
+    unique = set(kinds)
+    if not unique:
+        return UNKNOWN
+    if len(unique) == 1:
+        return unique.pop()
+    if unique <= {CONNECTION, BACKEND}:
+        return BACKEND
+    return VERIFY

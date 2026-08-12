@@ -2565,11 +2565,17 @@ class Browser(Gtk.Window):
         if vpn.STATE.blocks_navigation and not (
                 url or "").lower().startswith(VPN_LOCAL_SCHEMES):
             return done({"ok": False, "vpn": vpn.snapshot(),
-                         "error": "refused: VPN Mode is on and its proxy is not "
-                                  "working (%s). Nothing is loaded from this "
-                                  "machine's own address instead -- fix the "
-                                  "proxy, or turn VPN Mode off with `cbctl vpn "
-                                  "off`." % (vpn.STATE.reason or "no reason recorded")})
+                         # Headline, advice, then the raw reason. An agent
+                         # reading this is the caller most likely to act on it,
+                         # and "could not be reached" vs "misconfigured" is the
+                         # difference between retrying later and never.
+                         "error": "refused: %s. %s (%s) Nothing is loaded from "
+                                  "this machine's own address instead -- fix "
+                                  "that, or turn VPN Mode off with `cbctl vpn "
+                                  "off`."
+                                  % (vpn.headline(vpn.STATE.kind),
+                                     vpn.advice(vpn.STATE.kind),
+                                     vpn.STATE.reason or "no reason recorded")})
 
         if len(self._queue) >= MAX_QUEUED_LOADS:
             return done({
@@ -4421,7 +4427,7 @@ class Browser(Gtk.Window):
         vpn.STATE.refuse(reason)
         self._vpn_paint()
         self._reload_internal()
-        self._flash("VPN Mode failed")
+        self._flash("%s — %s" % (vpn.headline(vpn.CONFIG), vpn.advice(vpn.CONFIG)))
         if then:
             then(vpn.snapshot())
 
@@ -4432,9 +4438,12 @@ class Browser(Gtk.Window):
         answer -- the whole mode goes to failed and the next navigation is
         refused with the reason on cb:vpn.
         """
-        if vpn.STATE.fail(vpn.STATE.attempt, reason):
+        # CONFIG: this path is reached when a view could not be put behind the
+        # proxy at all, which is a fault in how the mode was applied rather than
+        # anything the network did.
+        if vpn.STATE.fail(vpn.STATE.attempt, reason, vpn.CONFIG):
             self._vpn_paint()
-            self._flash("VPN Mode failed")
+            self._flash(vpn.headline(vpn.CONFIG))
 
     def _vpn_probe(self, attempt, proxy, then=None):
         """Ask an outside service, through the proxy, what address it sees.
@@ -4455,14 +4464,20 @@ class Browser(Gtk.Window):
                 exit_ip, service = vpn.probe_exit_ip(proxy)
             except Exception as e:
                 reason = proxy.redact(str(e) or type(e).__name__)
-                landed(lambda: self._vpn_verdict(attempt, None, "", reason, then))
+                # The kind is decided in vpn.py, where the raise sites are, and
+                # only carried here. An exception with no kind never came from
+                # the probe, so it is UNKNOWN rather than a guess.
+                kind = getattr(e, "kind", vpn.UNKNOWN)
+                landed(lambda: self._vpn_verdict(attempt, None, "", reason,
+                                                 then, kind))
             else:
                 landed(lambda: self._vpn_verdict(attempt, exit_ip, service, "",
                                                  then))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _vpn_verdict(self, attempt, exit_ip, service, reason, then=None):
+    def _vpn_verdict(self, attempt, exit_ip, service, reason, then=None,
+                     kind=vpn.UNKNOWN):
         """What the exit check found, back on the main loop.
 
         `then` is called whether or not the result was still wanted, because it
@@ -4476,8 +4491,14 @@ class Browser(Gtk.Window):
             note = "VPN Mode on — the world sees %s" % exit_ip
         else:
             moved = vpn.STATE.fail(
-                attempt, "the exit check did not get an address back: %s" % reason)
-            note = "VPN Mode failed — the exit could not be verified"
+                attempt, "the exit check did not get an address back: %s" % reason,
+                kind)
+            # The headline names which of the four ways it failed, so the toast
+            # is actionable on its own: "the VPN proxy could not be reached" and
+            # "VPN Mode is misconfigured" send someone to two different places,
+            # and "could not be verified" -- which this said for all of them --
+            # sent them to neither.
+            note = "%s — %s" % (vpn.headline(kind), vpn.advice(kind))
         if moved:
             self._vpn_paint()
             self._reload_internal()

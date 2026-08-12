@@ -47,6 +47,28 @@ setup() {
     # leave stale accepts behind.
     $ipt -N "$CHAIN" 2>/dev/null || $ipt -F "$CHAIN"
 
+    # First rule, before any deny: reply traffic on a connection somebody else
+    # opened is not egress, and matching it against the deny-list broke the whole
+    # proxy.
+    #
+    # The deny-list matches on *destination*, which is right for a connection the
+    # container dials and wrong for one it merely answers. A client on the
+    # tailnet connects to 100.91.16.6:8888; the container's SYN-ACK goes back to
+    # 100.91.16.6, which is inside 100.64.0.0/10, so the rule meant to stop the
+    # container reaching the tailnet rejected the proxy's own replies to it. And
+    # since the published port is bound to the tailnet address, every legitimate
+    # client is a tailnet client -- so the proxy accepted connections and could
+    # never answer one. It showed up as a plain TCP timeout from the laptop, with
+    # the container "Up", tinyproxy listening, and its log empty, because the
+    # request never completed a handshake and so was never a request. The tell
+    # was the socket sitting in SYN_RECV in the container's /proc/net/tcp.
+    #
+    # This does not loosen the SSRF filter it sits above. A connection the
+    # container *initiates* into private space is ctstate NEW, matches nothing
+    # here, and falls through to the same REJECT as before; only packets belonging
+    # to an already-established flow are let past.
+    $ipt -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
     local net
     for net in "${denies[@]}"; do
         $ipt -A "$CHAIN" -s "$subnet" -d "$net" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null \
@@ -79,6 +101,10 @@ case "${1:-up}" in
         # flips enable_ipv6 the filter should already be there rather than
         # becoming a silent hole.
         ip6tables -N "$CHAIN" 2>/dev/null || ip6tables -F "$CHAIN"
+        # Same exemption, same reason as the v4 chain above. Installed now rather
+        # than the day IPv6 is enabled, so this chain cannot come alive already
+        # carrying the bug the v4 one just had.
+        ip6tables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
         for net in "${DENY6[@]}"; do
             ip6tables -A "$CHAIN" -d "$net" -j REJECT
         done

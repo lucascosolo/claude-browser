@@ -574,3 +574,177 @@ class PageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class FailureKindTest(unittest.TestCase):
+    """Which of the four ways it failed, decided from what actually happened.
+
+    The point of these is that "VPN mode failed" was one sentence covering four
+    unrelated problems with four different fixes, in four different places. What
+    is pinned here is the classification, because that is the part a user acts
+    on -- an unreachable proxy and a wrong password are not the same errand.
+    """
+
+    def opener_raising(self, error):
+        def open_it(proxy, host, port, timeout):
+            raise error
+        return open_it
+
+    def opener_answering(self, answer):
+        def open_it(proxy, host, port, timeout):
+            return FakeTunnel(answer)
+        return open_it
+
+    def probe(self, opener):
+        with self.assertRaises(vpn.ProbeError) as caught:
+            vpn.probe_exit_ip(vpn.parse_proxy(PROXY), opener=opener)
+        return caught.exception
+
+    def test_nothing_answering_is_a_connection_failure(self):
+        """The tailnet outage this was written for: the proxy accepted no
+        connection at all, so the errand is reachability and not settings."""
+        error = self.probe(self.opener_raising(TimeoutError("timed out")))
+        self.assertEqual(vpn.CONNECTION, error.kind)
+
+    def test_a_refused_socket_is_also_a_connection_failure(self):
+        error = self.probe(self.opener_raising(ConnectionRefusedError("nope")))
+        self.assertEqual(vpn.CONNECTION, error.kind)
+
+    def test_a_rejected_credential_is_a_configuration_failure(self):
+        """407 means the proxy was reached and answered. The server is healthy;
+        the password in the settings file is not -- so this must not send anyone
+        to check whether the VPS is up."""
+        error = self.probe(self.opener_answering((407, "denied")))
+        self.assertEqual(vpn.CONFIG, error.kind)
+
+    def test_a_bad_gateway_is_a_backend_failure(self):
+        """The proxy answered and said it could not reach the site: the tunnel
+        works and the exit does not."""
+        error = self.probe(self.opener_answering((502, "bad gateway")))
+        self.assertEqual(vpn.BACKEND, error.kind)
+
+    def test_a_scheme_this_build_cannot_tunnel_is_configuration(self):
+        with self.assertRaises(vpn.ProbeError) as caught:
+            vpn.probe_exit_ip(vpn.parse_proxy("socks5://box:1080"))
+        self.assertEqual(vpn.CONFIG, caught.exception.kind)
+
+    def test_a_reply_that_is_not_an_address_is_a_verification_failure(self):
+        """A captive portal, or anything else that answers 200 with prose. The
+        tunnel carried it; it just does not prove where traffic leaves from."""
+        error = self.probe(self.opener_answering("<html>sign in</html>"))
+        self.assertEqual(vpn.VERIFY, error.kind)
+
+    def test_an_empty_reply_is_a_verification_failure(self):
+        self.assertEqual(vpn.VERIFY, self.probe(self.opener_answering("")).kind)
+
+    def test_the_password_is_still_redacted_out_of_every_kind(self):
+        """Classification must not have opened a route for the credential into a
+        message: the reason is still built through `redact`."""
+        error = self.probe(self.opener_raising(OSError(PROXY)))
+        self.assertNotIn("s3cr3t", str(error))
+
+
+class CombineKindsTest(unittest.TestCase):
+    """Three echoes, one shared proxy hop: what a mixed sweep is allowed to
+    conclude. The asymmetry is the whole argument -- a failure all three share
+    is about the hop they share, and one only some of them have is not."""
+
+    def test_unanimous_is_reported_as_itself(self):
+        for kind in (vpn.CONNECTION, vpn.CONFIG, vpn.BACKEND, vpn.VERIFY):
+            with self.subTest(kind=kind):
+                self.assertEqual(kind, vpn.combine_kinds([kind] * 3))
+
+    def test_a_reply_from_any_echo_rules_out_an_unreachable_proxy(self):
+        """One echo got an answer out of the proxy, so the proxy hop is up.
+        Calling this CONNECTION would send someone to check a tailnet that is
+        demonstrably working."""
+        self.assertEqual(vpn.BACKEND,
+                         vpn.combine_kinds([vpn.CONNECTION, vpn.BACKEND]))
+
+    def test_mixed_causes_are_reported_as_unverified(self):
+        """No single cause is established, and 'could not be verified' is the
+        one description that is true regardless -- and is what the mode is
+        actually enforcing."""
+        self.assertEqual(vpn.VERIFY,
+                         vpn.combine_kinds([vpn.CONFIG, vpn.VERIFY]))
+
+    def test_no_failures_at_all_is_unknown_rather_than_a_guess(self):
+        self.assertEqual(vpn.UNKNOWN, vpn.combine_kinds([]))
+
+
+class FailureStateTest(unittest.TestCase):
+    """The kind has to survive into the snapshot every surface reads, and has
+    to disappear again when the failure does."""
+
+    def setUp(self):
+        self.state = vpn.State()
+
+    def test_a_failure_carries_its_kind_and_a_headline(self):
+        self.state.engage(vpn.parse_proxy(PROXY))
+        self.state.fail(self.state.attempt, "timed out", vpn.CONNECTION)
+        snap = self.state.snapshot()
+        self.assertEqual(vpn.CONNECTION, snap["kind"])
+        self.assertEqual(vpn.headline(vpn.CONNECTION), snap["headline"])
+        self.assertTrue(snap["advice"])
+
+    def test_the_four_kinds_read_differently(self):
+        """The whole point: four failures must not produce one sentence."""
+        said = {vpn.headline(k) for k in
+                (vpn.CONFIG, vpn.CONNECTION, vpn.BACKEND, vpn.VERIFY)}
+        self.assertEqual(4, len(said))
+
+    def test_refusing_is_a_configuration_failure(self):
+        self.state.refuse("no proxy is set")
+        self.assertEqual(vpn.CONFIG, self.state.snapshot()["kind"])
+
+    def test_success_clears_the_kind(self):
+        """A stale kind outliving its failure would label a working mode."""
+        self.state.engage(vpn.parse_proxy(PROXY))
+        self.state.fail(self.state.attempt, "timed out", vpn.CONNECTION)
+        self.state.verified(self.state.attempt, "162.35.172.112", "ipify.org")
+        snap = self.state.snapshot()
+        self.assertEqual("", snap["kind"])
+        self.assertEqual("", snap["headline"])
+
+    def test_turning_it_off_clears_the_kind(self):
+        self.state.refuse("no proxy is set")
+        self.state.disengage()
+        self.assertEqual("", self.state.snapshot()["kind"])
+
+    def test_an_unclassified_failure_is_labelled_unknown_not_blank(self):
+        self.state.engage(vpn.parse_proxy(PROXY))
+        self.state.fail(self.state.attempt, "something")
+        self.assertEqual(vpn.UNKNOWN, self.state.snapshot()["kind"])
+
+    def test_every_kind_has_a_headline_and_advice(self):
+        for kind in vpn.KINDS:
+            with self.subTest(kind=kind):
+                self.assertTrue(vpn.headline(kind))
+                self.assertTrue(vpn.advice(kind))
+
+    def test_an_unheard_of_kind_degrades_rather_than_raising(self):
+        """A new kind added without its strings must not stop the browser."""
+        self.assertTrue(vpn.headline("something-new"))
+        self.assertTrue(vpn.advice("something-new"))
+
+
+class FailurePageTest(unittest.TestCase):
+    """cb:vpn has to say which failure it is, and stay injection-proof."""
+
+    def render(self, state):
+        return pages.vpn_page(style.palette("phosphor"), "n0nce", state)
+
+    def test_the_failure_kind_reaches_the_page(self):
+        state = vpn.State()
+        state.engage(vpn.parse_proxy(PROXY))
+        state.fail(state.attempt, "timed out", vpn.CONNECTION)
+        html = self.render(state.snapshot())
+        self.assertIn(vpn.headline(vpn.CONNECTION), html)
+
+    def test_a_working_mode_shows_no_failure_row(self):
+        state = vpn.State()
+        state.engage(vpn.parse_proxy(PROXY))
+        state.verified(state.attempt, "162.35.172.112", "ipify.org")
+        html = self.render(state.snapshot())
+        for kind in (vpn.CONFIG, vpn.CONNECTION, vpn.BACKEND, vpn.VERIFY):
+            self.assertNotIn(vpn.headline(kind), html)

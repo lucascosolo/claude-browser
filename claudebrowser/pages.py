@@ -389,7 +389,15 @@ def vpn_page(palette, nonce, state):
     mode = state.get("mode") or "off"
     label, tone, blurb = _VPN_STATES.get(mode, _VPN_STATES["off"])
 
+    # A failure gets its own row naming which of the four kinds it was. The
+    # state row says "Failed" for all of them, which is the thing that made the
+    # mode frustrating to fix: it could not distinguish a proxy nobody could
+    # reach from a password that was wrong, and both read as "VPN mode failed".
     facts = [_fact("State", label)]
+    if mode == "failed" and state.get("headline"):
+        facts.append(_fact("What went wrong", state["headline"]))
+        if state.get("advice"):
+            facts.append(_fact("What to try", state["advice"]))
     if state.get("exit_ip"):
         facts.append(_fact("Address the world sees", state["exit_ip"]))
         if state.get("service"):
