@@ -17,6 +17,7 @@ the same table control.py serves and cb-mcp exposes. When they were three lists,
 """
 
 import argparse
+import getpass
 import json
 import sys
 from pathlib import Path
@@ -39,7 +40,9 @@ def build_parser():
         command = sub.add_parser(alias_of.get(op.name, op.name), help=op.summary)
         command.set_defaults(op=op)
         for param in op.params:
-            if param.cli == "arg":
+            if param.cli == "secret":
+                continue  # prompted for interactively in main(), never a CLI arg
+            elif param.cli == "arg":
                 command.add_argument(param.name, help=param.help or None)
             elif param.cli == "optarg":
                 command.add_argument(param.name, nargs="?", help=param.help or None)
@@ -55,7 +58,12 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     op = args.op
 
-    params = {p.name: getattr(args, p.name, None) for p in op.params}
+    params = {p.name: getattr(args, p.name, None) for p in op.params if p.cli != "secret"}
+    for p in op.params:
+        # Typed straight into this terminal via getpass -- never an argv entry
+        # (shell history, `ps aux`) and never text this session's model sees.
+        if p.cli == "secret":
+            params[p.name] = getpass.getpass((p.help or p.name).rstrip(".") + ": ")
     if op.tab:
         params["tab"] = args.tab
 

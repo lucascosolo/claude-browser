@@ -30,7 +30,7 @@ EVERY_KEY = (
     "CB_AUTH", "CB_AUTOSTART", "CB_BLOCK", "CB_COOKIES", "CB_GPU", "CB_HOME",
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
     "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
-    "CB_QUEUE_LIST",
+    "CB_QUEUE_LIST", "CB_RESTORE_SESSION",
     "CB_SCRUB", "CB_SEARCH", "CB_SEARCH_LANG", "CB_SITERULES", "CB_THEME", "CB_TOKEN", "CB_URL", "CB_VPN",
     "CB_VPN_PROXY", "CB_WEBGL", "CB_YT_EMBED",
 )
@@ -315,10 +315,10 @@ class TestReset(Isolated):
         """Writing the default back would pin it: a later release that ships a
         better default would never reach anyone who pressed this button."""
         self.apply("CB_MAX_TABS", "3")
-        self.assertEqual(self.reset("CB_MAX_TABS"), "10")
+        self.assertEqual(self.reset("CB_MAX_TABS"), "24")
         self.assertNotIn("CB_MAX_TABS", self.path.read_text())
         block = self.item("CB_MAX_TABS")
-        self.assertEqual(block["value"], "10")
+        self.assertEqual(block["value"], "24")
         self.assertEqual(block["source"], "default")
         self.assertFalse(block["in_file"])
 

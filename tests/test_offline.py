@@ -420,14 +420,22 @@ class TestApiRegistry(unittest.TestCase):
             "/navigate": {"url": "x.com"}, "/back": {}, "/forward": {}, "/reload": {},
             "/close": {}, "/wait": {}, "/text": {}, "/markdown": {}, "/links": {},
             "/html": {}, "/reader": {}, "/simplify": {},
-            "/find": {"q": "a"}, "/click": {"selector": "a"},
-            "/fill": {"selector": "a", "value": "b"}, "/eval": {"js": "1"},
+            "/find": {"q": "a"}, "/snapshot": {}, "/click": {"selector": "a"},
+            "/fill": {"selector": "a", "value": "b"},
+            "/fill/many": {"fields": '{"a": "b"}'}, "/eval": {"js": "1"},
             "/console": {}, "/screenshot": {}, "/recall": {"q": "a"},
             "/machine": {}, "/discard": {}, "/storage": {},
             "/clear": {"kind": "pagetext"},
             "/playbook/record": {"action": "status"}, "/playbook/list": {},
             "/playbook/run": {"name": "login"}, "/playbook/delete": {"name": "login"},
             "/persona": {}, "/settings": {}, "/vpn": {},
+            "/blocked": {}, "/profile": {}, "/profile/set": {"key": "first_name"},
+            "/bookmarks": {}, "/bookmark/add": {},
+            "/bookmark/remove": {"url": "https://example.com"},
+            "/history": {"q": "a"}, "/history/clear": {}, "/downloads": {},
+            "/import-chrome": {},
+            "/passwords/save": {"origin": "https://example.com", "username": "a",
+                                "password": "b"},
         }
         # /health is served without touching the browser, so it has no builder.
         callable_routes = {op.route for op in self.api.OPS if op.call}
@@ -451,9 +459,57 @@ class TestApiRegistry(unittest.TestCase):
     def test_health_needs_no_browser(self):
         self.assertIsNone(self.api.BY_NAME["health"].call)
 
+    def test_snapshot_dispatches_to_its_own_browser_method(self):
+        method, call_args = self.dispatch("/snapshot", {"tab": "3"})
+        self.assertEqual(method, "api_snapshot")
+        self.assertEqual(call_args, (3,))
+
+    def test_fill_many_dispatches_the_raw_fields_json_untouched(self):
+        # api.py never parses `fields` itself -- resolving {profile:key}
+        # placeholders happens natively in Browser.api_fill_many, never here.
+        method, call_args = self.dispatch(
+            "/fill/many", {"fields": '{"#email": "{profile:email}"}'})
+        self.assertEqual(method, "api_fill_many")
+        self.assertEqual(call_args, (None, '{"#email": "{profile:email}"}'))
+
+    def test_click_and_fill_document_ref_targeting(self):
+        # Snapshot's refs are the whole point of the feature -- an agent must
+        # be told it can pass one to click/fill without reading extract.py.
+        self.assertIn("@ref", self.api.BY_NAME["click"].summary)
+        self.assertIn("@ref", self.api.BY_NAME["fill"].summary)
+        self.assertIn("@ref", self.api.BY_NAME["fill-many"].summary)
+
     def test_missing_parameter_is_reported_as_a_key_error(self):
         with self.assertRaises(KeyError):
             self.dispatch("/click", {})
+
+    def test_bookmark_add_defaults_to_the_tabs_own_url_and_title(self):
+        # api.py never resolves the tab's own url/title itself -- that is
+        # Browser.api_bookmark_add's job, reusing the same lookup
+        # toggle_bookmark already does. Here it must simply pass None through.
+        method, call_args = self.dispatch("/bookmark/add", {})
+        self.assertEqual(method, "api_bookmark_add")
+        self.assertEqual(call_args, (None, None, None))
+
+    def test_bookmark_add_carries_an_explicit_url_and_title(self):
+        method, call_args = self.dispatch(
+            "/bookmark/add", {"url": "https://example.com", "title": "Example"})
+        self.assertEqual(call_args, (None, "https://example.com", "Example"))
+
+    def test_bookmark_remove_requires_a_url(self):
+        with self.assertRaises(KeyError):
+            self.dispatch("/bookmark/remove", {})
+
+    def test_history_requires_a_query(self):
+        with self.assertRaises(KeyError):
+            self.dispatch("/history", {})
+        method, call_args = self.dispatch("/history", {"q": "example", "limit": "5"})
+        self.assertEqual(method, "api_history")
+        self.assertEqual(call_args, ("example", "5"))
+
+    def test_bookmarks_history_and_downloads_are_tab_free(self):
+        for name in ("bookmarks", "history", "downloads"):
+            self.assertFalse(self.api.BY_NAME[name].tab, name)
 
     def test_tab_defaults_to_focused(self):
         self.assertIsNone(self.dispatch("/text", {})[1][0])
@@ -489,6 +545,45 @@ class TestApiRegistry(unittest.TestCase):
         # be able to do to the user's focus mid-task.
         self.assertNotIn("browser_present", tools)
         self.assertNotIn("browser_health", tools)
+        self.assertIn("browser_blocked", tools)
+        self.assertIn("browser_profile", tools)
+        self.assertIn("browser_snapshot", tools)
+        self.assertIn("browser_fill-many", tools)
+        # Writing the user's own profile is not something an agent should be
+        # able to do as a side effect of some other goal -- same reasoning as
+        # settings/persona.
+        self.assertNotIn("browser_profile-set", tools)
+        # Reading bookmarks/history/downloads and adding a bookmark are fine
+        # for an agent; deleting a bookmark, wiping all history, and other
+        # destructive/user-preference actions are not -- same reasoning as
+        # `clear` and `settings`.
+        self.assertIn("browser_bookmarks", tools)
+        self.assertIn("browser_bookmark-add", tools)
+        self.assertIn("browser_history", tools)
+        self.assertIn("browser_downloads", tools)
+        self.assertNotIn("browser_bookmark-remove", tools)
+        self.assertNotIn("browser_history-clear", tools)
+        self.assertNotIn("browser_import-chrome", tools)
+        self.assertNotIn("browser_save-password", tools)
+
+    def test_import_chrome_is_registered_and_not_an_mcp_tool(self):
+        op = next(o for o in self.api.OPS if o.name == "import-chrome")
+        self.assertEqual(op.method, "POST")
+        self.assertFalse(op.mcp)
+        self.assertFalse(op.tab)
+        tools = {t["name"] for t in self.api.mcp_tools()}
+        self.assertNotIn("browser_import-chrome", tools)
+
+    def test_save_password_is_registered_not_an_mcp_tool_and_not_replayable(self):
+        from claudebrowser import playbooks
+
+        op = next(o for o in self.api.OPS if o.name == "save-password")
+        self.assertEqual(op.method, "POST")
+        self.assertFalse(op.mcp)
+        self.assertFalse(op.tab)
+        password_param = next(p for p in op.params if p.name == "password")
+        self.assertEqual(password_param.cli, "secret")
+        self.assertIsNone(playbooks.replayable("save-password"))
 
 
 class TestCbctlSurface(unittest.TestCase):

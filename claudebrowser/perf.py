@@ -126,25 +126,28 @@ HINTS = {"Save-Data": "on"}
 
 
 def light_enabled(raw=None, path=None):
-    """Is light mode on? Default yes.
+    """Is light mode on? Default no.
 
-    On by default for the same reason the ad blocker is: this browser exists for
-    a two-core laptop, and a hint that asks for fewer bytes costs a page nothing
-    it can notice. `CB_LIGHT=0` turns it off when a site serves a degraded page
-    you did not want.
+    Off by default: the CPU-conservation rationale that used to justify this
+    was written for a two-core laptop, and this browser now runs on hardware
+    with cores and RAM to spare, where degrading every page's assets by
+    default costs more in broken layouts and stripped-down sites than it saves.
+    `CB_LIGHT=1` turns it back on for anyone still running this on constrained
+    hardware.
 
     Read from the settings file on every call, like the persona is: the switch
     on cb:data writes that file, and a value captured at import would leave the
     browser sending a hint the user has just turned off until it was restarted.
-    `envfile.setting` falls back to the environment, so `CB_LIGHT=0 ./cb` still
+    `envfile.setting` falls back to the environment, so `CB_LIGHT=1 ./cb` still
     works for one session.
 
-    Anything unrecognised means on, matching CB_BLOCK: a typo should not
-    silently remove a default the user never asked to lose.
+    Only the words that unambiguously mean "on" count, matching
+    `ai.private_ai_enabled`: a typo has to fall back to the new default (off),
+    not out of it.
     """
     if raw is None:
         raw = envfile.setting(LIGHT_ENV, "", path=path)
-    return (raw or "").strip().lower() not in ("0", "off", "false", "no")
+    return (raw or "").strip().lower() in ("1", "on", "true", "yes")
 
 
 def remember(enabled, path=None):

@@ -153,6 +153,35 @@ class InjectedScript(unittest.TestCase):
         self.assertIn("getOwnPropertyDescriptor(HTMLInputElement.prototype",
                       passwords.PASSWORD_JS)
 
+    def test_fill_no_longer_bails_out_when_no_password_field_exists(self):
+        # Regression: __cbPwFill used to `return 0` before even looking for a
+        # username field when passwords() was empty, so a username-only step
+        # of a split login (Google/Microsoft/Okta-style) never got filled.
+        fill = passwords.PASSWORD_JS.split("window.__cbPwFill = function")[1]
+        fill = fill.split("window.__cbPwFill")[0]  # just this function's body
+        self.assertNotIn("if (!fields.length) { return 0; }", fill)
+        # It must still find and fill a standalone username field on that step.
+        self.assertIn("standaloneUserField", fill)
+
+    def test_standalone_username_field_reuses_the_same_input_heuristics(self):
+        # Reuse the existing candidate shape (visible text/email/tel inputs)
+        # rather than inventing a new selector for the no-password case.
+        self.assertIn("function standaloneUserField", passwords.PASSWORD_JS)
+        self.assertIn(
+            "t === 'text' || t === 'email' || t === 'tel'",
+            passwords.PASSWORD_JS)
+
+    def test_password_field_appearing_rings_a_secret_free_doorbell(self):
+        # The SPA-transition fix: a MutationObserver watches for a password
+        # field newly showing up and pings a doorbell distinct from the
+        # credential-capture one, carrying no payload.
+        self.assertIn("MutationObserver", passwords.PASSWORD_JS)
+        self.assertIn("cbpwfield", passwords.PASSWORD_JS)
+        self.assertIn("messageHandlers.cbpwfield.postMessage(1)",
+                      passwords.PASSWORD_JS)
+        self.assertNotIn("messageHandlers.cbpwfield.postMessage(pending)",
+                         passwords.PASSWORD_JS)
+
 
 if __name__ == "__main__":
     unittest.main()

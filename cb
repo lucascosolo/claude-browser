@@ -54,8 +54,8 @@ then
     CB_IN_SCOPE=1 exec systemd-run --user --quiet --collect --scope \
         --unit="claude-browser-$$" \
         -p CPUWeight="${CB_CPU_WEIGHT:-150}" \
-        -p CPUQuota="${CB_CPU_QUOTA:-180%}" \
-        -p MemoryHigh="${CB_MEM_HIGH:-1200M}" \
+        -p CPUQuota="${CB_CPU_QUOTA:-800%}" \
+        -p MemoryHigh="${CB_MEM_HIGH:-8192M}" \
         -- "$0" "$@"
 fi
 

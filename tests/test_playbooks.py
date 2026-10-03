@@ -209,6 +209,29 @@ class TestSecretsAreNeverRecorded(unittest.TestCase):
         self.assertEqual(steps, [])
         self.assertEqual(skipped, 1)
 
+    def test_is_secret_step_checks_fill_many_keys_only(self):
+        # A fill-many step whose *selector* looks like a password field is
+        # dropped; one whose *value* merely contains the word "password" is
+        # not -- is_secret_step must never look at the value (CLAUDE.md: "A
+        # credential is never written to a playbook, not even redacted").
+        self.assertTrue(playbooks.is_secret_step(
+            "fill-many", {"fields": json.dumps({"#password": "{profile:x}"})}))
+        self.assertFalse(playbooks.is_secret_step(
+            "fill-many", {"fields": json.dumps({"#note": "my password is old"})}))
+
+    def test_fill_many_with_unparsable_fields_is_not_treated_as_secret(self):
+        self.assertFalse(playbooks.is_secret_step("fill-many", {"fields": "not json"}))
+
+    def test_a_fill_many_password_field_never_reaches_the_recording(self):
+        self.rec.start("optout")
+        self.rec.observe("open", {"url": "https://example.com/optout"})
+        self.rec.observe("fill-many", {
+            "fields": json.dumps({"#email": "{profile:email}",
+                                  "#password": "{profile:x}"})})
+        _name, steps, skipped = self.rec.stop()
+        self.assertEqual(skipped, 1)
+        self.assertEqual([s["op"] for s in steps], ["open"])
+
     def test_the_secret_is_absent_from_the_file_on_disk(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "playbooks.json"
@@ -412,6 +435,42 @@ class TestStorage(unittest.TestCase):
         from claudebrowser import store
 
         self.assertEqual(playbooks.default_path().parent, store.data_dir())
+
+    def test_save_infers_match_from_first_navigate_step(self):
+        steps = [{"op": "navigate", "params": {"url": "https://acxiom.com/optout"}},
+                 {"op": "click", "params": {"selector": "#submit"}}]
+        self.books.save("acxiom-optout", steps)
+        self.assertEqual(self.books.get("acxiom-optout")["match"], "acxiom.com")
+
+    def test_save_infers_match_from_first_open_step_when_no_navigate(self):
+        self.books.save("a", self.steps())   # steps() opens example.com first
+        self.assertEqual(self.books.get("a")["match"], "example.com")
+
+    def test_save_leaves_match_none_with_no_navigate_or_open_step(self):
+        self.books.save("noop", [{"op": "reload", "params": {}}])
+        self.assertIsNone(self.books.get("noop")["match"])
+
+    def test_matching_finds_playbooks_by_host(self):
+        self.books.save("acxiom-optout", [
+            {"op": "open", "params": {"url": "https://acxiom.com/optout"}}])
+        self.assertEqual(self.books.matching("https://acxiom.com/optout?ref=x"),
+                         ["acxiom-optout"])
+        self.assertEqual(self.books.matching("https://example.com"), [])
+
+    def test_matching_is_never_auto_replayed_just_advisory(self):
+        # matching() only ever returns names -- confirming there is no
+        # execution path from a nav result straight into playbook-run.
+        self.books.save("a", self.steps())
+        result = self.books.matching("https://example.com/anything")
+        self.assertIsInstance(result, list)
+        self.assertTrue(all(isinstance(n, str) for n in result))
+
+    def test_placeholder_round_trips_unresolved_through_save_and_replay(self):
+        steps = [{"op": "fill-many",
+                  "params": {"fields": json.dumps({"#email": "{profile:email}"})}}]
+        self.books.save("test", steps)
+        saved = self.books.get("test")["steps"]
+        self.assertIn("{profile:email}", saved[0]["params"]["fields"])
 
 
 class TestPage(unittest.TestCase):

@@ -53,6 +53,11 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     added INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS bookmarks_added ON bookmarks(added DESC);
+
+CREATE TABLE IF NOT EXISTS session_tabs (
+    rowid INTEGER PRIMARY KEY,
+    url   TEXT NOT NULL
+);
 """
 
 
@@ -230,6 +235,23 @@ class Store:
                    ORDER BY last_visit DESC, rowid DESC LIMIT -1 OFFSET ?)""",
             (keep,))
 
+    def import_history(self, entries):
+        """Fill-gaps-only import: entries are (url, title, visits,
+        last_visit_epoch). Same untouched-if-present rule as
+        import_bookmarks. Returns the count actually inserted."""
+        existing = {r["url"] for r in self._query("SELECT url FROM history")}
+        inserted = 0
+        for url, title, visits, last_visit in entries:
+            if not recordable(url) or url in existing:
+                continue
+            self._write(
+                "INSERT OR IGNORE INTO history (url, title, visits, last_visit) "
+                "VALUES (?, ?, ?, ?)",
+                (url, title or "", visits, last_visit))
+            existing.add(url)
+            inserted += 1
+        return inserted
+
     # -- bookmarks ----------------------------------------------------------
 
     def bookmark(self, url, title=""):
@@ -273,6 +295,34 @@ class Store:
                    ORDER BY added DESC LIMIT ?""", (like, like, limit))
         return self._query(
             "SELECT url, title, added FROM bookmarks ORDER BY added DESC LIMIT ?", (limit,))
+
+    def import_bookmarks(self, entries):
+        """Fill-gaps-only import: entries are (url, title, added_epoch), and
+        a url already present is left completely untouched -- an import must
+        never overwrite something the user saved natively. Returns the count
+        actually inserted."""
+        existing = {r["url"] for r in self._query("SELECT url FROM bookmarks")}
+        inserted = 0
+        for url, title, added in entries:
+            if not recordable(url) or url in existing:
+                continue
+            self._write(
+                "INSERT OR IGNORE INTO bookmarks (url, title, added) VALUES (?, ?, ?)",
+                (url, title or "", added))
+            existing.add(url)
+            inserted += 1
+        return inserted
+
+    # -- session restore -----------------------------------------------------
+
+    def save_session_tabs(self, urls):
+        self._write("DELETE FROM session_tabs")
+        for url in urls:
+            self._write("INSERT INTO session_tabs (url) VALUES (?)", (url,))
+
+    def session_tabs(self):
+        return [r["url"] for r in
+                self._query("SELECT url FROM session_tabs ORDER BY rowid")]
 
     # -- the omnibox --------------------------------------------------------
 

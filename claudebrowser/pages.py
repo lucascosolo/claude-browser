@@ -38,6 +38,9 @@ NAV = (
     ("cb:passwords", "Logins",
      "M6 10V7a6 6 0 1 1 12 0v3h1a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1"
      " 0 0 1 1-1zm2 0h8V7a4 4 0 0 0-8 0z"),
+    ("cb:profile", "Profile",
+     "M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 "
+     "1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"),
     ("cb:playbooks", "Playbooks",
      "M4 6h10M4 12h7M4 18h7M15 12.5l6 3.5-6 3.5z"),
     ("cb:data", "Data",
@@ -599,6 +602,60 @@ def _never_row(origin):
     </div>""" % {
         "hue": hue, "letter": _e(letter), "origin": _e(origin), "jo": _js(origin),
     }
+
+
+def profile_page(palette, nonce, fields, available=True):
+    """The stored personal-info profile used to fill out forms.
+
+    Unlike passwords, values are rendered in the clear: a profile field exists
+    specifically so it can be read -- by the user here, and by an agent over
+    the control API -- so there is no secret to hide until asked for.
+    """
+    if not available:
+        return shell("Profile", palette, nonce, "cb:profile", _empty(
+            "&#128100;", "The system keyring is unavailable",
+            "The profile is stored in the freedesktop Secret Service. On this "
+            "desktop that is <code>gnome-keyring</code> — start it and reopen "
+            "the browser."))
+
+    if fields:
+        body = '<div class="rows">%s</div>' % "".join(
+            _profile_row(k, v) for k, v in sorted(fields.items()))
+    else:
+        body = _empty("&#128100;", "No profile fields saved",
+                      "Add a field below — name, address and contact fields "
+                      "an agent can use to fill out forms on your behalf.")
+    return shell("Profile", palette, nonce, "cb:profile", body + _profile_add_row())
+
+
+def _profile_row(key, value):
+    return """
+    <div class="row set">
+      <span class="sl"><span class="rt">%(key)s</span></span>
+      <span class="sc">
+        <input class="sin" type="text" value="%(value)s" data-k="%(dkey)s"
+               autocomplete="off" spellcheck="false">
+        <button class="pbbtn" onclick="return cbui.pfsave(event, %(jkey)s)">Save</button>
+        <button class="pbbtn" onclick="return cbui.pfdrop(event, %(jkey)s)">Delete</button>
+      </span>
+    </div>""" % {
+        "key": _e(key), "value": _e(value or ""), "dkey": _e(key), "jkey": _js(key),
+    }
+
+
+def _profile_add_row():
+    return """
+    <div class="row set">
+      <span class="sl"><span class="rt">Add a field</span>
+        <span class="sx">e.g. first_name, address_line1, email</span></span>
+      <span class="sc">
+        <input class="sin" id="pfkey" type="text" placeholder="field name"
+               autocomplete="off" spellcheck="false">
+        <input class="sin" id="pfval" type="text" placeholder="value"
+               autocomplete="off" spellcheck="false">
+        <button class="pbbtn" onclick="return cbui.pfadd(event)">Add</button>
+      </span>
+    </div>"""
 
 
 def playbooks_page(palette, nonce, books, recording=None, available=True):
@@ -1650,6 +1707,29 @@ _DOC = """<!doctype html>
       if (el) { el.style.transition = 'opacity .12s'; el.style.opacity = '0';
                 setTimeout(function () { el.remove(); }, 120); }
       return this.send({action: 'pw_allow', url: origin});
+    },
+    // cb:profile. Same fixed {action, url, title} shape as set_setting: the
+    // field name travels as url, the value as title.
+    pfsave: function (ev, key) {
+      ev.preventDefault();
+      var el = ev.currentTarget;
+      var box = el.parentNode.querySelector('input');
+      if (!box) return false;
+      return this.send({action: 'profile_set', url: key, title: box.value});
+    },
+    pfdrop: function (ev, key) {
+      ev.preventDefault();
+      var el = ev.currentTarget.closest('.row');
+      if (el) { el.style.transition = 'opacity .12s'; el.style.opacity = '0';
+                setTimeout(function () { el.remove(); }, 120); }
+      return this.send({action: 'profile_set', url: key, title: ''});
+    },
+    pfadd: function (ev) {
+      ev.preventDefault();
+      var k = document.getElementById('pfkey'), v = document.getElementById('pfval');
+      var key = k ? k.value.trim() : '';
+      if (!key) { if (k) k.focus(); return false; }
+      return this.send({action: 'profile_set', url: key, title: v ? v.value : ''});
     },
     pbstart: function (ev) {
       ev.preventDefault();

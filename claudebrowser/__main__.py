@@ -103,7 +103,11 @@ def main(argv=None):
     # is no themed icon, so fall back to the generated PNG on disk rather than
     # showing the stock GTK placeholder.
     Gtk.Window.set_default_icon_name("claude-browser")
-    if not Gtk.IconTheme.get_default().has_icon("claude-browser"):
+    # get_default() can return None this early if GTK hasn't realized a
+    # screen yet (seen under waypipe's virtual compositor before any
+    # window exists) -- treat that the same as "theme lacks the icon".
+    icon_theme = Gtk.IconTheme.get_default()
+    if icon_theme is None or not icon_theme.has_icon("claude-browser"):
         fallback = Path(__file__).resolve().parent.parent / "packaging" / "icons" / "claude-browser.png"
         if fallback.exists():
             try:

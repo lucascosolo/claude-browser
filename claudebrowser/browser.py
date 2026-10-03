@@ -22,10 +22,11 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import (agent, ai, auth, envfile, extract, findbar, pages, pagetext,  # noqa: E402
-               panel_html, passwords, perf, personas, playbooks, progress,
-               reader, resources, scrub, search, settings, siterules, storage,
-               store, style, tabnames, urls, vpn, watchlater, youtube)
+from . import (agent, ai, auth, envfile, extract, fills, findbar, pages,  # noqa: E402
+               pagetext, panel_html, passwords, perf, personas, playbooks,
+               profile, progress, reader, resources, scrub, search, settings,
+               siterules, storage, store, style, tabnames, urls, vpn,
+               watchlater, youtube)
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
@@ -228,7 +229,7 @@ STUCK_LOAD_S = 40
 # -- Ctrl+T always works, because a person opening a tab has looked at the
 # screen and an agent has not. resources.tab_ceiling() lowers it further on a
 # machine that is already struggling.
-MAX_AGENT_TABS = int(os.environ.get("CB_MAX_TABS", "10"))
+MAX_AGENT_TABS = int(os.environ.get("CB_MAX_TABS", "24"))
 
 
 def needs_tab(method):
@@ -474,7 +475,7 @@ class Browser(Gtk.Window):
         # reads. The tradeoff is that console output from inside an iframe is
         # not captured.
         self.content = WebKit2.UserContentManager()
-        for script in (CONSOLE_SHIM, passwords.PASSWORD_JS):
+        for script in (CONSOLE_SHIM, passwords.PASSWORD_JS, extract.SNAPSHOT_SHIM):
             self.content.add_script(
                 WebKit2.UserScript.new(
                     script,
@@ -534,8 +535,13 @@ class Browser(Gtk.Window):
         # a machine without a Secret Service loses password saving, not its
         # browser. `cb:passwords` says so rather than rendering an empty list.
         self.vault = passwords.open_vault()
+        # Same "a box without a keyring should cost you the feature, not your
+        # browser" posture as self.vault above. See profile.py.
+        self.profile = profile.open_vault()
         self.content.register_script_message_handler("cbpw")
         self.content.connect("script-message-received::cbpw", self._on_pw_message)
+        self.content.register_script_message_handler("cbpwfield")
+        self.content.connect("script-message-received::cbpwfield", self._on_pw_field_message)
         self.pw_offer = None
 
         # Active downloads, keyed by id(download) -- the dict entry is what
@@ -587,8 +593,21 @@ class Browser(Gtk.Window):
             self._vpn_engage()
 
         self.connect("destroy", self._on_destroy)
-        for url in (urls or [HOME]):
-            self.new_tab(url)
+        # `urls` is only ever set for an explicit launch target (a command-line
+        # argument, or xdg-open handing this process a URL) -- an ordinary
+        # launch passes None, which is the only case restoring last session's
+        # tabs should apply. Read once, like CB_HOME: this only ever matters at
+        # the moment the window is built.
+        restore = (envfile.setting("CB_RESTORE_SESSION", "1") or "1").strip().lower() \
+            not in ("0", "off", "false", "no")
+        restored = self.store.session_tabs() if (
+            urls is None and restore and self.store is not None) else []
+        for url in (urls or restored or [HOME]):
+            # Routed through the same admission queue as every other
+            # API-initiated navigation (see `_admit`'s docstring): a restored
+            # session of many tabs opening at once is exactly the burst of
+            # simultaneous loads that queue exists to prevent.
+            self._admit(lambda url=url: self.new_tab(url), lambda _r: None, normalize(url))
 
     def _on_destroy(self, *_a):
         """Let queued history writes land before the process goes away. The
@@ -1461,6 +1480,11 @@ class Browser(Gtk.Window):
             return pages.passwords_page(palette, self.nonce, self.vault.entries(),
                                         never=self.vault.never_list())
 
+        if name == "profile":
+            if self.profile is None:
+                return pages.profile_page(palette, self.nonce, {}, available=False)
+            return pages.profile_page(palette, self.nonce, self.profile.get_all())
+
         # Playbooks live in their own file, so like the two above they render
         # whether or not the history database opened. When even that file could
         # not be reached `self.playbooks` is None and the page says so rather
@@ -1544,6 +1568,10 @@ class Browser(Gtk.Window):
             if secret is not None and tab is not None:
                 self._pw_js(tab, "cbui.reveal(%s, %s)"
                             % (json.dumps(data.get("idx")), json.dumps(secret)))
+        elif action == "profile_set" and self.profile:
+            # url carries the field name, title the new value (or "" to
+            # delete it) -- same fixed message shape reasoning as set_setting.
+            self.api_profile_set(url, title or None, lambda result: self._reload_internal())
         elif action == "clear_data":
             # `title` carries the kind -- the message shape is fixed at
             # {action, url, title} and adding a field for one page is not worth
@@ -1966,6 +1994,20 @@ class Browser(Gtk.Window):
 
     # -- tabs ---------------------------------------------------------------
 
+    def _save_session(self):
+        """Snapshot the open, non-private tabs for the next launch to restore.
+
+        Called wherever the tab list is already being mutated (open, close) --
+        no separate timer or poll. A private tab is never written to store.py,
+        no exception here: `t.private` excludes it before the URL ever reaches
+        `save_session_tabs`.
+        """
+        if self.store is None:
+            return
+        self.store.save_session_tabs(
+            [t.view.get_uri() for t in self.tabs
+             if not t.private and t.view.get_uri()])
+
     def new_tab(self, url=HOME, background=False, private=False):
         # A private tab must not be created *related* to a normal one, or it
         # inherits the very storage it exists to avoid.
@@ -2001,6 +2043,7 @@ class Browser(Gtk.Window):
         index = self.notebook.append_page(view, label)
         self.notebook.set_tab_reorderable(view, True)
         self.tabs.append(tab)
+        self._save_session()
         self.notebook.set_show_tabs(len(self.tabs) > 1)
         if not background:
             self.notebook.set_current_page(index)
@@ -2077,6 +2120,7 @@ class Browser(Gtk.Window):
         self._settle(tab, {"ok": True, "closed": True})
         self.notebook.remove_page(index)
         self.tabs.remove(tab)
+        self._save_session()
         self.privacy.closed(tab.id)
         # Destroyed rather than left to the garbage collector. A private view
         # owns an ephemeral session, and "it is wiped when the tab closes" has
@@ -2948,6 +2992,23 @@ class Browser(Gtk.Window):
             return
         self._pw_js(tab, "window.__cbPwTake ? window.__cbPwTake() : ''",
                     lambda raw: self._pw_maybe_offer(origin, raw))
+
+    def _on_pw_field_message(self, _manager, _result):
+        """A page reports a password field newly showing up -- a same-document
+        step change, most often a split login revealing its password field
+        after the username step. Carries no secret, ever; it just re-runs the
+        normal autofill path, which re-reads the vault fresh on its own.
+
+        Resolved to the focused tab for the same reason as `_on_pw_message`:
+        the content manager is shared, so the signal itself cannot say which
+        tab rang it.
+        """
+        if self.vault is None:
+            return
+        tab = self.current()
+        if tab is None:
+            return
+        self._pw_autofill(tab)
 
     def _pw_maybe_offer(self, origin, raw):
         try:
@@ -3865,7 +3926,7 @@ class Browser(Gtk.Window):
             tab = self.new_tab(url, background=background, private=private)
             self.note_agent_activity(tab)
             self._begin_load(tab)
-            self._await_load(tab, wait, done)
+            self._await_load(tab, wait, self._with_matching_playbooks(url, done))
 
         # Normalized, because that is what will actually be loaded: "cb:vpn"
         # and a search term have to be judged as the addresses they become.
@@ -3878,9 +3939,23 @@ class Browser(Gtk.Window):
             tab.discarded = None
             self._begin_load(tab)
             perf.load_url(tab.view, normalize(url))
-            self._await_load(tab, wait, done)
+            self._await_load(tab, wait, self._with_matching_playbooks(url, done))
 
         self._admit(go, done, normalize(url))
+
+    def _with_matching_playbooks(self, url, done):
+        """Wrap a nav result's `done` with the saved playbooks whose host
+        matches this navigation -- purely advisory (see
+        playbooks.Playbooks.matching), never auto-replayed. `url` is the
+        fallback for the not-`wait`ed case, where `tab.info()` may not yet
+        reflect the new address; the tab's own reported url wins once it is
+        there."""
+        def wrapped(result):
+            if result.get("ok") and self.playbooks is not None:
+                result["playbooks"] = self.playbooks.matching(
+                    result.get("url") or url)
+            done(result)
+        return wrapped
 
     @needs_tab
     def api_history(self, tab, direction, wait, done):
@@ -3980,6 +4055,36 @@ class Browser(Gtk.Window):
                 return done({"ok": True, "result": text})
 
         tab.view.evaluate_javascript(script, -1, None, None, None, on_result, None)
+
+    def api_snapshot(self, tab, done):
+        """The page's interactive elements as a compact, ref-indexed list --
+        see extract.snapshot(). Read-only; never mutates the page."""
+        self.api_eval(tab, extract.snapshot(), done)
+
+    def api_fill_many(self, tab, fields_json, done):
+        """fields_json: {"selector_or_@ref": "value_or_{profile:key}", ...},
+        passed as a JSON string (not a dict param) so playbooks.py's scalar-only
+        parameter checking never has to trust a nested structure -- see the
+        design spec's fill-many section.
+
+        Placeholders are resolved here, natively, before any JS reaches the
+        page -- the model that requested this call never receives the resolved
+        value. An unresolvable placeholder fails the whole call before touching
+        the page at all: a partially-filled form with a null in the middle is a
+        worse failure than not starting.
+        """
+        try:
+            fields = json.loads(fields_json)
+        except ValueError:
+            return done({"ok": False, "error": "fields must be a JSON object"})
+        if not isinstance(fields, dict):
+            return done({"ok": False, "error": "fields must be a JSON object"})
+        try:
+            resolved = [(k, fills.resolve_value(v, self.profile))
+                        for k, v in fields.items()]
+        except fills.FillError as e:
+            return done({"ok": False, "error": str(e)})
+        self.api_eval(tab, extract.fill_many(resolved), done)
 
     def api_console(self, tab_id, pattern, done):
         def filter_entries(result):
@@ -4214,6 +4319,32 @@ class Browser(Gtk.Window):
         # the old persona would make the setting look like it had not taken.
         self.persona_combo.set_active_id(key)
         done({"ok": True, **personas.describe()})
+
+    def api_profile(self, done):
+        """Report every stored profile field, for an agent to fill forms with.
+
+        Shaped like api_persona/api_settings: no arguments, since there is
+        only ever one profile to read. Same "unavailable, not broken" posture
+        as passwords.py when there is no keyring on this machine.
+        """
+        if self.profile is None:
+            return done({"ok": True, "available": False, "fields": {}})
+        done({"ok": True, "available": True, "fields": self.profile.get_all()})
+
+    def api_profile_set(self, key, value, done):
+        """Set one profile field, or delete it when `value` is empty.
+
+        Not an MCP tool -- see the profile-set Op in api.py -- so the only
+        callers are cbctl and cb:profile's own Save/Delete buttons. An agent
+        driving the browser toward some other goal has no business rewriting
+        the user's own name or address as a side effect.
+        """
+        if self.profile is None:
+            return done({"ok": False, "error": "the system keyring is unavailable"})
+        if not key:
+            return done({"ok": False, "error": "a field name is required"})
+        self.profile.set(key, value)
+        done({"ok": True, "fields": self.profile.get_all()})
 
     def _change_setting(self, key, value):
         """One control on cb:settings, answered by the api_* method behind it.
@@ -4913,3 +5044,151 @@ class Browser(Gtk.Window):
             getattr(self, method)(*call_args, after)
 
         run(0)
+
+    # -- bookmarks, history and downloads, over the API ----------------------
+    # These expose the same store.py the star button and cb:bookmarks/
+    # cb:history already read and write -- see `toggle_bookmark` above -- so an
+    # agent can search or maintain them without opening those pages itself.
+
+    def api_bookmarks(self, q, done):
+        """List saved bookmarks, optionally filtered by a search term."""
+        if self.store is None:
+            return done({"ok": True, "bookmarks": []})
+        done({"ok": True, "bookmarks": self.store.bookmarks(q or None)})
+
+    def api_bookmark_add(self, tab, url, title, done):
+        """Bookmark a page -- an explicit URL, or the given/current tab's own.
+
+        Not `@needs_tab`: an explicit `url` needs no tab open at all, and only
+        the fallback path (`url` omitted) has to resolve one, the same way
+        `toggle_bookmark` reads the front tab's own `view.get_uri()`.
+        """
+        if self.store is None:
+            return done({"ok": False, "error": "bookmarks are unavailable"})
+        target_url = url
+        target_title = title
+        if not target_url:
+            current = self.find(tab)
+            if current is None:
+                return done({"ok": False, "error": "no such tab"})
+            target_url = current.view.get_uri() or ""
+            if not target_title:
+                target_title = current.view.get_title() or ""
+        if not self.store.bookmark(target_url, target_title or ""):
+            return done({"ok": False,
+                         "error": "that page cannot be bookmarked"})
+        self._sync_star()
+        self._reload_internal()
+        done({"ok": True, "url": target_url})
+
+    def api_bookmark_remove(self, url, done):
+        """Remove a bookmark. Not an MCP tool -- see the Op in api.py."""
+        if self.store is None:
+            return done({"ok": False, "error": "bookmarks are unavailable"})
+        if not url:
+            return done({"ok": False, "error": "a url is required"})
+        self.store.unbookmark(url)
+        self._sync_star()
+        self._reload_internal()
+        done({"ok": True, "url": url})
+
+    def api_history(self, q, limit, done):
+        """Search browsing history. A search term is required -- this is a
+        search, not a full listing, the same posture as `recall`."""
+        if not q:
+            return done({"ok": False, "error": "a search term is required"})
+        if self.store is None:
+            return done({"ok": True, "history": []})
+        try:
+            count = int(limit) if limit not in (None, "") else 50
+        except (TypeError, ValueError):
+            count = 50
+        done({"ok": True, "history": self.store.history(q, max(1, min(count, 300)))})
+
+    def api_history_clear(self, done):
+        """Delete all browsing history. Not an MCP tool -- see the Op in
+        api.py: signing every site out from under the user is not a step an
+        agent should be able to take in pursuit of some other goal."""
+        if self.store is not None:
+            self.store.clear_history()
+        self._reload_internal()
+        done({"ok": True})
+
+    def api_downloads(self, done):
+        """List this session's downloads, most recent first.
+
+        `download_history` is the same list `cb:downloads`-style surfaces
+        already read -- see where it is populated on a finished download --
+        so this adds no tracking of its own.
+        """
+        done({"ok": True, "downloads": list(self.download_history)})
+
+    def api_import_chrome(self, kinds, done):
+        """Import bookmarks, history and saved passwords from the local
+        Chrome profile. Not an MCP tool -- see the Op in api.py.
+
+        Each kind is attempted independently: a failed password decrypt must
+        never abort the bookmarks or history import, and vice versa. Only
+        counts ever leave this function -- a decrypted password lives in a
+        local variable for exactly as long as the loop body that hands it to
+        self.vault.save, never longer, never returned, never logged.
+        """
+        from claudebrowser import chrome_import
+
+        profile_dir = chrome_import.CHROME_PROFILE_DEFAULT
+        if not os.path.isdir(profile_dir):
+            return done({"ok": False,
+                         "error": "Chrome profile not found at %s" % profile_dir})
+
+        result = {"ok": True}
+
+        if "bookmarks" in kinds:
+            try:
+                entries = chrome_import.read_bookmarks(profile_dir)
+                inserted = self.store.import_bookmarks(entries) if self.store else 0
+                result["bookmarks"] = {"imported": inserted,
+                                        "skipped": len(entries) - inserted}
+            except (OSError, ValueError) as exc:
+                result["bookmarks"] = {"error": str(exc)}
+
+        if "history" in kinds:
+            try:
+                entries = chrome_import.read_history(profile_dir)
+                inserted = self.store.import_history(entries) if self.store else 0
+                result["history"] = {"imported": inserted,
+                                      "skipped": len(entries) - inserted}
+            except (OSError, ValueError) as exc:
+                result["history"] = {"error": str(exc)}
+
+        if "passwords" in kinds:
+            imported = skipped = failed = 0
+            try:
+                for origin, username, password in chrome_import.read_passwords(profile_dir):
+                    if self.vault is None:
+                        failed += 1
+                        continue
+                    existing = self.vault.credentials(origin)
+                    if any(e["username"] == username for e in existing):
+                        skipped += 1
+                        continue
+                    if self.vault.save(origin, username, password):
+                        imported += 1
+                    else:
+                        failed += 1
+                result["passwords"] = {"imported": imported, "skipped": skipped,
+                                        "failed": failed}
+            except (OSError, ValueError) as exc:
+                result["passwords"] = {"error": str(exc)}
+
+        if self.store is not None:
+            self.store.flush()
+        self._reload_internal()
+        done(result)
+
+    def api_save_password(self, origin, username, password, done):
+        """Save one credential straight into the keyring-backed vault. The
+        password never touches this method's caller again -- it is handed to
+        Vault.save and nothing else here ever reads or returns it."""
+        if self.vault is None:
+            return done({"ok": False, "error": "no password vault available"})
+        done({"ok": self.vault.save(origin, username, password)})

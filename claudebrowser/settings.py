@@ -314,12 +314,25 @@ SETTINGS = (
         "CB_LIGHT", "Appearance", "Ask sites for a lighter page",
         "Sends Save-Data: on with each page this browser loads, and asks for "
         "reduced motion. Servers that honour it send smaller images and fewer "
-        "fonts.",
-        "bool", "1",
+        "fonts. Off by default: this used to be on to conserve CPU on a "
+        "two-core laptop, but that rationale does not apply on the hardware "
+        "this now runs on, so pages load at full fidelity unless you turn it "
+        "back on.",
+        "bool", "0",
         "Next page load",
         "The header follows on the next page load. Reduced motion cannot: "
         "WebKit reads it once, before the first tab exists, so that half stays "
-        "as it was until the browser restarts."),
+        "as it was until the browser restarts.",
+        truth=_only_on_words),
+    Setting(
+        "CB_RESTORE_SESSION", "Appearance", "Reopen tabs on launch",
+        "Reopens the tabs that were open when the browser last closed. On by "
+        "default. Private tabs are never saved and never restored -- the "
+        "session list only ever holds non-private URLs.",
+        "bool", "1",
+        "After a restart",
+        "The saved list is read once, at startup, before the first tab opens.",
+        truth=_off_words),
     Setting(
         "CB_HOME", "Appearance", "Start page",
         "Where a new tab and the home button go.",
@@ -516,8 +529,9 @@ SETTINGS = (
         "CB_MAX_TABS", "Performance", "Tab limit for agents",
         "The most tabs an agent may have open at once. You are never held to "
         "it -- Ctrl+T always works -- and a machine under pressure lowers it "
-        "further on its own.",
-        "number", "10",
+        "further on its own. Raised from 10 to 24 now that this runs on "
+        "hardware with cores and RAM to spare.",
+        "number", "24",
         "After a restart",
         "Read into a module constant when the browser is imported.",
         minimum=1, maximum=200),

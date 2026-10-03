@@ -1,0 +1,88 @@
+path	commit	date	kind	subject
+.gitignore	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+CLAUDE.md	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+cb	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+cbctl	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/__main__.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/agent.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/api.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/browser.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/chrome_import.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/client.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/extract.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/fills.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/pages.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/passwords.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/perf.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/playbooks.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/profile.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/settings.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+claudebrowser/store.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+docs/handoffs/2026-08-29-openclaw-unbroker-handoff.md	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+docs/plans/2026-08-29-agentic-spine-and-power-user-layer.md	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+docs/plans/2026-08-29-import-chrome.md	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+docs/plans/2026-08-29-pii-profile-and-blocked-detection.md	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+docs/superpowers/specs/2026-08-29-agentic-spine-and-power-user-layer-design.md	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+docs/superpowers/specs/2026-08-29-import-chrome-design.md	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+docs/superpowers/specs/2026-08-29-pii-profile-and-blocked-detection-design.md	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_agent.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_ai.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_chrome_import.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_extract_snapshot.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_fills.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_light.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_offline.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_pages_style.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_passwords.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_playbooks.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_profile.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_settings.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+tests/test_store.py	a443c089	2026-08-29 23:43	exact	Add save-password: enter a credential without it passing through chat
+AUDIT.md	-	-	missing	
+README.md	-	-	missing	
+SESSION.md	-	-	missing	
+cb-mcp	-	-	missing	
+claudebrowser/__init__.py	-	-	missing	
+claudebrowser/_aes.py	-	-	missing	
+claudebrowser/ai.py	-	-	missing	
+claudebrowser/auth.py	-	-	missing	
+claudebrowser/control.py	-	-	missing	
+claudebrowser/envfile.py	-	-	missing	
+claudebrowser/findbar.py	-	-	missing	
+claudebrowser/pagetext.py	-	-	missing	
+claudebrowser/panel_html.py	-	-	missing	
+claudebrowser/personas.py	-	-	missing	
+claudebrowser/progress.py	-	-	missing	
+claudebrowser/reader.py	-	-	missing	
+claudebrowser/resources.py	-	-	missing	
+claudebrowser/scrub.py	-	-	missing	
+claudebrowser/search.py	-	-	missing	
+claudebrowser/siterules.py	-	-	missing	
+claudebrowser/storage.py	-	-	missing	
+claudebrowser/style.py	-	-	missing	
+claudebrowser/tabnames.py	-	-	missing	
+claudebrowser/urls.py	-	-	missing	
+claudebrowser/vpn.py	-	-	missing	
+claudebrowser/watchlater.py	-	-	missing	
+claudebrowser/youtube.py	-	-	missing	
+install.sh	-	-	missing	
+logo.png	-	-	missing	
+suggestions.md	-	-	missing	
+tests/test_aes.py	-	-	missing	
+tests/test_envfile.py	-	-	missing	
+tests/test_pacing.py	-	-	missing	
+tests/test_pagetext.py	-	-	missing	
+tests/test_panel_markdown.py	-	-	missing	
+tests/test_personas.py	-	-	missing	
+tests/test_progress.py	-	-	missing	
+tests/test_reader.py	-	-	missing	
+tests/test_resources.py	-	-	missing	
+tests/test_scrub.py	-	-	missing	
+tests/test_search.py	-	-	missing	
+tests/test_siterules.py	-	-	missing	
+tests/test_storage.py	-	-	missing	
+tests/test_style.py	-	-	missing	
+tests/test_tabnames.py	-	-	missing	
+tests/test_vpn.py	-	-	missing	
+tests/test_watchlater.py	-	-	missing	
+tests/test_youtube.py	-	-	missing	

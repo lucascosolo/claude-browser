@@ -124,6 +124,16 @@ class StoreTest(unittest.TestCase):
         hosts = [store.host_of(r["url"]) for r in self.s.top_sites()]
         self.assertEqual(len(hosts), len(set(hosts)))
 
+    def test_save_and_read_session_tabs(self):
+        self.s.save_session_tabs(["https://a.example", "https://b.example"])
+        self.assertEqual(self.s.session_tabs(),
+                          ["https://a.example", "https://b.example"])
+
+    def test_save_session_tabs_overwrites_the_previous_list(self):
+        self.s.save_session_tabs(["https://a.example"])
+        self.s.save_session_tabs(["https://b.example"])
+        self.assertEqual(self.s.session_tabs(), ["https://b.example"])
+
 
 class PageRenderTest(unittest.TestCase):
     def setUp(self):
@@ -250,6 +260,41 @@ class PageRenderTest(unittest.TestCase):
         ])
         self.assertIn("card cur", html)
         self.assertEqual(html.count('cbui.send({action:\'switch\''), 2)
+
+
+class ImportTest(unittest.TestCase):
+    def setUp(self):
+        self.s = store.Store(":memory:", background=False)
+        self.addCleanup(self.s.close)
+
+    def test_import_bookmarks_fills_gaps_only(self):
+        self.s.bookmark("https://existing.example/", "Existing")
+        inserted = self.s.import_bookmarks([
+            ("https://existing.example/", "Should Not Overwrite", 1000),
+            ("https://new.example/", "New", 2000),
+        ])
+        self.assertEqual(inserted, 1)
+        rows = {r["url"]: r["title"] for r in self.s.bookmarks()}
+        self.assertEqual(rows["https://existing.example/"], "Existing")
+        self.assertEqual(rows["https://new.example/"], "New")
+
+    def test_import_history_fills_gaps_only(self):
+        self.s.record("https://existing.example/", "Existing")
+        inserted = self.s.import_history([
+            ("https://existing.example/", "Should Not Overwrite", 99, 1000),
+            ("https://new.example/", "New", 5, 2000),
+        ])
+        self.assertEqual(inserted, 1)
+        rows = {r["url"]: r["visits"] for r in self.s.history()}
+        self.assertEqual(rows["https://existing.example/"], 1)
+        self.assertEqual(rows["https://new.example/"], 5)
+
+    def test_import_is_idempotent(self):
+        entries = [("https://a.example/", "A", 1000)]
+        first = self.s.import_bookmarks(entries)
+        second = self.s.import_bookmarks(entries)
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
 
 
 if __name__ == "__main__":

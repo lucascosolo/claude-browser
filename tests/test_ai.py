@@ -953,8 +953,13 @@ class AgentTest(unittest.TestCase):
 
     def test_every_tool_that_touches_the_tab_is_gated(self):
         """A tool added to the loop without a decision about private tabs is
-        the whole failure mode this list exists to prevent."""
-        driving = {t["name"] for t in agent.TOOLS} - {"list_tabs", "open_tab"}
+        the whole failure mode this list exists to prevent.
+
+        `profile` is the one deliberate exception: it reads the keyring, not
+        the tab, so a private tab has no bearing on it -- see agent.TAB_TOOLS'
+        own comment.
+        """
+        driving = {t["name"] for t in agent.TOOLS} - {"list_tabs", "open_tab", "profile"}
         self.assertEqual(driving, set(agent.TAB_TOOLS))
 
     def test_an_agent_opened_tab_asks_for_nothing_and_inherits(self):

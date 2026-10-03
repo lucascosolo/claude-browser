@@ -236,14 +236,30 @@ OPS = [
        params=[Param("q", required=True, help="Regex to search for.")],
        call=_js_call("find", "q")),
 
-    Op("click", "/click", "POST", "Click the first element matching a CSS selector.",
+    Op("snapshot", "/snapshot", "GET", "List the page's interactive elements "
+       "(inputs, buttons, links) as a compact, ref-indexed manifest -- use this "
+       "instead of `text` before filling a form. Each ref (like @e7) can be "
+       "passed to `click`/`fill` in place of a CSS selector.",
+       call=lambda c, a: ("api_snapshot", (_tab(a),))),
+
+    Op("click", "/click", "POST", "Click the first element matching a CSS "
+       "selector, or a @ref from `snapshot` (e.g. \"@e7\").",
        params=[Param("selector", required=True)],
        call=_js_call("click", "selector")),
 
-    Op("fill", "/fill", "POST", "Set an input's value and dispatch input/change so "
-       "frameworks notice.",
+    Op("fill", "/fill", "POST", "Set an input's value and dispatch input/change "
+       "so frameworks notice. `selector` is a CSS selector or a @ref from "
+       "`snapshot`.",
        params=[Param("selector", required=True), Param("value", required=True)],
        call=_js_call("fill", "selector", "value")),
+
+    Op("fill-many", "/fill/many", "POST", "Fill several fields in one call. "
+       "`fields` is a JSON object mapping each selector (or @ref from "
+       "`snapshot`) to a value -- use \"{profile:KEY}\" as a value to fill "
+       "from the stored profile without ever seeing the value yourself.",
+       params=[Param("fields", required=True,
+                     help="JSON object: {selector_or_ref: value}.")],
+       call=lambda c, a: ("api_fill_many", (_tab(a), a["fields"]))),
 
     Op("eval", "/eval", "POST", "Evaluate JavaScript in the page and return its value.",
        params=[Param("js", required=True, help="JavaScript to evaluate.")],
@@ -253,6 +269,12 @@ OPS = [
        "captured on the page. Call this when debugging why a page misbehaves.",
        params=[Param("pattern", help="Regex filter over message text.", cli="opt")],
        call=lambda c, a: ("api_console", (_tab(a), a.get("pattern")))),
+
+    Op("blocked", "/blocked", "GET", "Check whether the page is showing a "
+       "CAPTCHA or anti-bot challenge instead of its real content. Call this "
+       "when a click or fill had no visible effect. This never attempts to "
+       "solve or bypass a challenge -- it only reports one.",
+       call=_js("BLOCKED")),
 
     # Cookies and caches. Reading is an MCP tool; clearing is not -- signing the
     # user out of every site they use is not a step an agent should be able to
@@ -370,6 +392,95 @@ OPS = [
        call=lambda c, a: ("api_settings", (a.get("name"), a.get("value"),
                                            _truthy(a.get("reset"), False))),
        tab=False, mcp=False),
+
+    # Not an MCP tool for `profile-set`, and for the same reason `settings`
+    # and `persona` aren't: this is the user's own data, and an agent acting
+    # toward some other goal has no business rewriting their name or address
+    # as a side effect. `profile` itself IS exposed -- an agent needs to read
+    # it to fill out forms, which is the entire point of storing it.
+    Op("profile", "/profile", "GET",
+       "Report the stored personal-info profile (name, address, contact "
+       "fields) used to fill out forms.",
+       call=lambda c, a: ("api_profile", ()), tab=False),
+
+    Op("profile-set", "/profile/set", "POST",
+       "Set or delete one field in the personal-info profile.",
+       params=[Param("key", required=True),
+               Param("value", cli="optarg",
+                     help="New value; omit to delete the field.")],
+       call=lambda c, a: ("api_profile_set", (a["key"], a.get("value"))),
+       tab=False, mcp=False),
+
+    Op("bookmarks", "/bookmarks", "GET",
+       "List saved bookmarks, optionally filtered by a search term.",
+       params=[Param("q", cli="opt", help="Filter text; omit to list all.")],
+       call=lambda c, a: ("api_bookmarks", (a.get("q"),)), tab=False),
+
+    Op("bookmark-add", "/bookmark/add", "POST",
+       "Bookmark a page -- the current tab by default, or a given URL.",
+       params=[Param("url", cli="optarg", help="URL to bookmark; omit for "
+                     "the tab's own."),
+               Param("title", cli="optarg", help="Title to store; omit to "
+                     "use the tab's own.")],
+       call=lambda c, a: ("api_bookmark_add",
+                          (_tab(a), a.get("url"), a.get("title")))),
+
+    # Not an MCP tool, for the same reason `clear` is not: removing something
+    # the user saved is not a step an agent should take in pursuit of some
+    # other goal.
+    Op("bookmark-remove", "/bookmark/remove", "POST", "Remove a bookmark.",
+       params=[Param("url", required=True)],
+       call=lambda c, a: ("api_bookmark_remove", (a["url"],)),
+       tab=False, mcp=False),
+
+    Op("history", "/history", "GET",
+       "Search browsing history. A search term is required -- this is a "
+       "search, not a full listing, the same posture as `recall`.",
+       params=[Param("q", required=True, help="Words to look for."),
+               Param("limit", "integer", "Maximum matches (default 50).",
+                     cli="opt")],
+       call=lambda c, a: ("api_history", (a["q"], a.get("limit"))), tab=False),
+
+    # Not an MCP tool, for the same reason `clear` is not: signing the user
+    # out of every site's memory of them is not a step an agent should take
+    # in pursuit of some other goal. `cbctl history-clear` is one command
+    # away for a person who means it.
+    Op("history-clear", "/history/clear", "POST", "Delete all browsing history.",
+       call=lambda c, a: ("api_history_clear", ()), tab=False, mcp=False),
+
+    Op("downloads", "/downloads", "GET",
+       "List this session's downloads and their status.",
+       call=lambda c, a: ("api_downloads", ()), tab=False),
+
+    # Not an MCP tool: this is a user-triggered one-time migration of their
+    # own Chrome data, never a step an agent should take toward some other
+    # goal, and it is the one op in this table that ever holds a decrypted
+    # password -- see chrome_import.py and Browser.api_import_chrome.
+    Op("import-chrome", "/import-chrome", "POST",
+       "Import bookmarks, history and saved passwords from the local Google "
+       "Chrome profile. Existing entries are never overwritten -- this only "
+       "fills gaps. Reports counts only, never values.",
+       params=[Param("passwords", "boolean", "Import saved passwords.",
+                     cli="opt", default=False),
+               Param("bookmarks", "boolean", "Import bookmarks.",
+                     cli="opt", default=False),
+               Param("history", "boolean", "Import browsing history.",
+                     cli="opt", default=False)],
+       call=lambda c, a: ("api_import_chrome", (_import_chrome_kinds(a),)),
+       tab=False, mcp=False, timeout=90),
+    Op("save-password", "/passwords/save", "POST",
+       "Save one credential straight into the password vault. Not an agent "
+       "tool -- the one path for a human to hand this browser a password "
+       "without typing it anywhere an agent or a chat transcript can see.",
+       params=[Param("origin", "string", "Site origin/URL this login is for.",
+                     required=True, cli="arg"),
+               Param("username", "string", "Username or email for this login.",
+                     required=True, cli="arg"),
+               Param("password", "string", "The password value.",
+                     required=True, cli="secret")],
+       call=lambda c, a: ("api_save_password",
+                          (a["origin"], a.get("username") or "", a["password"])),
+       tab=False, mcp=False),
 ]
 
 BY_NAME = {op.name: op for op in OPS}
@@ -382,3 +493,12 @@ CLI_ALIASES = {"shot": "screenshot", "go": "navigate"}
 
 def mcp_tools():
     return [op.mcp_tool() for op in OPS if op.mcp]
+
+
+def _import_chrome_kinds(args):
+    """No flag given at all means "all three" -- cbctl import-chrome with no
+    arguments is the common case, not an error asking the user to spell out
+    every kind."""
+    requested = {k for k in ("passwords", "bookmarks", "history")
+                 if _truthy(args.get(k), False)}
+    return sorted(requested) if requested else ["passwords", "bookmarks", "history"]

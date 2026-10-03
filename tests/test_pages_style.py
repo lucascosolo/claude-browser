@@ -182,7 +182,8 @@ class StillFrames(unittest.TestCase):
     def test_reduced_motion_is_honoured(self):
         """WebKitGTK drives `prefers-reduced-motion` from GTK's
         `gtk-enable-animations`, which perf.tune_gtk turns off whenever
-        CB_LIGHT is on -- the default. This is the live branch here."""
+        CB_LIGHT is on. The media query itself is static CSS, present
+        regardless of CB_LIGHT's default."""
         for where, html in self.surfaces():
             with self.subTest(where=where):
                 self.assertIn("prefers-reduced-motion", html)

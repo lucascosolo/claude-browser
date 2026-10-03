@@ -47,33 +47,37 @@ class Isolated(unittest.TestCase):
 
 
 class TestKnob(Isolated):
-    def test_it_defaults_on(self):
-        self.assertTrue(perf.light_enabled())
-
-    def test_the_off_spellings(self):
-        for raw in ("0", "off", "false", "no", "OFF", " off ", "No"):
-            self.assertFalse(perf.light_enabled(raw), raw)
+    def test_it_defaults_off(self):
+        self.assertFalse(perf.light_enabled())
 
     def test_the_on_spellings(self):
-        for raw in ("", "1", "on", "yes", "true", None):
-            self.assertTrue(perf.light_enabled("" if raw is None else raw), raw)
+        for raw in ("1", "on", "true", "yes", "ON", " on ", "Yes"):
+            self.assertTrue(perf.light_enabled(raw), raw)
 
-    def test_a_typo_leaves_it_on(self):
-        """Matching CB_BLOCK: the knob turns a default *off*, so anything it
-        cannot read must not be taken as permission to lose that default."""
-        self.assertTrue(perf.light_enabled("offf"))
-        self.assertTrue(perf.light_enabled("banana"))
+    def test_the_off_spellings(self):
+        for raw in ("", "0", "off", "no", "false", None):
+            self.assertFalse(perf.light_enabled("" if raw is None else raw), raw)
 
-    def test_the_environment_turns_it_off(self):
-        os.environ[perf.LIGHT_ENV] = "0"
-        self.assertFalse(perf.light_enabled())
+    def test_a_typo_leaves_it_off(self):
+        """Matching ai.private_ai_enabled: the knob turns a default *on*, so
+        anything it cannot read must not be taken as permission to gain it."""
+        self.assertFalse(perf.light_enabled("onn"))
+        self.assertFalse(perf.light_enabled("banana"))
+
+    def test_the_environment_turns_it_on(self):
         os.environ[perf.LIGHT_ENV] = "1"
         self.assertTrue(perf.light_enabled())
+        os.environ[perf.LIGHT_ENV] = "0"
+        self.assertFalse(perf.light_enabled())
 
 
 class TestHeaders(Isolated):
     def test_save_data_is_what_goes_out(self):
+        os.environ[perf.LIGHT_ENV] = "1"
         self.assertEqual(perf.hint_headers(), {"Save-Data": "on"})
+
+    def test_nothing_goes_out_by_default(self):
+        self.assertEqual(perf.hint_headers(), {})
 
     def test_nothing_goes_out_when_it_is_off(self):
         os.environ[perf.LIGHT_ENV] = "off"
@@ -84,16 +88,19 @@ class TestHeaders(Isolated):
         fingerprinting bit servers must ask for, the other a measurement this
         process does not have. A future addition should be a decision, not a
         drive-by, so the omission is asserted."""
+        os.environ[perf.LIGHT_ENV] = "1"
         self.assertNotIn("Device-Memory", perf.hint_headers())
         self.assertNotIn("Downlink", perf.hint_headers())
 
     def test_the_user_agent_is_untouched(self):
         """Pretending to be a phone is the other way to get a light page, and
         it is a fingerprinting and correctness mess. Nothing here may do it."""
+        os.environ[perf.LIGHT_ENV] = "1"
         for name in perf.hint_headers():
             self.assertNotEqual(name.lower(), "user-agent")
 
     def test_the_request_carries_the_hint(self):
+        os.environ[perf.LIGHT_ENV] = "1"
         request = perf.make_request("https://example.com/a?b=c")
         self.assertIsNotNone(request)
         self.assertEqual(request.get_uri(), "https://example.com/a?b=c")
@@ -102,6 +109,7 @@ class TestHeaders(Isolated):
     def test_headers_are_replaced_not_appended(self):
         """`replace`, not `append`: a second Save-Data would be a second header
         line, and a server reading only the first would see whichever won."""
+        os.environ[perf.LIGHT_ENV] = "1"
         request = perf.make_request("https://example.com/")
         seen = []
         request.get_http_headers().foreach(lambda k, v: seen.append(k))
@@ -110,7 +118,6 @@ class TestHeaders(Isolated):
     def test_no_request_is_built_when_it_is_off(self):
         """None means "fall back to load_uri", which is what keeps the off path
         identical to what the browser did before this existed."""
-        os.environ[perf.LIGHT_ENV] = "0"
         self.assertIsNone(perf.make_request("https://example.com/"))
 
 
@@ -128,6 +135,7 @@ class TestLoadUrl(Isolated):
             self.calls.append(("load_request", request))
 
     def test_on_it_loads_a_request(self):
+        os.environ[perf.LIGHT_ENV] = "1"
         view = self.FakeView()
         perf.load_url(view, "https://example.com/")
         kind, request = view.calls[0]
@@ -135,7 +143,6 @@ class TestLoadUrl(Isolated):
         self.assertEqual(request.get_http_headers().get_one("Save-Data"), "on")
 
     def test_off_it_falls_back_to_load_uri(self):
-        os.environ[perf.LIGHT_ENV] = "0"
         view = self.FakeView()
         perf.load_url(view, "https://example.com/")
         self.assertEqual(view.calls, [("load_uri", "https://example.com/")])
@@ -157,10 +164,16 @@ class TestTuneGtk(Isolated):
             self.props[name] = value
 
     def test_it_turns_animations_off(self):
+        os.environ[perf.LIGHT_ENV] = "1"
         settings = self.FakeSettings()
         notes = perf.tune_gtk(settings)
         self.assertEqual(settings.props, {"gtk-enable-animations": False})
         self.assertTrue(notes)
+
+    def test_it_leaves_them_alone_by_default(self):
+        settings = self.FakeSettings()
+        self.assertEqual(perf.tune_gtk(settings), [])
+        self.assertEqual(settings.props, {})
 
     def test_it_leaves_them_alone_when_off(self):
         os.environ[perf.LIGHT_ENV] = "0"
@@ -171,6 +184,7 @@ class TestTuneGtk(Isolated):
     def test_a_missing_property_is_a_note_not_a_crash(self):
         """Same rule as the rest of perf.py: a browser that will not start
         because a tuning call vanished is worse than a slower browser."""
+        os.environ[perf.LIGHT_ENV] = "1"
         notes = perf.tune_gtk(self.FakeSettings(fail=True))
         self.assertEqual(len(notes), 1)
         self.assertIn("unavailable", notes[0])

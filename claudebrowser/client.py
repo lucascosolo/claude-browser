@@ -79,8 +79,8 @@ def call(route, method="GET", params=None, timeout=180, raw=False):
 
 
 def unreachable(reason):
-    return ("cannot reach claude-browser at %s (%s). Is it running? Try: cb"
-            % (base_url(), reason))
+    return ("cannot reach claude-browser at %s (%s). Is it running? Try: "
+            "claude-browser" % (base_url(), reason))
 
 
 def is_running(timeout=2):

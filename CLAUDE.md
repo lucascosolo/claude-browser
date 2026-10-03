@@ -36,6 +36,8 @@ backend/       the VPS half of VPN Mode: tinyproxy in a container, tailnet-bound
                deployed as the cb-vpn systemd unit. See backend/README.md
 AUDIT.md       the private-tab leak inventory the hardening was written against
   passwords.py saved logins in the system keyring + the injected form script
+  profile.py   the PII profile agents fill forms from -- keyring-backed, one
+               identity, no fixed schema (GTK-free)
   settings.py  EVERY SETTING DESCRIBED ONCE -- values, validation, when each
                one lands. Behind cb:settings and `cbctl settings` (GTK-free)
   style.py     THE PALETTE + the GTK3 sheet. Three themes by name, never by a

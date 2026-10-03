@@ -319,9 +319,36 @@ PASSWORD_JS = r"""
     return p ? JSON.stringify(p) : '';
   };
 
+  // A username/email field found with no password field to anchor from --
+  // the first step of a split login (Google/Microsoft/Okta-style). Same
+  // candidate set and autocomplete hint as userField(), just not ordered
+  // relative to a password field that does not exist yet.
+  function standaloneUserField() {
+    var candidates = Array.prototype.filter.call(
+      document.querySelectorAll('input'), function (i) {
+        var t = (i.getAttribute('type') || 'text').toLowerCase();
+        return visible(i) && (t === 'text' || t === 'email' || t === 'tel');
+      });
+    var best = null;
+    for (var i = 0; i < candidates.length; i++) {
+      var el = candidates[i];
+      var hint = (el.getAttribute('autocomplete') || '').toLowerCase();
+      if (hint.indexOf('username') >= 0 || hint.indexOf('email') >= 0) { return el; }
+      if (!best) { best = el; }
+    }
+    return best;
+  }
+
   window.__cbPwFill = function (username, password) {
     var fields = passwords();
-    if (!fields.length) { return 0; }
+    if (!fields.length) {
+      // Username-only step of a multi-step login: fill what is on the page
+      // now, but there is no password field to fill and nothing to signal
+      // as "filled" -- the caller's retry loop keeps polling for one.
+      var standalone = standaloneUserField();
+      if (standalone && !standalone.value && username) { setValue(standalone, username); }
+      return 0;
+    }
     var pw = fields[0];
     // Never overwrite something already in the box -- that is either the user
     // mid-type or a value the site put there on purpose.
@@ -331,6 +358,25 @@ PASSWORD_JS = r"""
     setValue(pw, password);
     return 1;
   };
+
+  // Second doorbell, secret-free: a same-document SPA transition from the
+  // username step to the password step fires no LoadEvent, so the native
+  // retry loop (bounded, ~4s) can already have given up by the time the
+  // password field shows up. This observer just pings the native side to
+  // run __cbPwFill again -- no credential ever crosses this channel, and the
+  // native handler re-reads the vault fresh, same as every other attempt.
+  var pwFieldSeen = passwords().length > 0;
+  new MutationObserver(function () {
+    if (!window.__cbPwFill) { return; }
+    var has = passwords().length > 0;
+    if (has && !pwFieldSeen) {
+      try { webkit.messageHandlers.cbpwfield.postMessage(1); } catch (e) {}
+    }
+    pwFieldSeen = has;
+  }).observe(document.documentElement || document, {
+    childList: true, subtree: true, attributes: true,
+    attributeFilter: ['type', 'style', 'class', 'hidden']
+  });
 
   // Three ways a login leaves: a real form submit, a click on whatever the site
   // uses instead of one, and the page going away. An SPA login often fires none

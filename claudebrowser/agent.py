@@ -19,17 +19,19 @@ import json
 import os
 import time
 
-from . import ai, extract, scrub
+from . import ai, extract, fills, scrub
 
-MAX_STEPS = 14
+MAX_STEPS = 24
 
 #: The tools that touch the tab the user is looking at -- and so the ones that
 #: would put a private page's address, title or text into a message to
 #: Anthropic. `list_tabs` is not among them because `api_tabs` drops private
 #: tabs from its answer outright: the model is not told they exist, so there is
-#: nothing here to refuse.
+#: nothing here to refuse. `profile` is deliberately not here either -- it
+#: reads the keyring, not the tab, so a private tab has no bearing on it.
 TAB_TOOLS = frozenset({
     "navigate", "read_page", "find_in_page", "page_links", "click", "type_text",
+    "snapshot", "fill_form", "blocked",
 })
 PAGE_CHARS = 15_000     # per read_page result fed back to the model
 RESULT_CHARS = 20_000   # hard ceiling on any single tool result
@@ -83,8 +85,8 @@ Work in small steps: look before you act. Read a page before clicking in it, and
 prefer find_in_page or page_links over re-reading a whole page you have already \
 seen. Navigate directly to a URL when you know it rather than searching for it.
 
-You are on a slow machine, so every page load costs the user real seconds. Do not \
-browse speculatively; each navigation should be one you can justify.
+Every page load costs the user real seconds. Do not browse speculatively; each \
+navigation should be one you can justify.
 
 Be careful with side effects. Clicking and typing are available because they are \
 often necessary, but do not submit forms, post content, make purchases, or change \
@@ -151,6 +153,42 @@ TOOLS = [
         },
     },
     {
+        "name": "snapshot",
+        "description": "List the page's interactive elements (inputs, "
+                       "buttons, links) as a compact, ref-indexed list. Use "
+                       "this instead of read_page before filling a form -- "
+                       "refs (like @e7) can be passed to click/type_text/"
+                       "fill_form in place of a CSS selector.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "fill_form",
+        "description": "Fill several fields in one call. `fields` maps "
+                       "each selector or @ref to a value; use "
+                       "\"{profile:KEY}\" to fill from the stored profile "
+                       "without ever seeing the value yourself.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"fields": {"type": "object"}},
+            "required": ["fields"],
+        },
+    },
+    {
+        "name": "blocked",
+        "description": "Check whether the page is showing a CAPTCHA or "
+                       "anti-bot challenge instead of its real content. "
+                       "Never attempt to solve or bypass one -- stop and "
+                       "report it.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "profile",
+        "description": "List the names of the stored personal-info profile "
+                       "fields (not their values) -- use a name with "
+                       "fill_form's \"{profile:KEY}\" syntax.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "open_tab",
         "description": "Open a URL in a new background tab and wait for it to load. "
                        "Use when you need to keep the current page.",
@@ -166,6 +204,37 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}},
     },
 ]
+
+
+def truncate_result(name, result, limit=RESULT_CHARS):
+    """Shrink a tool result to fit the per-call budget before it is encoded.
+
+    `snapshot`/`fill_form` results carry a `lines` list -- one row per page
+    element -- and a raw byte-slice of their JSON can cut a row in half,
+    handing the model a string that fails to parse. Dropping whole rows from
+    the end keeps the result valid JSON at the cost of the elements furthest
+    down the page, which is a far better trade than a broken payload.
+
+    Every other tool keeps the existing behavior: returned unchanged here,
+    and byte-sliced by the caller once encoded -- a raw slice of prose (a page
+    read, a find match) is merely truncated mid-sentence, not corrupted.
+    """
+    if name in ("snapshot", "fill_form") and isinstance(result, dict) and "lines" in result:
+        lines = result["lines"]
+        out = dict(result)
+        kept = []
+        budget = limit
+        for line in lines:
+            cost = len(json.dumps(line))
+            if budget - cost <= 0:
+                out["truncated"] = True
+                out["omitted"] = len(lines) - len(kept)
+                break
+            kept.append(line)
+            budget -= cost
+        out["lines"] = kept
+        return out
+    return result
 
 
 class Agent:
@@ -218,18 +287,31 @@ class Agent:
             return {"error": result.get("error", "eval failed")}
         return result.get("result")
 
+    def _loop_signature(self, name, args, url):
+        """A key for `self.seen`'s repeated-call counter.
+
+        `url` is the tab's current address, or None for a tool that never
+        touches one (list_tabs, profile). Without it, a tool that takes no
+        arguments -- snapshot, blocked -- would look like the same call
+        whichever page it ran on, and a multi-page flow that legitimately
+        snapshots four different forms would trip the loop guard on the
+        second one.
+        """
+        return (name, json.dumps(args, sort_keys=True), url)
+
+    def _tab_gate(self):
+        """Ask whether the tab in front may be read for Claude, and its URL.
+
+        Asked once per tool call rather than cached for the run: the user can
+        switch to a private tab between two steps, and a decision taken at the
+        start of the run would still be answering about the tab that was in
+        front then. Called from run(), before dispatch(), so the same one
+        native round trip both gates the call and supplies the URL the loop-
+        detection signature needs -- see _loop_signature.
+        """
+        return self.call("private_gate")
+
     def dispatch(self, name, args):
-        if name in TAB_TOOLS:
-            # Asked once per tool call rather than cached for the run: the user
-            # can switch to a private tab between two steps, and a decision
-            # taken at the start of the run would still be answering about the
-            # tab that was in front then.
-            gate = self.call("private_gate")
-            if not gate.get("ok"):
-                # Emitted as well as returned: the model is told why it cannot
-                # read the page, and so is the person watching the panel.
-                self.emit("  → refused: this tab is private\n")
-                return {"error": gate.get("error") or ai.PRIVATE_REFUSAL}
         if name == "navigate":
             r = self.call("api_navigate", None, args["url"], True, timeout=120)
             return {k: r.get(k) for k in ("ok", "url", "title", "error") if k in r}
@@ -274,6 +356,31 @@ class Agent:
             out = self._eval(extract.fill(args["selector"], args["value"]))
             self._pause(ACT_S)
             return out
+        if name == "snapshot":
+            return self._eval(extract.snapshot())
+        if name == "fill_form":
+            # No self.vault -- Agent only ever reaches browser state through
+            # self.call, the same bridge every other tool here uses, so a
+            # profile-keyed placeholder resolves off the same api_profile
+            # payload the `profile` tool below reports keys from. A dict's
+            # own .get(key) already matches the interface fills.resolve_value
+            # expects of a vault, so no adapter object is needed.
+            profile_result = self.call("api_profile")
+            vault = profile_result.get("fields") if profile_result.get("available") else None
+            try:
+                resolved = [(k, fills.resolve_value(v, vault))
+                           for k, v in args["fields"].items()]
+            except fills.FillError as e:
+                return {"error": str(e)}
+            out = self._eval(extract.fill_many(resolved))
+            self._pause(ACT_S)
+            return out
+        if name == "blocked":
+            return self._eval(extract.BLOCKED)
+        if name == "profile":
+            fields = self.call("api_profile")
+            return {"available": fields.get("available"),
+                    "keys": sorted((fields.get("fields") or {}).keys())}
         return {"error": "unknown tool %r" % name}
 
     # -- the loop -----------------------------------------------------------
@@ -339,10 +446,30 @@ class Agent:
                 # two read as cause and effect rather than one event.
                 self._pause(STEP_S)
 
+                current_url = None
+                if name in TAB_TOOLS:
+                    gate = self._tab_gate()
+                    if not gate.get("ok"):
+                        # Emitted as well as returned: the model is told why it
+                        # cannot read the page, and so is the person watching
+                        # the panel.
+                        self.emit("  → refused: this tab is private\n")
+                        output = {"error": gate.get("error") or ai.PRIVATE_REFUSAL}
+                        encoded = json.dumps(output, ensure_ascii=False)[:RESULT_CHARS]
+                        self.spent += len(encoded)
+                        results.append({"type": "tool_result",
+                                        "tool_use_id": block["id"], "content": encoded})
+                        continue
+                    current_url = gate.get("url")
+
                 # Loop detection. Without it a model that keeps re-reading the
                 # same page burns the step budget and the user's money making
                 # no progress, and the only visible symptom is a stalled panel.
-                signature = (name, json.dumps(args, sort_keys=True))
+                # The tab's URL is part of the signature -- snapshot() and
+                # blocked() take no arguments at all, so without it four calls
+                # across four different pages in one multi-page flow would look
+                # like the same repeated call.
+                signature = self._loop_signature(name, args, current_url)
                 self.seen[signature] = self.seen.get(signature, 0) + 1
                 if self.seen[signature] > REPEAT_LIMIT:
                     output = {"error": "repeated this exact call %d times; "
@@ -357,7 +484,9 @@ class Agent:
                     except Exception as e:
                         output = {"error": repr(e)}
 
-                encoded = json.dumps(output, ensure_ascii=False)[:RESULT_CHARS]
+                truncated = truncate_result(name, output)
+                encoded = (truncated if isinstance(truncated, str)
+                          else json.dumps(truncated, ensure_ascii=False)[:RESULT_CHARS])
                 self.spent += len(encoded)
                 results.append({
                     "type": "tool_result",

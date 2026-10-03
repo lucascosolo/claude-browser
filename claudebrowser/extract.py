@@ -99,6 +99,27 @@ HTML = r"""JSON.stringify({url: location.href, html: document.documentElement.ou
 
 TITLE = r"""JSON.stringify({url: location.href, title: document.title})"""
 
+BLOCKED = r"""
+(function () {
+  var html = document.documentElement.innerHTML;
+  var text = document.body ? document.body.innerText : '';
+  var title = (document.title || '').toLowerCase();
+  var checks = [
+    ['recaptcha', /recaptcha/i.test(html) ||
+                  !!document.querySelector('iframe[src*="recaptcha"], .g-recaptcha')],
+    ['hcaptcha', /hcaptcha/i.test(html) ||
+                 !!document.querySelector('iframe[src*="hcaptcha"], .h-captcha')],
+    ['turnstile', !!document.querySelector('.cf-turnstile, #cf-challenge-stage') ||
+                  title.indexOf('just a moment') >= 0],
+    ['generic', /verify you.{0,3}(are|.re).{0,3}(a )?human|i.?m not a robot|unusual traffic|access denied/i.test(text)],
+  ];
+  for (var i = 0; i < checks.length; i++) {
+    if (checks[i][1]) return JSON.stringify({ blocked: true, kind: checks[i][0] });
+  }
+  return JSON.stringify({ blocked: false, kind: null });
+})()
+"""
+
 
 # How long the page-side choreography takes, in milliseconds. agent.py reads
 # these to pace its own steps, so the native side and the page agree on timing
@@ -216,6 +237,170 @@ _HALO_SRC = r"""
 HALO = (_HALO_SRC.replace("__TRAVEL__", str(TRAVEL_MS))
                  .replace("__PRESS__", str(PRESS_MS)))
 
+
+# Installed once per document via a document-start UserScript (see
+# browser.py's add_script loop, alongside CONSOLE_SHIM). __cbEpoch is
+# unconditional -- unlike __cbHalo's `if (window.__cbHalo) return` guard, a
+# stale epoch surviving a same-document re-run is exactly the silent-wrong-
+# click failure mode this exists to prevent: a snapshot taken before a
+# navigation must never resolve against the document that replaced it.
+#
+# __cbRegistry maps a ref ("e7") to the node snapshot() found there, plus a
+# signature (role/type/label) and a structural path -- both used by
+# __cbResolve as a fallback when the node itself has been replaced (a
+# framework re-render swaps DOM nodes but usually preserves their shape).
+SNAPSHOT_SHIM = r"""
+(function () {
+  window.__cbEpoch = Math.random().toString(36).slice(2);
+  window.__cbRegistry = window.__cbRegistry || {};
+  window.__cbRegister = function (ref, node, sig, path) {
+    window.__cbRegistry[ref] = { node: node, sig: sig, path: path };
+  };
+  window.__cbSig = function (node) {
+    var role = node.getAttribute('role') || node.tagName.toLowerCase();
+    var label = (node.getAttribute('aria-label')
+                 || (node.labels && node.labels[0] && node.labels[0].innerText)
+                 || node.getAttribute('placeholder')
+                 || node.innerText || '').trim().slice(0, 80);
+    return role + '|' + (node.type || '') + '|' + label;
+  };
+  window.__cbResolve = function (ref) {
+    var entry = window.__cbRegistry[ref];
+    if (!entry) return null;
+    if (entry.node && entry.node.isConnected
+        && window.__cbSig(entry.node) === entry.sig) return entry.node;
+    // Structural fallback: re-walk the recorded frame/nth-child path.
+    if (entry.path) {
+      try {
+        var node = document.querySelector(entry.path);
+        if (node && window.__cbSig(node) === entry.sig) return node;
+      } catch (e) {}
+    }
+    return null;
+  };
+})()
+"""
+
+
+def snapshot() -> str:
+    """Interactive elements as a compact, ref-indexed line list, not prose.
+
+    Same-origin iframes are walked (contentDocument is reachable from the
+    top frame); cross-origin ones are reported as unreachable rather than
+    silently yielding no matches -- an agent deciding a form cannot be
+    filled needs to know *why*, not just that nothing came back.
+
+    A <select>'s option COUNT is reported, never its option list: inlining
+    every <option> is exactly the per-turn token cost this feature exists to
+    avoid. An agent that needs the choices asks for them explicitly.
+    """
+    return r"""
+(function () {
+  var out = [];
+  var n = 0;
+  function label(el) {
+    var l = el.getAttribute('aria-label')
+      || (el.labels && el.labels[0] && el.labels[0].innerText)
+      || el.getAttribute('placeholder')
+      || (el.innerText || '').trim();
+    return (l || '').trim().slice(0, 80);
+  }
+  function sig(el) {
+    return (el.getAttribute('role') || el.tagName.toLowerCase())
+      + '|' + (el.type || '') + '|' + label(el);
+  }
+  function walk(doc, path) {
+    if (!doc) return;
+    var els = doc.querySelectorAll(
+      'input,textarea,select,button,a[href],[role=button],[contenteditable]');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (!(el.getClientRects().length > 0)) continue;
+      n++;
+      var ref = 'e' + n;
+      var elPath = path + ' ' + el.tagName.toLowerCase() + ':nth-child(' + (i + 1) + ')';
+      if (typeof window.__cbRegister === 'function') {
+        window.__cbRegister(ref, el, sig(el), elPath);
+      }
+      var row = { ref: ref, tag: el.tagName.toLowerCase(), label: label(el) };
+      if (el.tagName === 'SELECT') row.options = el.options.length;
+      if (el.tagName === 'A') row.href = el.href;
+      if (el.required) row.required = true;
+      out.push(row);
+    }
+    var frames = doc.querySelectorAll('iframe');
+    for (var j = 0; j < frames.length; j++) {
+      var f = frames[j];
+      try {
+        if (f.contentDocument) {
+          walk(f.contentDocument, path + ' f' + j);
+        } else {
+          out.push({ ref: 'f' + j, tag: 'iframe',
+                     origin: (new URL(f.src, location.href)).origin,
+                     reason: 'UNREACHABLE' });
+        }
+      } catch (e) {
+        out.push({ ref: 'f' + j, tag: 'iframe', reason: 'UNREACHABLE' });
+      }
+    }
+  }
+  walk(document, 'body');
+  return JSON.stringify({
+    ok: true, url: location.href,
+    epoch: window.__cbEpoch || null,
+    lines: out, counts: { total: out.length }
+  });
+})()
+"""
+
+
+def delta() -> str:
+    """A fragment of object-literal properties appended to every acting op's
+    return value: what actually changed, so the caller does not need a full
+    re-read to find out. Assumes an enclosing scope has already captured
+    `__cbUrlBefore` (the URL as it stood right before the action ran).
+
+    `blocked` reuses the same signals as BLOCKED above, compacted -- a click
+    that triggers a CAPTCHA is exactly the moment an agent needs to know
+    without spending a whole extra round trip on `blocked` to find out.
+    """
+    return r"""
+    url_changed: (location.href !== __cbUrlBefore),
+    epoch: window.__cbEpoch || null,
+    blocked: (function () {
+      var html = document.documentElement.innerHTML;
+      var title = (document.title || '').toLowerCase();
+      return /recaptcha/i.test(html) || /hcaptcha/i.test(html) ||
+             !!document.querySelector(
+               'iframe[src*="recaptcha"], .g-recaptcha, ' +
+               'iframe[src*="hcaptcha"], .h-captcha, ' +
+               '.cf-turnstile, #cf-challenge-stage') ||
+             title.indexOf('just a moment') >= 0;
+    })(),
+    changed: document.querySelectorAll(
+      '[aria-invalid="true"],[role="alert"],.error,:invalid').length,
+    errors: (function () {
+      var els = document.querySelectorAll('[aria-invalid="true"],[role="alert"],.error');
+      var msgs = [];
+      for (var i = 0; i < els.length && i < 5; i++) {
+        var t = (els[i].innerText || '').trim();
+        if (t) msgs.push(t);
+      }
+      return msgs;
+    })()
+"""
+
+
+def _resolve_target(selector: str) -> str:
+    """A ref target ("@e7") resolves via __cbResolve (populated by a prior
+    snapshot()); anything else is a plain querySelector -- unchanged
+    behavior for every existing caller that only ever passes a CSS
+    selector."""
+    if selector.startswith("@"):
+        return "(window.__cbResolve && window.__cbResolve(%s))" % _js_str(selector[1:])
+    return "document.querySelector(%s)" % _js_str(selector)
+
+
 def point(selector: str) -> str:
     """Scroll the match into view and send the cursor to it, without acting.
 
@@ -239,11 +424,13 @@ def point(selector: str) -> str:
 
 
 def click(selector: str) -> str:
-    """Click the first match. Reports whether anything was actually hit --
-    a silent no-op is the worst possible answer to give an agent."""
+    """Click the first match -- a plain CSS selector, or an "@ref" from a
+    prior snapshot(). Reports whether anything was actually hit -- a silent
+    no-op is the worst possible answer to give an agent -- plus a delta()
+    of what the click changed."""
     return (
         HALO +
-        "(function(){var e=document.querySelector(%s);"
+        "(function(){var __cbUrlBefore=location.href;var e=%s;"
         "if(!e)return JSON.stringify({ok:false,error:'no match'});"
         # Instant, not smooth: point() has usually centred this already, and
         # when it has not, the halo and the cursor must land on a settled rect
@@ -251,24 +438,69 @@ def click(selector: str) -> str:
         "e.scrollIntoView({block:'center'});"
         # After scrollIntoView, so the halo lands on where the element ended up.
         "window.__cbHaloAt(e);window.__cbCursorAt(e,true);e.click();"
-        "return JSON.stringify({ok:true,tag:e.tagName.toLowerCase()});})()"
-        % _js_str(selector)
+        "return JSON.stringify(Object.assign("
+        "{ok:true,tag:e.tagName.toLowerCase()},{%s}));})()"
+        % (_resolve_target(selector), delta())
     )
 
 
 def fill(selector: str, value: str) -> str:
     """Set a field's value and fire input+change, so frameworks that listen for
-    events (React, Vue) actually see the write. Assigning .value alone does not."""
+    events (React, Vue) actually see the write. Assigning .value alone does
+    not. `selector` is a plain CSS selector or an "@ref" from a prior
+    snapshot(); the result carries a delta() of what the write changed."""
     return (
         HALO +
-        "(function(){var e=document.querySelector(%s);"
+        "(function(){var __cbUrlBefore=location.href;var e=%s;"
         "if(!e)return JSON.stringify({ok:false,error:'no match'});"
         "e.scrollIntoView({block:'center'});window.__cbHaloAt(e);"
         "window.__cbCursorAt(e,true);"
         "e.focus();e.value=%s;"
         "e.dispatchEvent(new Event('input',{bubbles:true}));"
         "e.dispatchEvent(new Event('change',{bubbles:true}));"
-        "return JSON.stringify({ok:true});})()" % (_js_str(selector), _js_str(value))
+        "return JSON.stringify(Object.assign({ok:true},{%s}));})()"
+        % (_resolve_target(selector), _js_str(value), delta())
+    )
+
+
+def fill_many(pairs) -> str:
+    """Fill several fields in one round trip. `pairs` is a list of
+    (selector_or_ref, value) tuples, already resolved against the profile
+    vault by the caller -- this function only ever sees literal strings to
+    type, never a {profile:...} placeholder (see fills.py). One unresolvable
+    target does not abort the rest: each entry reports its own ok/error, so
+    a caller can see exactly which fields need a different selector."""
+    entries = ",".join(
+        "[%s, %s]" % (
+            ("'@' + " + _js_str(sel[1:])) if sel.startswith("@")
+            else _js_str(sel),
+            _js_str(val))
+        for sel, val in pairs)
+    return (
+        HALO +
+        r"""
+(function () {
+  var __cbUrlBefore = location.href;
+  var pairs = [%s];
+  var results = [];
+  for (var i = 0; i < pairs.length; i++) {
+    var target = pairs[i][0];
+    var el = target.charAt(0) === '@'
+      ? (window.__cbResolve && window.__cbResolve(target.slice(1)))
+      : document.querySelector(target);
+    if (!el) { results.push({ ok: false, target: target, error: 'no match' }); continue; }
+    el.scrollIntoView({ block: 'center' });
+    if (window.__cbHaloAt) window.__cbHaloAt(el);
+    if (window.__cbCursorAt) window.__cbCursorAt(el, true);
+    el.focus();
+    el.value = pairs[i][1];
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    results.push({ ok: true, target: target });
+  }
+  return JSON.stringify(Object.assign({ ok: true, results: results }, {%s}));
+})()
+""" % (entries, delta())
     )
 
 

@@ -60,6 +60,11 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
 #: no depth limit and no reason to exist.
 NOT_REPLAYABLE = frozenset({
     "playbook-record", "playbook-list", "playbook-run", "playbook-delete",
+    # Carries a raw credential in its own params -- is_secret_step only ever
+    # looks at fill/eval/fill-many, so without this a recording in progress
+    # while someone saves a password would write it to the playbook file
+    # verbatim.
+    "save-password",
 })
 
 #: What a credential field looks like from the outside. Matched against a CSS
@@ -103,15 +108,53 @@ def replayable(name):
 def is_secret_step(op_name, params):
     """Would recording this step write a credential to disk?
 
-    Only two ops carry free text that could be one: `fill` types a value into a
-    field the selector names, and `eval` can carry anything at all. Everything
-    else is a URL, a selector, or a number.
+    Three ops carry free text that could be one: `fill` types a value into a
+    field the selector names, `eval` can carry anything at all, and
+    `fill-many` types several values at once. Everything else is a URL, a
+    selector, or a number.
     """
     if op_name == "fill":
         return bool(SECRET_HINT.search(str(params.get("selector") or "")))
     if op_name == "eval":
         return bool(SECRET_HINT.search(str(params.get("js") or "")))
+    if op_name == "fill-many":
+        try:
+            fields = json.loads(params.get("fields") or "{}")
+        except ValueError:
+            return False
+        if not isinstance(fields, dict):
+            return False
+        # Keys only -- never the value. Matching a value here would violate
+        # the rule this function exists to enforce (see the module docstring:
+        # a pattern that has to read the value has already loaded the secret
+        # into a variable someone then has to be careful with).
+        return any(SECRET_HINT.search(str(k)) for k in fields)
     return False
+
+
+def _host_of(url):
+    from urllib.parse import urlparse
+
+    try:
+        return urlparse(url).hostname or ""
+    except ValueError:
+        return ""
+
+
+def _inferred_match(steps):
+    """The host of the first navigate/open step, or None.
+
+    Purely advisory -- see Playbooks.matching -- so a step shape this cannot
+    parse just means no match is offered, not a save failure.
+    """
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if step.get("op") in ("navigate", "open"):
+            host = _host_of((step.get("params") or {}).get("url", ""))
+            if host:
+                return host
+    return None
 
 
 def _coerce(param, value):
@@ -471,11 +514,26 @@ class Playbooks:
             "name": name,
             "created": int(time.time()),
             "skipped_secrets": int(skipped),
+            "match": _inferred_match(steps),
             "steps": [{"op": s["op"], "params": dict(s.get("params") or {})}
                       for s in steps],
         }
         self._write(books)
         return books[name]
+
+    def matching(self, url):
+        """Names of saved playbooks whose recorded host equals `url`'s host.
+
+        Purely advisory -- surfaced on a nav result so the caller can decide
+        whether to look closer, never auto-replayed. A playbook with no
+        inferred `match` (an old file, or one with no navigate/open step) is
+        never suggested.
+        """
+        host = _host_of(url)
+        if not host:
+            return []
+        return sorted(name for name, book in self._read().items()
+                      if book.get("match") and host == book["match"])
 
     def delete(self, name):
         books = self._read()
