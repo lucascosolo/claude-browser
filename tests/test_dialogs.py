@@ -40,6 +40,22 @@ class TestAnswer(unittest.TestCase):
                 dialogs.answer("popup", pol)
 
 
+class TestEffectivePolicy(unittest.TestCase):
+    def test_auto_only_when_driven(self):
+        e = dialogs.effective_policy
+        self.assertEqual(e("auto", True), "auto")
+        self.assertEqual(e("auto", False), "ask")
+        self.assertEqual(e("ask", True), "ask")
+        self.assertEqual(e("ask", False), "ask")
+        self.assertEqual(e("auto", None), "ask")
+
+    def test_undriven_auto_answers_ask_for_every_kind(self):
+        for kind in dialogs.KINDS:
+            self.assertEqual(
+                dialogs.answer(kind, dialogs.effective_policy("auto", False)),
+                ("ask", None), kind)
+
+
 class TestLog(unittest.TestCase):
     def test_entry_shape_and_timestamp(self):
         e = dialogs.Log().add("prompt", "name?", "bob", "accept")

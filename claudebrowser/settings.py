@@ -572,9 +572,10 @@ SETTINGS = (
     Setting(
         "CB_DIALOGS", "Claude", "Page dialogs",
         "auto (default) answers alert, confirm, prompt and leave-page dialogs at "
-        "once -- closed, accepted, the prompt's default text -- so an agent is "
-        "never stuck behind a modal it cannot see. ask shows them to you instead. "
-        "Either way each one is logged on its tab.",
+        "once -- closed, accepted, the prompt's default text -- on a tab an "
+        "agent has driven in the last 30 seconds, so it is never stuck behind a "
+        "modal it cannot see. Your own tabs always show you their dialogs. ask "
+        "shows every dialog to you. Either way each one is logged on its tab.",
         "choice", "auto",
         "Next dialog",
         "Read from the settings file every time a page opens a dialog.",

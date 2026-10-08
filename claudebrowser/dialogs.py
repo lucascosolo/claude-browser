@@ -4,8 +4,10 @@ GTK-free so the policy table and the log are tested. An agent driving a page
 cannot see a modal dialog, and WebKit's own one blocks the page's script until
 a person answers it -- so a confirm() behind a click looks to the agent like a
 click that did nothing. Under "auto" the browser answers the way a user who
-wanted the action would; under "ask" WebKit shows its dialog as before. Either
-way the dialog is logged on the tab, so the agent can read what was said.
+wanted the action would, but only on a tab an agent is driving: a person's own
+tab is always "ask", because a confirm() accepted behind their back is an
+action they never agreed to. Under "ask" WebKit shows its dialog as before.
+Either way the dialog is logged on the tab, so the agent can read what was said.
 """
 from collections import deque
 from datetime import datetime, timezone
@@ -17,6 +19,11 @@ MESSAGE_MAX = 2000
 
 def policy(value):
     return "ask" if str(value or "").strip().lower() == "ask" else "auto"
+
+
+def effective_policy(policy, driven):
+    """"auto" only for a tab an agent is driving; every other tab asks."""
+    return "auto" if policy == "auto" and driven else "ask"
 
 
 def answer(kind, policy, default_text=""):

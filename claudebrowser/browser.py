@@ -34,6 +34,8 @@ from .urls import normalize  # noqa: E402
 HOME = os.environ.get("CB_HOME", "cb:home")
 # `download` waits this long (the op's own timeout) before cancelling.
 DOWNLOAD_TIMEOUT_S = 300
+PRIVATE_DOWNLOAD_ERROR = ("this tab is private; downloads from it are off "
+                          "(CB_PRIVATE_DOWNLOADS)")
 # `upload` re-reads the input this often, this many times, for the files.
 UPLOAD_CHECK_MS = 150
 UPLOAD_CHECKS = 10
@@ -198,6 +200,10 @@ PAGE_MIN = 120
 # Long enough to bridge the gap between steps in an agent loop, short enough
 # that the glow is gone before the user wonders whether it is stuck on.
 AGENT_GLOW_MS = 2600
+# A dialog is auto-answered only on a tab an agent touched this recently. The
+# glow is too short: a model can think for longer than 2.6 s between a click
+# and the dialog it causes, and that dialog still belongs to the agent.
+DIALOG_DRIVEN_S = 30
 
 # How often the resource guard reads /proc. Two small file reads, so the cost is
 # not the poll -- it is that a poll too far apart lets a tab storm get all the
@@ -2462,7 +2468,8 @@ class Browser(Gtk.Window):
         # pay for a reload. `needs_tab` funnels every tab-targeted API call
         # through here, which is the same reason the glow lives here.
         tab.touch()
-        tab.agent_until = time.monotonic() + AGENT_GLOW_MS / 1000.0
+        tab.agent_at = time.monotonic()
+        tab.agent_until = tab.agent_at + AGENT_GLOW_MS / 1000.0
         if getattr(tab, "label_box", None):
             tab.label_box.get_style_context().add_class("cb-agent")
         self._paint_agent_frame()
@@ -3327,6 +3334,11 @@ class Browser(Gtk.Window):
                 download.cancel()
             except Exception:
                 pass
+            # The policy can change between api_download's check and here; a
+            # waiting `download` call is answered now, not by its timer.
+            agent = self._dl_claim(download)
+            if agent:
+                agent["answer"]({"ok": False, "error": PRIVATE_DOWNLOAD_ERROR})
             self._flash("Download cancelled — this tab is private. "
                         "Allow it in cb:settings.")
             return
@@ -3567,16 +3579,25 @@ class Browser(Gtk.Window):
         """The pending agent `download` this WebKit download belongs to, removed
         from the pending table, or None for an ordinary one. Matched on the URI
         WebKit reports; a redirect changes it, so with no exact match the most
-        recently registered entry is taken."""
+        recent entry registered *by the tab this download came from* is taken.
+        Anything else is a person's own download and gets the offer row."""
         if not self.pending_downloads:
             return None
         try:
             uri = download.get_request().get_uri()
         except Exception:
             uri = None
-        key = uri if uri in self.pending_downloads else next(
-            reversed(self.pending_downloads))
-        return self.pending_downloads.pop(key)
+        if uri in self.pending_downloads:
+            return self.pending_downloads.pop(uri)
+        try:
+            view = download.get_web_view()
+        except Exception:
+            view = None
+        for key in reversed(list(self.pending_downloads)):
+            tab = self.find(self.pending_downloads[key]["tab"])
+            if view is not None and tab is not None and tab.view is view:
+                return self.pending_downloads.pop(key)
+        return None
 
     @needs_tab
     def api_download(self, tab, url, path, overwrite, done):
@@ -3588,8 +3609,7 @@ class Browser(Gtk.Window):
         URL, so _on_download routes it here instead of to the offer row.
         """
         if tab.private and not storage.private_downloads_enabled():
-            return done({"ok": False, "error": "this tab is private, so downloads "
-                         "are not written to disk (CB_PRIVATE_DOWNLOADS)"})
+            return done({"ok": False, "error": PRIVATE_DOWNLOAD_ERROR})
         if not os.path.isabs(path or ""):
             return done({"ok": False, "error": "path must be absolute"})
         if not os.path.isdir(os.path.dirname(path)):
@@ -3622,7 +3642,7 @@ class Browser(Gtk.Window):
             return GLib.SOURCE_REMOVE
 
         entry = {"path": path, "overwrite": bool(overwrite), "existed": existed,
-                 "answer": answer}
+                 "answer": answer, "tab": tab.id}
         self.pending_downloads[url] = entry
         GLib.timeout_add_seconds(DOWNLOAD_TIMEOUT_S, timed_out)
         try:
@@ -3648,8 +3668,12 @@ class Browser(Gtk.Window):
         if kind is None:
             return False
         default = dialog.prompt_get_default_text() if kind == "prompt" else None
-        action, value = dialogs.answer(
-            kind, dialogs.policy(envfile.setting("CB_DIALOGS")), default or "")
+        # A person's own tab always sees its dialogs: a confirm() accepted
+        # behind their back is a deletion they never agreed to.
+        driven = time.monotonic() - getattr(tab, "agent_at", -1e9) < DIALOG_DRIVEN_S
+        policy = dialogs.effective_policy(
+            dialogs.policy(envfile.setting("CB_DIALOGS")), driven)
+        action, value = dialogs.answer(kind, policy, default or "")
         tab.dialogs.add(kind, dialog.get_message(), default, action)
         if action == "ask":
             return False
