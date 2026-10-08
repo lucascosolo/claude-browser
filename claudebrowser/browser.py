@@ -4051,6 +4051,70 @@ class Browser(Gtk.Window):
     def api_wait(self, tab, done):
         self._await_load(tab, True, done)
 
+    @needs_tab
+    def api_wait_for(self, tab, selector, text, url, gone, timeout, done):
+        """Poll one JS predicate every 250 ms until a condition holds.
+
+        Goes through api_eval, so a discarded tab is restored first. An eval
+        error -- the page is mid-navigation and has no context to answer in --
+        is "not yet", not failure: waiting through a load is the point.
+        """
+        try:
+            js = extract.wait_predicate(selector, text, url, bool(gone))
+            seconds = max(1, min(120, int(timeout if timeout not in (None, "") else 20)))
+        except (ValueError, TypeError) as e:
+            return done({"ok": False, "error": str(e)})
+        what = ", ".join(
+            [("selector %s to disappear" if gone else "selector %s") % selector]
+            * bool(selector)
+            + ["text %s" % text] * bool(text) + ["url %s" % url] * bool(url))
+        start = time.monotonic()
+        state = {"finished": False}
+
+        def finish(payload):
+            if state["finished"]:
+                return
+            state["finished"] = True
+            done(payload)
+
+        def elapsed_ms():
+            return int((time.monotonic() - start) * 1000)
+
+        def on_result(payload):
+            if state["finished"]:
+                return
+            if payload.get("error") == "no such tab":
+                return finish(payload)
+            result = payload.get("result") if payload.get("ok") else None
+            matched = result.get("matched") if isinstance(result, dict) else None
+            if matched:
+                return finish({"ok": True, "matched": matched,
+                               "elapsed_ms": elapsed_ms()})
+            if time.monotonic() - start >= seconds:
+                return timed_out()
+            GLib.timeout_add(250, poll)
+
+        def poll():
+            if not state["finished"]:
+                self.api_eval(tab.id, js, on_result)
+            return GLib.SOURCE_REMOVE
+
+        def timed_out():
+            finish({"ok": False,
+                    "error": "timed out after %ds waiting for %s" % (seconds, what)})
+            return GLib.SOURCE_REMOVE
+
+        # The deadline is its own timer: an eval that never answers (a page
+        # hung mid-navigation) must not turn a bounded wait into an unbounded one.
+        GLib.timeout_add(seconds * 1000 + 500, timed_out)
+        poll()
+
+    @needs_tab
+    def api_scroll(self, tab, to, by, done):
+        if (to in (None, "")) == (by is None):
+            return done({"ok": False, "error": "give exactly one of to, by"})
+        self.api_eval(tab.id, extract.scroll_js(to or None, by), done)
+
     def api_present(self, done):
         """Raise the window. Used by a second launch after it hands over its
         URLs -- opening a link that lands in a window behind three others has

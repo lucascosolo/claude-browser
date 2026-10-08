@@ -436,6 +436,8 @@ class TestApiRegistry(unittest.TestCase):
             "/import-chrome": {},
             "/passwords/save": {"origin": "https://example.com", "username": "a",
                                 "password": "b"},
+            "/wait/for": {"selector": "a"}, "/scroll": {"to": "bottom"},
+            "/tables": {},
         }
         # /health is served without touching the browser, so it has no builder.
         callable_routes = {op.route for op in self.api.OPS if op.call}
@@ -445,6 +447,27 @@ class TestApiRegistry(unittest.TestCase):
             method, call_args = self.dispatch(route, args)
             self.assertTrue(method.startswith("api_"), route)
             self.assertIsInstance(call_args, tuple, route)
+
+    def test_scoped_reads_use_the_constant_without_a_selector(self):
+        for route, const, key in [("/text", "TEXT", None), ("/markdown", "MARKDOWN", None),
+                                  ("/links", "LINKS", None), ("/html", "HTML", None)]:
+            method, (tab, js) = self.dispatch(route, {})
+            self.assertEqual(method, "api_eval", route)
+            self.assertEqual(js, getattr(extract, const), route)
+            method, (tab, js) = self.dispatch(route, {"selector": "#main"})
+            self.assertEqual(method, "api_eval", route)
+            self.assertIn(extract._js_str("#main"), js, route)
+            self.assertNotEqual(js, getattr(extract, const), route)
+        method, (tab, js) = self.dispatch("/find", {"q": "x"})
+        self.assertEqual(method, "api_eval")
+        self.assertEqual(js, extract.find("x"))
+        method, (tab, js) = self.dispatch("/find", {"q": "x", "selector": "#main"})
+        self.assertIn(extract._js_str("#main"), js)
+
+    def test_chunk1_ops_dispatch_to_their_methods(self):
+        self.assertEqual(self.dispatch("/wait/for", {"selector": "a"})[0], "api_wait_for")
+        self.assertEqual(self.dispatch("/scroll", {"to": "bottom"})[0], "api_scroll")
+        self.assertEqual(self.dispatch("/tables", {})[0], "api_eval")
 
     def test_clear_carries_its_kind_through_and_documents_pagetext(self):
         """The page-text cache is the most personal thing on disk, so it is

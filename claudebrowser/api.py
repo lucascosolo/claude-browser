@@ -116,6 +116,25 @@ def _js_call(name, *arg_names):
     return build
 
 
+def _js_scoped(name, *lead):
+    """A read op with an optional `selector`. Without one it is the constant,
+    byte for byte, so callers that never pass a selector are unchanged."""
+    def build(_control, args):
+        from . import extract
+
+        fn = getattr(extract, name)
+        return "api_eval", (_tab(args), fn(*[args[a] for a in lead],
+                                           args.get("selector") or None))
+    return build
+
+
+def _tables(_control, args):
+    from . import extract
+
+    return "api_eval", (_tab(args), extract.tables(args.get("selector") or None,
+                                                   int(args.get("limit") or 200)))
+
+
 def _tab(args):
     raw = args.get("tab")
     return int(raw) if raw not in (None, "") else None
@@ -189,6 +208,24 @@ OPS = [
     Op("wait", "/wait", "POST", "Block until the tab's current load finishes.",
        call=lambda c, a: ("api_wait", (_tab(a),)), timeout=120),
 
+    Op("wait-for", "/wait/for", "POST", "Block until a condition holds on the "
+       "page: an element is visible (or, with gone, absent), the page text "
+       "matches a regex, or the URL matches a regex. Use after a click that "
+       "triggers a slow update. Fails with a timeout error if nothing matches.",
+       params=[Param("selector", help="CSS selector or @ref that must be visible.",
+                     cli="opt"),
+               Param("text", help="Regex the page text must match.", cli="opt"),
+               Param("url", help="Regex the URL must match.", cli="opt"),
+               Param("gone", "boolean", "Wait for the selector to disappear instead.",
+                     cli="opt", default=False),
+               Param("timeout", "integer", "Seconds to wait (default 20, max 120).",
+                     cli="opt")],
+       call=lambda c, a: ("api_wait_for", (_tab(a), a.get("selector") or None,
+                                           a.get("text") or None, a.get("url") or None,
+                                           _truthy(a.get("gone"), False),
+                                           a.get("timeout"))),
+       timeout=130),
+
     Op("close", "/close", "POST", "Close a tab.",
        call=lambda c, a: ("api_close", (_tab(a),))),
 
@@ -206,19 +243,31 @@ OPS = [
 
     Op("text", "/text", "GET", "Read the page as clean text, with nav/script/footer "
        "chrome stripped. Use this first when verifying what a page says.",
-       call=_js("TEXT")),
+       params=[Param("selector", help="Limit to this element: CSS selector or @ref.", cli="opt")],
+       call=_js_scoped("text")),
 
     Op("markdown", "/markdown", "GET", "Read the page as markdown, preserving "
        "headings, links and code blocks.",
-       call=_js("MARKDOWN")),
+       params=[Param("selector", help="Limit to this element: CSS selector or @ref.", cli="opt")],
+       call=_js_scoped("markdown")),
 
     Op("links", "/links", "GET", "List every link on the page as absolute URLs "
        "with their labels.",
-       call=_js("LINKS")),
+       params=[Param("selector", help="Limit to this element: CSS selector or @ref.", cli="opt")],
+       call=_js_scoped("links")),
 
     Op("html", "/html", "GET", "Get the page's full outer HTML. Prefer text unless "
        "you need the markup.",
-       call=_js("HTML")),
+       params=[Param("selector", help="Limit to this element: CSS selector or @ref.", cli="opt")],
+       call=_js_scoped("html")),
+
+    Op("tables", "/tables", "GET", "Read the page's tables as structured rows: "
+       "each has a caption, headers and rows of cell text. Cells that span "
+       "rows or columns are not expanded.",
+       params=[Param("selector", help="A table, or an element containing tables: "
+                     "CSS selector or @ref. Default: every table.", cli="opt"),
+               Param("limit", "integer", "Rows per table (default 200).", cli="opt")],
+       call=_tables),
 
     # Reader mode is a *display* change, not a read: it answers with a summary
     # of what it found, not the article. An agent that wants the prose still
@@ -241,8 +290,9 @@ OPS = [
 
     Op("find", "/find", "GET", "Search the rendered page text for a regex and "
        "return matches with context.",
-       params=[Param("q", required=True, help="Regex to search for.")],
-       call=_js_call("find", "q")),
+       params=[Param("q", required=True, help="Regex to search for."),
+               Param("selector", help="Limit to this element: CSS selector or @ref.", cli="opt")],
+       call=_js_scoped("find", "q")),
 
     Op("snapshot", "/snapshot", "GET", "List the page's interactive elements "
        "(inputs, buttons, links) as a compact, ref-indexed manifest -- use this "
@@ -254,6 +304,17 @@ OPS = [
        "selector, or a @ref from `snapshot` (e.g. \"@e7\").",
        params=[Param("selector", required=True)],
        call=_js_call("click", "selector")),
+
+    Op("scroll", "/scroll", "POST", "Scroll the page: `to` is top, bottom, a CSS "
+       "selector or a @ref (centred in view), or `by` is a signed pixel count. "
+       "Answers the scroll position and whether the page bottom is reached. "
+       "Give exactly one of to, by.",
+       params=[Param("to", help="top, bottom, a CSS selector or @ref.", cli="opt"),
+               Param("by", "integer", "Pixels to scroll; negative scrolls up.",
+                     cli="opt")],
+       call=lambda c, a: ("api_scroll", (_tab(a), a.get("to") or None,
+                                         None if a.get("by") in (None, "")
+                                         else int(a["by"])))),
 
     Op("fill", "/fill", "POST", "Set an input's value and dispatch input/change "
        "so frameworks notice. `selector` is a CSS selector or a @ref from "

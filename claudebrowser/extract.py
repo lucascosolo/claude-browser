@@ -504,15 +504,155 @@ def fill_many(pairs) -> str:
     )
 
 
-def find(pattern: str) -> str:
-    """Case-insensitive text search over the rendered page, with context."""
+def find(pattern: str, selector=None) -> str:
+    """Case-insensitive text search over the rendered page, with context.
+    With a selector (CSS or "@ref") only that element's innerText is searched,
+    and a selector that matches nothing answers "no match"."""
+    if selector:
+        source = ("var r=%s;if(!r)return JSON.stringify({ok:false,error:'no match'});"
+                  "var t=r.innerText||'';" % _resolve_target(selector))
+    else:
+        source = "var t=document.body?document.body.innerText:'';"
     return (
-        "(function(){var re=new RegExp(%s,'gi');"
-        "var t=document.body?document.body.innerText:'';var m,out=[];"
+        "(function(){var re=new RegExp(%s,'gi');" % _js_str(pattern) + source +
+        "var m,out=[];"
         "while((m=re.exec(t))&&out.length<50){"
         "out.push(t.slice(Math.max(0,m.index-80),m.index+m[0].length+80).replace(/\\s+/g,' '));"
         "if(m.index===re.lastIndex)re.lastIndex++;}"
-        "return JSON.stringify({count:out.length,matches:out});})()" % _js_str(pattern)
+        "return JSON.stringify({count:out.length,matches:out});})()"
+    )
+
+
+_MAIN_ROOT = """var root = document.querySelector('main,article,[role="main"]') || document.body;"""
+
+
+def _scoped_root(snippet: str, selector, anchor: str, replacement: str) -> str:
+    assert anchor in snippet, "walker changed; scoped read needs updating"
+    return snippet.replace(anchor, replacement % _resolve_target(selector), 1)
+
+
+def _scoped(const: str, selector, anchor: str, replacement: str) -> str:
+    if not selector:
+        return const
+    return _scoped_root(const, selector, anchor, replacement)
+
+
+_NO_MATCH = "if (!root) return JSON.stringify({ok:false,error:'no match'});"
+
+
+def text(selector=None) -> str:
+    """TEXT rooted at the match; with no selector, TEXT itself, byte for byte."""
+    return _scoped(TEXT, selector, _MAIN_ROOT, "var root = %s; " + _NO_MATCH)
+
+
+def markdown(selector=None) -> str:
+    """MARKDOWN rooted at the match; with no selector, MARKDOWN itself."""
+    return _scoped(MARKDOWN, selector, _MAIN_ROOT, "var root = %s; " + _NO_MATCH)
+
+
+def links(selector=None) -> str:
+    """LINKS limited to anchors under the match; with no selector, LINKS."""
+    if not selector:
+        return LINKS
+    anchor = "var seen = {}, out = [];"
+    assert anchor in LINKS and "document.querySelectorAll('a[href]')" in LINKS
+    scoped = LINKS.replace(
+        anchor,
+        "var root = %s; " % _resolve_target(selector) + _NO_MATCH + " " + anchor, 1)
+    return scoped.replace("document.querySelectorAll('a[href]')",
+                          "root.querySelectorAll('a[href]')", 1)
+
+
+def html(selector=None) -> str:
+    """The match's outer HTML; with no selector, HTML itself."""
+    if not selector:
+        return HTML
+    return ("(function(){var e=%s;"
+            "if(!e)return JSON.stringify({ok:false,error:'no match'});"
+            "return JSON.stringify({url:location.href,html:e.outerHTML});})()"
+            % _resolve_target(selector))
+
+
+def wait_predicate(selector=None, text=None, url=None, gone=False) -> str:
+    """One expression answering {"matched": "selector"|"text"|"url"|null}: the
+    first condition that holds right now. Polled by Browser.api_wait_for.
+    `selector` means present and visible, or -- with gone -- not visible.
+    `text` and `url` are case-insensitive regexes; a bad regex never matches."""
+    if not (selector or text or url):
+        raise ValueError("wait-for needs at least one of selector, text, url")
+    parts = ["var m=null,gone=%s;" % ("true" if gone else "false")]
+    branches = []
+    if selector:
+        branches.append(
+            "if(function(){var e=%s;var v=!!(e&&e.getClientRects&&e.getClientRects().length>0);"
+            "return gone?!v:v;}())m='selector';" % _resolve_target(selector))
+    if text:
+        branches.append(
+            "if(new RegExp(%s,'i').test(document.body?document.body.innerText:''))m='text';"
+            % _js_str(text))
+    if url:
+        branches.append("if(new RegExp(%s,'i').test(location.href))m='url';" % _js_str(url))
+    parts.append("try{" + "else ".join(branches) + "}catch(x){}")
+    parts.append("return JSON.stringify({matched:m});")
+    return "(function(){" + "".join(parts) + "})()"
+
+
+def scroll_js(to=None, by=None) -> str:
+    """Scroll the window to "top", "bottom", or an element (CSS or "@ref"), or
+    by a signed pixel count. Answers {ok, x, y, height, viewport, at_bottom}.
+    An element target is centred instantly (so the numbers describe where it
+    ended up, as in click) and the halo cursor is sent to it."""
+    if (to in (None, "")) == (by is None):
+        raise ValueError("scroll needs exactly one of to, by")
+    if by is not None:
+        act = "window.scrollBy({top:%d,left:0,behavior:'instant'});" % int(by)
+    elif to == "top":
+        act = "window.scrollTo({top:0,behavior:'instant'});"
+    elif to == "bottom":
+        act = ("window.scrollTo({top:document.documentElement.scrollHeight,"
+               "behavior:'instant'});")
+    else:
+        act = ("var e=%s;if(!e)return JSON.stringify({ok:false,error:'no match'});"
+               "e.scrollIntoView({block:'center',inline:'center'});"
+               "window.__cbCursorAt(e,false);" % _resolve_target(to))
+    # HALO is a statement; the comma form keeps the whole snippet one expression.
+    return (
+        "(" + HALO.strip().rstrip(";") + ",(function(){" + act +
+        "var d=document.documentElement,y=Math.round(window.scrollY),"
+        "vp=window.innerHeight,h=d.scrollHeight;"
+        "return JSON.stringify({ok:true,x:Math.round(window.scrollX),y:y,height:h,"
+        "viewport:vp,at_bottom:(y+vp>=h-2)});})())"
+    )
+
+
+def tables(selector=None, limit=200) -> str:
+    """Every <table> (or those under `selector`) as {caption, headers, rows}.
+    Headers come from <thead>, else from a first row made only of <th>. Cell
+    text is innerText with whitespace collapsed. rowspan and colspan are NOT
+    expanded: a spanning cell appears once, in the row that declares it, so
+    later rows can be shorter than the header. `limit` caps rows per table."""
+    limit = int(limit)
+    if selector:
+        scope = ("var r=%s;if(!r)return JSON.stringify({ok:false,error:'no match'});"
+                 "var ts=r.tagName==='TABLE'?[r]:r.querySelectorAll('table');"
+                 % _resolve_target(selector))
+    else:
+        scope = "var ts=document.querySelectorAll('table');"
+    return (
+        "(function(){" + scope +
+        "var LIMIT=%d;" % limit +
+        "function cell(c){return (c.innerText||c.textContent||'').replace(/\\s+/g,' ').trim();}"
+        "function row(tr){return Array.prototype.map.call(tr.cells,cell);}"
+        "var out=[];Array.prototype.forEach.call(ts,function(t){"
+        "var rs=Array.prototype.slice.call(t.rows),headers=[];"
+        "var hr=t.tHead&&t.tHead.rows.length?t.tHead.rows[0]:null;"
+        "if(!hr&&rs.length&&Array.prototype.every.call(rs[0].cells,function(c){return c.tagName==='TH';})"
+        "&&rs[0].cells.length)hr=rs[0];"
+        "if(hr){headers=row(hr);rs=rs.filter(function(r){return r!==hr&&"
+        "!(t.tHead&&t.tHead.contains(r));});}"
+        "var cap=t.caption?cell(t.caption):'';"
+        "out.push({caption:cap,headers:headers,rows:rs.slice(0,LIMIT).map(row)});});"
+        "return JSON.stringify({ok:true,tables:out});})()"
     )
 
 
