@@ -474,8 +474,18 @@ A few of these carry a rule worth knowing:
   chooser request when the input is clicked. A human clicking the same input
   still gets the ordinary chooser.
 - **`download` fetches with the tab's session** and writes exactly where it
-  was told, refusing to overwrite without `--overwrite`. A private tab refuses
-  it unless `CB_PRIVATE_DOWNLOADS` allows.
+  was told, refusing to overwrite without `--overwrite` (`pdf` has the same
+  flag). A private tab refuses it unless `CB_PRIVATE_DOWNLOADS` allows.
+- **File operations are confined to `CB_AGENT_DIRS`.** `upload` reads only
+  from, and `download` and `pdf` write only under, the directories in that
+  setting — `~/Downloads` and `~/.cache/claude-browser` by default, colon
+  separated, symlinks resolved before the check. A page can steer an agent
+  toward a selector or a URL; it must not be able to steer it toward your
+  settings file or your SSH keys. The refusal names the setting so the fix is
+  one line in `cb:settings`.
+- **`type` is never recorded into a playbook without a selector**, and with
+  one it follows `fill`'s credential rule: it writes to whatever has focus,
+  which may be a password field.
 - **`network` is per tab, in memory only, and resets on each navigation.** It
   is what `wait-for --idle` reads to decide the page has settled.
 - **A screenshot or PDF of a private tab is never written to disk** — omit the
@@ -487,8 +497,11 @@ The browser runs straight from its checkout, and the installed launcher is a
 symlink into it. When a commit lands there, the running window restarts itself
 onto the new code — once nothing is loading, no agent or playbook is active, no
 download is running, and neither the control API nor the keyboard has been used
-for half a minute. Tabs come back through the saved session. `CB_AUTOUPDATE=0`
-turns it off; `cbctl restart` restarts at once regardless.
+for half a minute, no private tab is open, session restore is on, and the new
+tree compiles and imports (a commit that does not is reported once and left
+alone). Tabs come back through the saved session. `CB_AUTOUPDATE=0` turns it
+off; `cbctl restart` restarts at once regardless, with only the compile check
+kept.
 
 ### Playbooks: record a sequence, replay it later
 
@@ -776,7 +789,7 @@ session eats it. It is a fallback, not a foundation.
 CB_AUTOSTART=0 python3 -m unittest discover -s tests
 ```
 
-1055 tests, about 4 seconds, no display needed. `CB_AUTOSTART=0` matters:
+1083 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
 `test_offline.py` runs `cbctl` and `cb-mcp` as real subprocesses, and those
 launch the browser on demand unless told not to.
 

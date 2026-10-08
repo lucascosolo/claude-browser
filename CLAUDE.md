@@ -25,7 +25,9 @@ claudebrowser/
   personas.py  named answering styles composed onto ai.py's prompts (GTK-free)
   playbooks.py recorded op sequences: capture, validation, JSON store,
                {param:NAME} substitution (GTK-free)
-  update.py    self-update: reads .git/HEAD, decides when a restart is safe (GTK-free)
+  update.py    self-update: reads .git/HEAD, decides when a restart is safe,
+               preflights the new tree (GTK-free)
+  files.py     CB_AGENT_DIRS containment for upload/download/pdf paths (GTK-free)
   dialogs.py   script-dialog policy + per-tab log (GTK-free)
   uploads.py   path checks + the pending-upload handshake for `upload` (GTK-free)
   netlog.py    per-tab request log behind `network` and `wait-for --idle` (GTK-free)
@@ -61,7 +63,7 @@ tests/         unittest, no display needed
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
 ./cbctl settings                            # every setting; add KEY VALUE to change one
-CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 1055 tests, ~4s, no display
+CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 1083 tests, ~6s, no display
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
@@ -310,6 +312,24 @@ stronger gate; on those four, py_compile is the only one there is.
   `COMMITTED`, so a plain reset would drop the very entry that names the page.
   Compare the resource to `get_main_resource()` with `==`, never `is`:
   PyGObject can hand out two wrappers for one GObject.
+- **Every path an agent op reads or writes goes through `files.py`.**
+  `upload` → `contain_read`, `download` and `pdf` → `contain_write`, each
+  against the realpath'd roots of `CB_AGENT_DIRS`, with the file (or its
+  parent, for a write) realpath'd first so a symlink out of a root is refused.
+  The reasoning is the table's own rule about `settings`: a selector or a URL
+  can come from a page, so an op that takes a filesystem path from the same
+  caller is an op a page can aim at `~/.config/claude-browser/env` or
+  `~/.ssh`. A new op that takes a path uses the same two functions or it is the
+  hole again. `screenshot` is deliberately outside this: it writes pixels of a
+  page the caller already drives.
+- **Self-update never restarts into a break.** `update.preflight` byte-compiles
+  the new tree and imports the GTK-free modules in a subprocess before the
+  quit, once per revision; a failing commit is flashed once and left alone. It
+  also holds while a private tab exists (a restart would silently drop it) and
+  when `CB_RESTORE_SESSION` is off. `control.inflight` and the playbook-run
+  counter are part of `idle()` because `last_request_at` is stamped when a
+  request *starts*: a 120 s `wait-for` or a 600 s playbook would otherwise look
+  idle twenty seconds in.
 - **`press` dispatches the events and then applies the default action.** A
   synthetic `KeyboardEvent` has no default action in any browser, so Enter
   submitting a form, Tab moving focus and Escape blurring are done by hand in
