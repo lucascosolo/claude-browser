@@ -31,6 +31,14 @@ credential-shaped field is dropped at capture time rather than written and
 redacted later, so the secret never reaches the file at all. Replay leans on the
 browser's own autofill for those fields, which reads the keyring against the
 *focused view's* URL -- the only path in this project allowed to hold a secret.
+
+**Parameters.** A string value in a step may carry `{param:NAME}`; the caller
+supplies the values at run time. The recorder never parametrises anything: a
+person edits the JSON file, or records with a literal and replaces it with
+`{param:NAME}`. Substitution runs after `validate` and before any step, and the
+result is validated again, so a missing value refuses the whole run before the
+browser has moved. `{profile:...}` placeholders are a different mechanism and
+pass through untouched.
 """
 
 import json
@@ -189,6 +197,54 @@ def _coerce(param, value):
     if value is None:
         raise PlaybookError("%s has no value" % param.name)
     return str(value)
+
+
+#: `{param:NAME}`; group 1 is the name.
+PARAM_RE = re.compile(r"\{param:([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _step_strings(steps):
+    for step in steps:
+        params = step.get("params") if isinstance(step, dict) else None
+        if isinstance(params, dict):
+            for value in params.values():
+                if isinstance(value, str):
+                    yield value
+
+
+def params_of(steps):
+    """Sorted, unique names of the `{param:NAME}` placeholders in these steps."""
+    return sorted({m for text in _step_strings(steps)
+                   for m in PARAM_RE.findall(text)})
+
+
+def substitute(steps, values):
+    """New steps with every `{param:NAME}` replaced; the input is not mutated.
+
+    Raises PlaybookError naming the first missing parameter, or a non-string
+    value (values arrive as raw JSON and are spliced into text).
+    """
+    values = values or {}
+    for key, value in values.items():
+        if not isinstance(value, str):
+            raise PlaybookError("parameter %s must be a string" % key)
+
+    def fill(match):
+        name = match.group(1)
+        if name not in values:
+            raise PlaybookError("missing parameter %s" % name)
+        return values[name]
+
+    out = []
+    for step in steps:
+        if isinstance(step, dict) and isinstance(step.get("params"), dict):
+            step = {**step, "params": {
+                k: PARAM_RE.sub(fill, v) if isinstance(v, str) else v
+                for k, v in step["params"].items()}}
+        elif isinstance(step, dict):
+            step = dict(step)
+        out.append(step)
+    return out
 
 
 def validate_step(step):
@@ -498,6 +554,7 @@ class Playbooks:
                 "name": name,
                 "steps": len(steps),
                 "ops": [s.get("op") for s in steps if isinstance(s, dict)],
+                "params": params_of(steps),
                 "created": book.get("created"),
                 "skipped_secrets": book.get("skipped_secrets", 0),
             })

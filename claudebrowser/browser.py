@@ -2647,17 +2647,38 @@ class Browser(Gtk.Window):
         url = tab.view.get_uri() or ""
         if not url or url.startswith("about:"):
             return False
-        tab.discarded = {"url": url, "title": tab.view.get_title() or "",
-                         "summary": ""}
-        # Resolve anyone waiting on this tab before the page goes: they asked
-        # about a load that is now never going to finish.
-        self._settle(tab, {"ok": False, "error": "tab discarded to free memory",
-                           **tab.info()})
-        tab.loading = False
-        tab.view.load_uri("about:blank")
-        self._capture_summary(tab, tab.discarded, url)
-        self._relabel_tabs()
-        self._flash("Freed a background tab — %s" % self.machine.reason())
+        state = tab.discarded = {"url": url,
+                                 "title": tab.view.get_title() or "",
+                                 "summary": ""}
+
+        def finish(y):
+            # Kept in memory only: where you were scrolled is browsing data.
+            tab.scroll = y
+            if tab.discarded is not state:
+                return
+            # Resolve anyone waiting on this tab before the page goes: they
+            # asked about a load that is now never going to finish.
+            self._settle(tab, {"ok": False,
+                               "error": "tab discarded to free memory",
+                               **tab.info()})
+            tab.loading = False
+            tab.view.load_uri("about:blank")
+            self._capture_summary(tab, state, url)
+            self._relabel_tabs()
+            self._flash("Freed a background tab — %s" % self.machine.reason())
+
+        def on_scroll(view, result, _data=None):
+            try:
+                y = int(view.evaluate_javascript_finish(result).to_double())
+            except (GLib.Error, AttributeError, TypeError, ValueError):
+                y = 0
+            finish(max(y, 0))
+
+        try:
+            tab.view.evaluate_javascript("window.scrollY", -1, None, None,
+                                         None, on_scroll, None)
+        except Exception:
+            finish(0)
         return True
 
     def _capture_summary(self, tab, state, url):
@@ -2705,6 +2726,13 @@ class Browser(Gtk.Window):
         self._begin_load(tab)
         perf.load_url(tab.view, url)
         self._relabel_tabs()
+        y = int(tab.scroll or 0)
+        if y > 0:
+            def back_to_place(_payload):
+                tab.scroll = 0
+                self._eval_now(tab, "window.scrollTo(0, %d)" % y,
+                               lambda _r: None)
+            self._await_load(tab, True, back_to_place)
         return True
 
     def _paint_machine(self):
@@ -5495,7 +5523,7 @@ class Browser(Gtk.Window):
             return done({"ok": False, "error": "no playbook named %r" % (name,)})
         done({"ok": True, "deleted": name})
 
-    def api_playbook_run(self, name, done):
+    def api_playbook_run(self, name, params, done):
         """Replay a saved playbook, strictly one step at a time.
 
         Two rules shape this loop.
@@ -5522,6 +5550,15 @@ class Browser(Gtk.Window):
         try:
             steps = playbooks.validate(book.get("steps"))
         except playbooks.PlaybookError as e:
+            return done({"ok": False,
+                         "error": "%s cannot be replayed: %s" % (name, e)})
+        try:
+            values = json.loads(params) if params else {}
+            if not isinstance(values, dict):
+                raise ValueError("params must be a JSON object")
+            steps = playbooks.validate(
+                playbooks.substitute(book["steps"], values))
+        except (ValueError, playbooks.PlaybookError) as e:
             return done({"ok": False,
                          "error": "%s cannot be replayed: %s" % (name, e)})
 

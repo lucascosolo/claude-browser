@@ -516,8 +516,10 @@ OPS = [
     # them may be a page load that queues behind others (see Browser._admit).
     Op("playbook-run", "/playbook/run", "POST",
        "Replay a saved playbook against the live browser, one step at a time.",
-       params=[Param("name", required=True, help="Playbook to replay.")],
-       call=lambda c, a: ("api_playbook_run", (a["name"],)),
+       params=[Param("name", required=True, help="Playbook to replay."),
+               Param("params", cli="optarg",
+                     help="JSON object of {param:NAME} values.")],
+       call=lambda c, a: ("api_playbook_run", (a["name"], a.get("params"))),
        tab=False, timeout=600),
 
     # Not an MCP tool, for the same reason `clear` is not: deleting something

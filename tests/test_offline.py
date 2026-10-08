@@ -580,6 +580,17 @@ class TestApiRegistry(unittest.TestCase):
         self.assertEqual(method, "api_fill_many")
         self.assertEqual(call_args, (None, '{"#email": "{profile:email}"}'))
 
+    def test_playbook_run_params_are_optional_and_passed_raw(self):
+        # Resolution of the JSON object happens in Browser.api_playbook_run,
+        # as fill-many does with its fields; api.py never parses it.
+        method, call_args = self.dispatch("/playbook/run", {"name": "login"})
+        self.assertEqual(method, "api_playbook_run")
+        self.assertEqual(call_args, ("login", None))
+        method, call_args = self.dispatch(
+            "/playbook/run", {"name": "x", "params": '{"a":"b"}'})
+        self.assertEqual(method, "api_playbook_run")
+        self.assertEqual(call_args, ("x", '{"a":"b"}'))
+
     def test_click_and_fill_document_ref_targeting(self):
         # Snapshot's refs are the whole point of the feature -- an agent must
         # be told it can pass one to click/fill without reading extract.py.

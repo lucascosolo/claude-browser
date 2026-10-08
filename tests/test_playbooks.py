@@ -593,5 +593,89 @@ class TestPage(unittest.TestCase):
         self.assertIn("saved just now", html)
 
 
+class TestParameters(unittest.TestCase):
+    """`{param:NAME}` placeholders: named by params_of, filled by substitute."""
+
+    def steps(self):
+        return [
+            {"op": "open", "params": {"url": "https://{param:host}/login"}},
+            {"op": "fill", "params": {"selector": "#user",
+                                      "value": "{param:user}"}},
+            {"op": "fill", "params": {"selector": "#mail",
+                                      "value": "{profile:email}"}},
+            {"op": "click", "params": {"selector": "button"}},
+            {"op": "back"},
+        ]
+
+    def test_param_re_matches_the_documented_name_shape(self):
+        m = playbooks.PARAM_RE.search("x {param:_a1B} y")
+        self.assertEqual(m.group(1), "_a1B")
+        self.assertIsNone(playbooks.PARAM_RE.search("{param:1abc}"))
+        self.assertIsNone(playbooks.PARAM_RE.search("{param:}"))
+        self.assertIsNone(playbooks.PARAM_RE.search("{profile:email}"))
+
+    def test_params_of_is_sorted_unique_and_skips_profile_placeholders(self):
+        steps = self.steps() + [
+            {"op": "fill", "params": {"selector": "#again",
+                                      "value": "{param:user}"}}]
+        self.assertEqual(playbooks.params_of(steps), ["host", "user"])
+
+    def test_params_of_skips_non_string_values_and_paramless_steps(self):
+        steps = [{"op": "scroll", "params": {"amount": 3}},
+                 {"op": "back"}]
+        self.assertEqual(playbooks.params_of(steps), [])
+
+    def test_substitute_fills_every_placeholder_including_two_in_one_value(self):
+        out = playbooks.substitute(
+            [{"op": "open", "params": {"url": "https://{param:h}/{param:p}"}}],
+            {"h": "example.com", "p": "in"})
+        self.assertEqual(out[0]["params"]["url"], "https://example.com/in")
+
+    def test_substitute_returns_new_steps_and_leaves_the_input_alone(self):
+        steps = self.steps()
+        before = json.dumps(steps)
+        out = playbooks.substitute(steps, {"host": "a.io", "user": "bob"})
+        self.assertEqual(json.dumps(steps), before)
+        self.assertIsNot(out, steps)
+        self.assertEqual(out[1]["params"]["value"], "bob")
+
+    def test_profile_placeholders_pass_through_untouched(self):
+        out = playbooks.substitute(self.steps(), {"host": "a.io", "user": "bob"})
+        self.assertEqual(out[2]["params"]["value"], "{profile:email}")
+
+    def test_a_missing_value_refuses_and_names_the_parameter(self):
+        with self.assertRaises(playbooks.PlaybookError) as ctx:
+            playbooks.substitute(self.steps(), {"host": "a.io"})
+        self.assertIn("user", str(ctx.exception))
+
+    def test_a_non_string_value_is_refused(self):
+        with self.assertRaises(playbooks.PlaybookError):
+            playbooks.substitute(self.steps(), {"host": 5, "user": "bob"})
+
+    def test_extra_keys_in_values_are_ignored(self):
+        out = playbooks.substitute(
+            [{"op": "open", "params": {"url": "https://{param:h}"}}],
+            {"h": "a.io", "unused": "z"})
+        self.assertEqual(out[0]["params"]["url"], "https://a.io")
+
+    def test_none_or_empty_values_with_no_placeholders_is_a_copy(self):
+        steps = [{"op": "open", "params": {"url": "https://example.com"}}]
+        for values in (None, {}):
+            out = playbooks.substitute(steps, values)
+            self.assertEqual(out, steps)
+            self.assertIsNot(out, steps)
+
+    def test_substituted_steps_still_validate(self):
+        out = playbooks.substitute(self.steps(), {"host": "a.io", "user": "bob"})
+        checked = playbooks.validate(out)
+        self.assertEqual(checked[0][1]["url"], "https://a.io/login")
+
+    def test_substitution_does_not_launder_an_unknown_op(self):
+        out = playbooks.substitute(
+            [{"op": "format-disk", "params": {"x": "{param:a}"}}], {"a": "b"})
+        with self.assertRaises(playbooks.PlaybookError):
+            playbooks.validate(out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
