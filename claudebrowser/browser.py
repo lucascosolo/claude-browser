@@ -22,7 +22,8 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
-from . import (agent, ai, auth, envfile, extract, fills, findbar, pages,  # noqa: E402
+from . import (update,  # noqa: E402
+               agent, ai, auth, envfile, extract, fills, findbar, pages,  # noqa: E402
                pagetext, panel_html, passwords, perf, personas, playbooks,
                profile, progress, reader, resources, scrub, search, settings,
                siterules, storage, store, style, tabnames, urls, vpn,
@@ -554,6 +555,17 @@ class Browser(Gtk.Window):
         # here is written to disk, since the file itself already is.
         self.download_history = []
 
+        # -- self-update ------------------------------------------------------
+        # The checkout is the installed application (install.sh symlinks into
+        # it), so a commit landing there is a new version waiting for a
+        # restart. See update.py for what counts as a change and as idle.
+        self.restart_requested = False
+        self.control = None          # set by __main__ once the server is up
+        self.last_input_at = time.monotonic()
+        self.updater = update.Watcher()
+        self._update_note = ""
+        GLib.timeout_add_seconds(update.POLL_S, self._poll_update)
+
         # Context tuning must happen before the first WebView exists, since the
         # process model is fixed once a web process has been spawned. So must
         # the context itself: a WebContext's data manager -- which is what makes
@@ -608,6 +620,58 @@ class Browser(Gtk.Window):
             # session of many tabs opening at once is exactly the burst of
             # simultaneous loads that queue exists to prevent.
             self._admit(lambda url=url: self.new_tab(url), lambda _r: None, normalize(url))
+
+    # -- self-update -------------------------------------------------------
+
+    def _idle_state(self):
+        return {
+            "loading": any(t.loading for t in self.tabs),
+            "agent_running": self.panel_busy,
+            "recording": bool(getattr(self.recorder, "active", False)),
+            "downloads_active": bool(self.downloads),
+            "last_request_at": getattr(self.control, "last_request_at", None),
+            "last_input_at": self.last_input_at,
+        }
+
+    def _poll_update(self):
+        """Restart onto a new commit, once nothing would be interrupted.
+
+        Runs every update.POLL_S from the main loop. Holding is reported once
+        per reason rather than on every tick: a flash every fifteen seconds
+        saying the same thing is noise, and a silent hold is a mystery.
+        """
+        if not update.enabled(envfile.setting("CB_AUTOUPDATE")):
+            return GLib.SOURCE_CONTINUE
+        revision = self.updater.changed()
+        if not revision:
+            return GLib.SOURCE_CONTINUE
+        ok, reason = update.idle(self._idle_state())
+        if not ok:
+            note = "New version %s — restarting once %s" % (revision, reason)
+            if note != self._update_note:
+                self._update_note = note
+                self._flash(note)
+            return GLib.SOURCE_CONTINUE
+        self._flash("Updated to %s — restarting" % revision)
+        self._restart()
+        return GLib.SOURCE_REMOVE
+
+    def _restart(self):
+        """Quit the main loop with a restart flagged; __main__ does the exec,
+        after the control server has released its port."""
+        self.restart_requested = True
+        self._save_session()
+        GLib.idle_add(lambda: (self._on_destroy(), GLib.SOURCE_REMOVE)[1])
+
+    def api_restart(self, done):
+        """Restart now, idle or not. The answer goes out before the quit so
+        the caller gets a reply rather than a dropped connection."""
+        if update.launcher() is None:
+            return done({"ok": False, "error": "not running from a git "
+                                               "checkout; nothing to restart onto"})
+        done({"ok": True, "restarting": True,
+              "revision": (update.head_revision(self.updater.repo) or "")[:10]})
+        GLib.timeout_add(300, lambda: (self._restart(), GLib.SOURCE_REMOVE)[1])
 
     def _on_destroy(self, *_a):
         """Let queued history writes land before the process goes away. The
@@ -1120,6 +1184,7 @@ class Browser(Gtk.Window):
         self.connect("key-press-event", self._on_key)
 
     def _on_key(self, _widget, event):
+        self.last_input_at = time.monotonic()
         mods = event.state & Gtk.accelerator_get_default_mod_mask()
         action = self._accels.get((Gdk.keyval_to_lower(event.keyval), mods))
         if action:

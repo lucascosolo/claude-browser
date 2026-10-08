@@ -20,6 +20,7 @@ just the server.
 import json
 import queue
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -64,6 +65,10 @@ class Control:
         self.port = port
         self.token = token
         self._server = None
+        # Monotonic stamp of the last request that reached an op. Read by the
+        # self-update poll (update.idle) so a restart never lands between two
+        # steps of a sequence someone is driving.
+        self.last_request_at = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -160,6 +165,7 @@ class Control:
                 "ok": True, "browser": "claude-browser", "engine": "webkit2gtk",
                 "routes": sorted(o.route for o in api.OPS)})
 
+        self.last_request_at = time.monotonic()
         try:
             method, call_args = op.call(self, args)
             payload = on_main_loop(self.browser, method, call_args, timeout=op.timeout)

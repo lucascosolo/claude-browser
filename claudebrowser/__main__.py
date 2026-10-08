@@ -124,6 +124,7 @@ def main(argv=None):
     server = None
     if not args.no_control:
         server = control.Control(browser, port=args.port, token=args.token)
+        browser.control = server
         try:
             server.start()
             print("control API: http://127.0.0.1:%d  (loopback only%s)"
@@ -145,6 +146,16 @@ def main(argv=None):
     finally:
         if server:
             server.stop()
+    if getattr(browser, "restart_requested", False):
+        # The port is released and the session saved; become the new version.
+        # exec keeps the PID, so the systemd scope `cb` put this process in --
+        # with its CPU and memory limits -- carries over (see update.py).
+        from . import update
+
+        path = update.launcher()
+        if path:
+            print("restarting onto %s" % path, flush=True)
+            os.execve(path, [path], update.restart_environ())
     return 0
 
 

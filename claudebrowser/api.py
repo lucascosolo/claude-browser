@@ -144,6 +144,14 @@ OPS = [
     Op("present", "/present", "POST", "Raise the browser window to the front.",
        call=lambda c, a: ("api_present", ()), tab=False, mcp=False),
 
+    # Not an MCP tool: an agent restarting the browser it is being driven
+    # through ends its own session mid-task. The browser restarts itself when
+    # the checkout moves and it is idle (update.py); this is the override for a
+    # person at a shell who wants it now.
+    Op("restart", "/restart", "POST", "Restart the browser onto the code "
+       "currently in its checkout, reopening this session's tabs.",
+       call=lambda c, a: ("api_restart", ()), tab=False, mcp=False),
+
     Op("open", "/open", "POST", "Open a URL in a new tab and wait for it to "
        "finish loading.",
        params=[Param("url", required=True, help="URL or search term."),

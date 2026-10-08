@@ -27,7 +27,7 @@ from claudebrowser import envfile, pages, personas, settings, style  # noqa: E40
 #: so that a setting deleted from settings.py fails a test instead of quietly
 #: becoming uneditable again.
 EVERY_KEY = (
-    "CB_AUTH", "CB_AUTOSTART", "CB_BLOCK", "CB_COOKIES", "CB_GPU", "CB_HOME",
+    "CB_AUTH", "CB_AUTOSTART", "CB_AUTOUPDATE", "CB_BLOCK", "CB_COOKIES", "CB_GPU", "CB_HOME",
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
     "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
     "CB_QUEUE_LIST", "CB_RESTORE_SESSION",
@@ -112,7 +112,10 @@ class TestTable(Isolated):
                 "CB_SEARCH_LANG",
                 # youtube.enabled() is read inside the decide-policy handler,
                 # so the next link clicked already obeys it.
-                "CB_YT_EMBED"}
+                "CB_YT_EMBED",
+                # Read by Browser._poll_update on every tick of the self-update
+                # poll, so switching it off lands within update.POLL_S.
+                "CB_AUTOUPDATE"}
         for knob in settings.SETTINGS:
             immediate = "restart" not in knob.effect.lower()
             self.assertEqual(immediate, knob.key in live,

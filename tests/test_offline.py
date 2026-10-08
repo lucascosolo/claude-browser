@@ -416,7 +416,7 @@ class TestApiRegistry(unittest.TestCase):
 
     def test_every_op_builds_a_call(self):
         cases = {
-            "/tabs": {}, "/present": {}, "/open": {"url": "x.com"},
+            "/tabs": {}, "/present": {}, "/restart": {}, "/open": {"url": "x.com"},
             "/navigate": {"url": "x.com"}, "/back": {}, "/forward": {}, "/reload": {},
             "/close": {}, "/wait": {}, "/text": {}, "/markdown": {}, "/links": {},
             "/html": {}, "/reader": {}, "/simplify": {},

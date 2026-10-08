@@ -569,6 +569,19 @@ SETTINGS = (
         "or speeds up as it goes.",
         # agent.PACE_MAX: past this a typo becomes a hang rather than a pause.
         minimum=0, maximum=5, step=0.1),
+    Setting(
+        "CB_AUTOUPDATE", "Claude", "Restart on a new commit",
+        "The browser runs straight from its git checkout. When a commit lands "
+        "there, it restarts itself onto the new code -- once nothing is "
+        "loading, no agent is driving, no playbook is recording, no download "
+        "is running, and neither the control API nor the keyboard has been "
+        "used for half a minute. Tabs come back through the saved session. "
+        "`cbctl restart` restarts at once regardless.",
+        "bool", "1",
+        "Next check",
+        "Read on every poll (update.POLL_S), so turning it off takes effect "
+        "within seconds and never needs a restart of its own.",
+        truth=_off_words),
 
     # -- Control API --------------------------------------------------------
     Setting(
