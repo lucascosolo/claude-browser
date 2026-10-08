@@ -230,3 +230,52 @@ hand the user the diff to apply.
 then `implementer`. Chunks 3, 4: `deep-implementer` (WebKit signal work with
 no test coverage possible on the GTK half). Ledger:
 `docs/plans/2026-10-08-agent-power-pass.ledger.md` (git-ignored).
+
+## Chunk 7 — hardening from review (added 2026-10-08 12:15 CDT)
+
+Findings from the architecture review of 3b59150..7ac738b, with decisions:
+
+1. `type` joins `playbooks.is_secret_step`: with a selector it is treated
+   like `fill`; with no selector it is always secret (it writes to whatever
+   has focus) and dropped at capture.
+2. `upload`, `download` and `pdf` stay MCP tools but are confined. New
+   GTK-free `claudebrowser/files.py`: `roots(value)` parses the setting
+   `CB_AGENT_DIRS` (colon-separated, `~` expanded; default
+   `~/Downloads:~/.cache/claude-browser`); `contain_read(path, roots)` and
+   `contain_write(path, roots)` return the resolved path or raise
+   `ValueError` naming the rule: absolute only; `os.path.realpath` of the
+   file (read) or of its parent (write) must sit under a realpath'd root;
+   symlinks are resolved before the check so a link out of the root is
+   refused. `upload` checks each source with `contain_read`; `download` and
+   `pdf` check their destination with `contain_write`. `screenshot` is
+   unchanged (pixels of a page the caller already drives). Setting
+   `CB_AGENT_DIRS` (Control API section, text, re-read on every call).
+3. `playbooks.NOT_REPLAYABLE` gains `restart`, `upload`, `download`, `pdf`.
+4. Idle accounting: `control.Control` counts in-flight requests
+   (`inflight`, incremented before `on_main_loop`, decremented in `finally`);
+   `Browser._idle_state` adds `requests_active` and `playbook_running` (a
+   flag set for the life of `api_playbook_run`); `update.idle` refuses on
+   either, with reasons.
+5. Restart safety: before quitting, `_poll_update` runs a preflight
+   subprocess (`python3 -m py_compile` over `claudebrowser/*.py` plus
+   `python3 -c "import claudebrowser.api, claudebrowser.extract,
+   claudebrowser.settings, claudebrowses.playbooks"` from the repo root) and
+   holds with a once-per-revision flash "New version X does not compile —
+   not restarting" on failure. It also holds while any private tab exists
+   ("a private tab is open") and when `CB_RESTORE_SESSION` is off ("session
+   restore is off"); `cbctl restart` ignores all three holds but still runs
+   the preflight. `__main__` catches `OSError` from `execve`, prints it, and
+   falls back to `subprocess.Popen([path], start_new_session=True)`.
+6. Download claiming: no URL matching. `api_download` refuses when
+   `tab.pending_download` is already set ("a download is already pending on
+   this tab"), sets it, then calls `download_uri`; `_on_download` claims it
+   when the download's web view is that tab's view and clears it at once.
+   `pending_downloads` (the URL map) is removed.
+7. `pdf`: `overwrite` param (same rule as `download`); `print_()` wrapped so
+   an exception answers `done`; before printing, enumerate printers
+   (`Gtk.enumerate_printers(..., wait=True)`) and use the one that
+   `is_virtual()` and `accepts_pdf()` with "file" in its backend or name,
+   refusing with "no print-to-file printer available" when none exists.
+8. LATER: `tab.agent_at` is stamped by every tab-targeted op, reads
+   included, so a read-only `text` call makes the tab "driven" for 30 s.
+   Stamp only acting ops. Not in this chunk.
