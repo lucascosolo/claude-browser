@@ -860,6 +860,33 @@ def submit(selector=None) -> str:
     return _driven(selector, body)
 
 
+def upload_click(selector, count=1) -> str:
+    """Open the file chooser of a file input, for upload. Refuses anything that
+    is not `input[type=file]`, and refuses several files for an input without
+    `multiple` before clicking -- otherwise the chooser opens for a list the
+    page could never accept. Reports `multiple` either way."""
+    body = (
+        "if(e.tagName!=='INPUT'||e.type!=='file')"
+        "return JSON.stringify({ok:false,error:'not a file input'});"
+        "if(%d>1&&!e.multiple)return JSON.stringify({ok:false,multiple:false,"
+        "error:'this file input takes one file'});"
+        "window.__cbCursorAt(e,true);e.click();"
+        "return JSON.stringify({ok:true,multiple:!!e.multiple});" % int(count)
+    )
+    return _driven(selector, body)
+
+
+def upload_check(selector) -> str:
+    """The names of the files a file input now holds, plus a delta()."""
+    return (
+        "(function(){var __cbUrlBefore=location.href;var e=%s;"
+        "if(!e||!e.files)return JSON.stringify({ok:false,error:'no match'});"
+        "var n=[];for(var i=0;i<e.files.length;i++)n.push(e.files[i].name);"
+        "return JSON.stringify(Object.assign({ok:true,files:n},{%s}));})()"
+        % (_resolve_target(selector), delta())
+    )
+
+
 def _js_str(s: str) -> str:
     """Render `s` as a JS string literal that is safe in any injection context.
 

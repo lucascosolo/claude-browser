@@ -570,6 +570,17 @@ SETTINGS = (
         # agent.PACE_MAX: past this a typo becomes a hang rather than a pause.
         minimum=0, maximum=5, step=0.1),
     Setting(
+        "CB_DIALOGS", "Claude", "Page dialogs",
+        "auto (default) answers alert, confirm, prompt and leave-page dialogs at "
+        "once -- closed, accepted, the prompt's default text -- so an agent is "
+        "never stuck behind a modal it cannot see. ask shows them to you instead. "
+        "Either way each one is logged on its tab.",
+        "choice", "auto",
+        "Next dialog",
+        "Read from the settings file every time a page opens a dialog.",
+        choices=(("auto", "Answer automatically"), ("ask", "Ask me")),
+        canon=_choice_canon(("auto", "ask"))),
+    Setting(
         "CB_AUTOUPDATE", "Claude", "Restart on a new commit",
         "The browser runs straight from its git checkout. When a commit lands "
         "there, it restarts itself onto the new code -- once nothing is "

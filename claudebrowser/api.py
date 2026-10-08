@@ -379,6 +379,36 @@ OPS = [
        call=lambda c, a: ("api_submit", (_tab(a), a.get("selector") or None)),
        timeout=LOAD_TIMEOUT),
 
+    # Dialogs and files: the three things a page does that an agent driving it
+    # through JavaScript cannot see -- a modal, a native chooser, a save prompt.
+    Op("dialogs", "/dialogs", "GET", "Read the alert/confirm/prompt/beforeunload "
+       "dialogs the page has shown, and how each was answered. Under the default "
+       "CB_DIALOGS=auto they are answered at once (alerts closed, confirms and "
+       "prompts accepted), so check here after a click that seemed to do nothing.",
+       params=[Param("clear", "boolean", "Empty the log after reading it.",
+                     cli="opt", default=False)],
+       call=lambda c, a: ("api_dialogs", (_tab(a), _truthy(a.get("clear"), False)))),
+
+    Op("upload", "/upload", "POST", "Put local files into a file input, as if "
+       "chosen in the file picker. `path` is one absolute path, or a JSON array "
+       "of them for an input that accepts several.",
+       params=[Param("selector", required=True,
+                     help="The input[type=file], as a CSS selector or @ref."),
+               Param("path", required=True,
+                     help="Absolute path, or a JSON array string of them.")],
+       call=lambda c, a: ("api_upload", (_tab(a), a["selector"], a["path"]))),
+
+    Op("download", "/download", "POST", "Download a URL with this tab's cookies "
+       "to an absolute path on disk and wait for it to finish. Refused for a "
+       "private tab unless private downloads are allowed.",
+       params=[Param("url", required=True, help="What to download."),
+               Param("path", required=True, help="Absolute destination file."),
+               Param("overwrite", "boolean", "Replace an existing file.",
+                     cli="opt", default=False)],
+       call=lambda c, a: ("api_download", (_tab(a), a["url"], a["path"],
+                                           _truthy(a.get("overwrite"), False))),
+       timeout=300),
+
     Op("eval", "/eval", "POST", "Evaluate JavaScript in the page and return its value.",
        params=[Param("js", required=True, help="JavaScript to evaluate.")],
        call=lambda c, a: ("api_eval", (_tab(a), a["js"]))),

@@ -23,7 +23,8 @@ gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (update,  # noqa: E402
-               agent, ai, auth, envfile, extract, fills, findbar, pages,  # noqa: E402
+               agent, ai, auth, dialogs, envfile, extract, fills, findbar,  # noqa: E402
+               pages, uploads,
                pagetext, panel_html, passwords, perf, personas, playbooks,
                profile, progress, reader, resources, scrub, search, settings,
                siterules, storage, store, style, tabnames, urls, vpn,
@@ -31,6 +32,11 @@ from . import (update,  # noqa: E402
 from .urls import normalize  # noqa: E402
 
 HOME = os.environ.get("CB_HOME", "cb:home")
+# `download` waits this long (the op's own timeout) before cancelling.
+DOWNLOAD_TIMEOUT_S = 300
+# `upload` re-reads the input this often, this many times, for the files.
+UPLOAD_CHECK_MS = 150
+UPLOAD_CHECKS = 10
 # Where a private tab starts, and not CB_HOME: the default start page is a
 # dashboard of history and bookmarks, which is the one thing a private
 # session should not open with. cb:private says what the tab does and does
@@ -306,6 +312,7 @@ class Tab:
         self.id = Tab._next_id
         Tab._next_id += 1
         self.private = private
+        self.dialogs = dialogs.Log()
         # A private view gets its own ephemeral WebsiteDataManager: separate
         # cookie jar, no disk cache, nothing written when it closes. It cannot
         # also be a *related* view -- related views inherit their relative's
@@ -554,6 +561,10 @@ class Browser(Gtk.Window):
         # popover under the toolbar's Downloads button. Session-only: nothing
         # here is written to disk, since the file itself already is.
         self.download_history = []
+        # Files an `upload` has promised to the next file chooser on a tab, and
+        # `download` calls waiting for WebKit's download-started, by URL.
+        self.pending_uploads = uploads.Pending()
+        self.pending_downloads = {}
 
         # -- self-update ------------------------------------------------------
         # The checkout is the installed application (install.sh symlinks into
@@ -2102,6 +2113,8 @@ class Browser(Gtk.Window):
         # is coalesced onto a timer while the others stay immediate.
         view.connect("notify::estimated-load-progress", lambda *_: self._refresh_soon(tab))
         view.connect("create", self._on_popup)
+        view.connect("script-dialog", self._on_script_dialog, tab)
+        view.connect("run-file-chooser", self._on_file_chooser, tab)
 
         label = self._tab_label(tab)
         view.show()
@@ -3319,7 +3332,8 @@ class Browser(Gtk.Window):
             return
 
         record = {"download": download, "tab": tab, "row": None, "path": None,
-                  "suggested": None, "user_cancelled": False}
+                  "suggested": None, "user_cancelled": False,
+                  "agent": self._dl_claim(download)}
         self.downloads[id(download)] = record
         download.connect("decide-destination", self._dl_decide_destination, record)
         download.connect("created-destination", self._dl_created_destination, record)
@@ -3332,6 +3346,12 @@ class Browser(Gtk.Window):
         # somewhere -- that "somewhere" is a button in the offer row this
         # builds, whenever the user gets to it.
         record["suggested"] = suggested_filename or "download"
+        if record["agent"]:
+            # An agent `download` already named its destination; no offer row.
+            record["path"] = record["agent"]["path"]
+            _download.set_allow_overwrite(record["agent"]["overwrite"])
+            _download.set_destination(GLib.filename_to_uri(record["path"], None))
+            return True
         self._dl_offer(record)
         return True
 
@@ -3504,6 +3524,14 @@ class Browser(Gtk.Window):
         path = record.get("path")
         cancelled = record.get("user_cancelled", False)
         self._dl_remove_row(record)
+        agent = record.get("agent")
+        if agent:
+            # Never remove a file that was there before this download began:
+            # with overwrite, `path` may be the user's own copy.
+            if not agent["existed"]:
+                self._dl_delete_partial(path)
+            return agent["answer"]({"ok": False, "error": getattr(
+                _error, "message", None) or str(_error) or "download failed"})
         self._dl_delete_partial(path)
         if not cancelled:
             self._flash("Download failed: %s" % os.path.basename(
@@ -3520,7 +3548,164 @@ class Browser(Gtk.Window):
         if path:
             self.download_history.insert(0, {"name": name, "path": path})
             del self.download_history[12:]
+        agent = record.get("agent")
+        if agent:
+            try:
+                size = os.path.getsize(path)
+            except (OSError, TypeError):
+                size = None
+            try:
+                response = _download.get_response()
+                mime = response.get_mime_type() if response else None
+            except Exception:
+                mime = None
+            return agent["answer"]({"ok": True, "path": path, "bytes": size,
+                                    "mime": mime})
         self._flash("Downloaded %s" % name)
+
+    def _dl_claim(self, download):
+        """The pending agent `download` this WebKit download belongs to, removed
+        from the pending table, or None for an ordinary one. Matched on the URI
+        WebKit reports; a redirect changes it, so with no exact match the most
+        recently registered entry is taken."""
+        if not self.pending_downloads:
+            return None
+        try:
+            uri = download.get_request().get_uri()
+        except Exception:
+            uri = None
+        key = uri if uri in self.pending_downloads else next(
+            reversed(self.pending_downloads))
+        return self.pending_downloads.pop(key)
+
+    @needs_tab
+    def api_download(self, tab, url, path, overwrite, done):
+        """Download `url` with this tab's cookies to `path`, waiting for it.
+
+        Goes through WebKit's own download machinery (view.download_uri) rather
+        than fetching in Python, so the session, cookies and proxy are the
+        tab's. The record is registered before the download starts, keyed by
+        URL, so _on_download routes it here instead of to the offer row.
+        """
+        if tab.private and not storage.private_downloads_enabled():
+            return done({"ok": False, "error": "this tab is private, so downloads "
+                         "are not written to disk (CB_PRIVATE_DOWNLOADS)"})
+        if not os.path.isabs(path or ""):
+            return done({"ok": False, "error": "path must be absolute"})
+        if not os.path.isdir(os.path.dirname(path)):
+            return done({"ok": False, "error": "no such directory: %s"
+                         % os.path.dirname(path)})
+        existed = os.path.exists(path)
+        if existed and not overwrite:
+            return done({"ok": False, "error": "file exists: %s "
+                         "(pass overwrite to replace it)" % path})
+        state = {"answered": False, "download": None}
+
+        def answer(payload):
+            if state["answered"]:
+                return
+            state["answered"] = True
+            self.pending_downloads.pop(url, None)
+            done(payload)
+
+        def timed_out():
+            if not state["answered"]:
+                record = next((r for r in self.downloads.values()
+                               if r.get("agent") is entry), None)
+                answer({"ok": False, "error": "download timed out"})
+                if record is not None:
+                    record["user_cancelled"] = True
+                    try:
+                        record["download"].cancel()
+                    except Exception:
+                        pass
+            return GLib.SOURCE_REMOVE
+
+        entry = {"path": path, "overwrite": bool(overwrite), "existed": existed,
+                 "answer": answer}
+        self.pending_downloads[url] = entry
+        GLib.timeout_add_seconds(DOWNLOAD_TIMEOUT_S, timed_out)
+        try:
+            tab.view.download_uri(url)
+        except Exception as e:
+            answer({"ok": False, "error": str(e)})
+
+    @needs_tab
+    def api_dialogs(self, tab, clear, done):
+        entries = tab.dialogs.entries()
+        if clear:
+            tab.dialogs.clear()
+        done({"ok": True, "count": len(entries), "entries": entries})
+
+    def _on_script_dialog(self, _view, dialog, tab):
+        """Answer a page dialog under CB_DIALOGS, logging it on the tab.
+        Returning False lets WebKit show its own dialog."""
+        types = WebKit2.ScriptDialogType
+        kind = {types.ALERT: "alert", types.CONFIRM: "confirm",
+                types.PROMPT: "prompt",
+                types.BEFORE_UNLOAD_CONFIRM: "beforeunload"}.get(
+                    dialog.get_dialog_type())
+        if kind is None:
+            return False
+        default = dialog.prompt_get_default_text() if kind == "prompt" else None
+        action, value = dialogs.answer(
+            kind, dialogs.policy(envfile.setting("CB_DIALOGS")), default or "")
+        tab.dialogs.add(kind, dialog.get_message(), default, action)
+        if action == "ask":
+            return False
+        if kind in ("confirm", "beforeunload"):
+            dialog.confirm_set_confirmed(value)
+        elif kind == "prompt":
+            dialog.prompt_set_text(value)
+        return True
+
+    def _on_file_chooser(self, _view, request, tab):
+        """Hand the chooser the files an `upload` queued for this tab; with
+        nothing queued, return False and let a person pick as before."""
+        paths = self.pending_uploads.take(tab.id)
+        if paths is None:
+            return False
+        request.select_files(paths)
+        return True
+
+    @needs_tab
+    def api_upload(self, tab, selector, path, done):
+        """Click a file input and answer its chooser with `path`, then poll
+        until the input holds the files."""
+        try:
+            paths = uploads.check_paths(path)
+        except ValueError as e:
+            return done({"ok": False, "error": str(e)})
+        self.pending_uploads.put(tab.id, paths)
+        tries = {"n": 0}
+
+        def fail(error):
+            # Taken so a list the page never asked for cannot answer a later
+            # click on some other file input.
+            self.pending_uploads.take(tab.id)
+            done({"ok": False, "error": error})
+
+        def on_check(r):
+            inner = r.get("result") if r.get("ok") else None
+            if isinstance(inner, dict) and len(inner.get("files") or []) == len(paths):
+                return done({**inner, "ok": True})
+            tries["n"] += 1
+            if tries["n"] >= UPLOAD_CHECKS:
+                return fail("the page did not accept the file")
+            GLib.timeout_add(UPLOAD_CHECK_MS, check)
+
+        def check():
+            self.api_eval(tab.id, extract.upload_check(selector), on_check)
+            return GLib.SOURCE_REMOVE
+
+        def on_click(r):
+            inner = r.get("result")
+            if not r.get("ok") or not (isinstance(inner, dict) and inner.get("ok")):
+                self.pending_uploads.take(tab.id)
+                return done(inner if isinstance(inner, dict) else r)
+            GLib.timeout_add(UPLOAD_CHECK_MS, check)
+
+        self.api_eval(tab.id, extract.upload_click(selector, len(paths)), on_click)
 
     # -- the Claude panel ---------------------------------------------------
     # One panel, four modes. Each mode is just a different prompt over the same

@@ -438,6 +438,11 @@ class TestApiRegistry(unittest.TestCase):
                                 "password": "b"},
             "/wait/for": {"selector": "a"}, "/scroll": {"to": "bottom"},
             "/tables": {},
+            "/press": {"key": "Enter"}, "/type": {"text": "hi"},
+            "/select": {"selector": "#s", "value": "a"},
+            "/hover": {"selector": "a"}, "/submit": {},
+            "/dialogs": {}, "/upload": {"selector": "input", "path": "/x"},
+            "/download": {"url": "https://x", "path": "/x"},
         }
         # /health is served without touching the browser, so it has no builder.
         callable_routes = {op.route for op in self.api.OPS if op.call}
@@ -468,6 +473,43 @@ class TestApiRegistry(unittest.TestCase):
         self.assertEqual(self.dispatch("/wait/for", {"selector": "a"})[0], "api_wait_for")
         self.assertEqual(self.dispatch("/scroll", {"to": "bottom"})[0], "api_scroll")
         self.assertEqual(self.dispatch("/tables", {})[0], "api_eval")
+
+    def test_chunk3_ops_dispatch(self):
+        d = self.dispatch
+        self.assertEqual(d("/dialogs", {}), ("api_dialogs", (None, False)))
+        self.assertEqual(d("/dialogs", {"clear": "1"}), ("api_dialogs", (None, True)))
+        self.assertEqual(d("/upload", {"selector": "input", "path": "/x", "tab": "3"}),
+                         ("api_upload", (3, "input", "/x")))
+        self.assertEqual(d("/download", {"url": "https://x", "path": "/x"}),
+                         ("api_download", (None, "https://x", "/x", False)))
+        got = d("/download", {"url": "https://x", "path": "/x", "overwrite": "true"})
+        self.assertEqual(got, ("api_download", (None, "https://x", "/x", True)))
+
+    def test_chunk3_op_shape(self):
+        by = self.api.BY_NAME
+        self.assertEqual(by["download"].timeout, 300)
+        self.assertEqual(by["upload"].timeout, 45)
+        for name in ("dialogs", "upload", "download"):
+            self.assertTrue(by[name].mcp, name)
+        self.assertEqual(by["dialogs"].method, "GET")
+        self.assertEqual(by["upload"].method, "POST")
+        self.assertEqual(by["download"].method, "POST")
+
+        def required(name):
+            return {p.name for p in by[name].params if p.required}
+        self.assertTrue({"selector", "path"} <= required("upload"))
+        self.assertTrue({"url", "path"} <= required("download"))
+
+    def test_chunk2_ops_dispatch(self):
+        for route, args, needle in [
+                ("/press", {"key": "Ctrl+K"}, "KeyK"),
+                ("/type", {"text": "</script>hi"}, extract._js_str("</script>hi")),
+                ("/select", {"selector": "#s", "value": "a"}, extract._js_str("#s")),
+                ("/hover", {"selector": "a.x"}, extract._js_str("a.x"))]:
+            method, (tab, js) = self.dispatch(route, args)
+            self.assertEqual(method, "api_eval", route)
+            self.assertIn(needle, js, route)
+        self.assertEqual(self.dispatch("/submit", {})[0], "api_submit")
 
     def test_clear_carries_its_kind_through_and_documents_pagetext(self):
         """The page-text cache is the most personal thing on disk, so it is

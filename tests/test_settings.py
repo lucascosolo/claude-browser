@@ -27,7 +27,7 @@ from claudebrowser import envfile, pages, personas, settings, style  # noqa: E40
 #: so that a setting deleted from settings.py fails a test instead of quietly
 #: becoming uneditable again.
 EVERY_KEY = (
-    "CB_AUTH", "CB_AUTOSTART", "CB_AUTOUPDATE", "CB_BLOCK", "CB_COOKIES", "CB_GPU", "CB_HOME",
+    "CB_AUTH", "CB_AUTOSTART", "CB_AUTOUPDATE", "CB_BLOCK", "CB_COOKIES", "CB_DIALOGS", "CB_GPU", "CB_HOME",
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
     "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
     "CB_QUEUE_LIST", "CB_RESTORE_SESSION",
@@ -115,7 +115,9 @@ class TestTable(Isolated):
                 "CB_YT_EMBED",
                 # Read by Browser._poll_update on every tick of the self-update
                 # poll, so switching it off lands within update.POLL_S.
-                "CB_AUTOUPDATE"}
+                "CB_AUTOUPDATE",
+                # read on every dialog by the script-dialog handler
+                "CB_DIALOGS"}
         for knob in settings.SETTINGS:
             immediate = "restart" not in knob.effect.lower()
             self.assertEqual(immediate, knob.key in live,
@@ -136,6 +138,14 @@ class TestTable(Isolated):
                 continue
             for value, _label in knob.choices:
                 self.assertEqual(knob.clean(value), value, knob.key)
+
+    def test_cb_dialogs_is_described(self):
+        knob = settings.BY_KEY["CB_DIALOGS"]
+        self.assertEqual(knob.section, "Claude")
+        self.assertEqual(knob.kind, "choice")
+        self.assertEqual(knob.default, "auto")
+        self.assertEqual(knob.effect, "Next dialog")
+        self.assertEqual({v for v, _l in knob.choices}, {"auto", "ask"})
 
     def test_the_personas_come_from_personas_py(self):
         """Not a second list. A persona added there has to appear here."""
