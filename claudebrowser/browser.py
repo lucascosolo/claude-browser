@@ -247,6 +247,15 @@ STUCK_LOAD_S = 40
 MAX_AGENT_TABS = int(os.environ.get("CB_MAX_TABS", "24"))
 
 
+def _same_object(a, b):
+    """PyGObject may hand out two Python wrappers for one GObject, so `is` can
+    be False for the same WebResource; `==` compares the underlying pointer."""
+    try:
+        return a is not None and b is not None and a == b
+    except Exception:
+        return False
+
+
 def needs_tab(method):
     """Resolve the leading tab id, or answer "no such tab" and stop.
 
@@ -2292,7 +2301,7 @@ class Browser(Gtk.Window):
         key = id(resource)
         log = tab.netlog
         entry = log.start(key, request.get_uri(),
-                          main=resource is view.get_main_resource())
+                          main=_same_object(resource, view.get_main_resource()))
         if entry["main"]:
             tab.main_entry = entry
         tab.resources[key] = resource
