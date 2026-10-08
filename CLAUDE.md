@@ -23,7 +23,12 @@ claudebrowser/
   storage.py   the web context: persistent cookies, disk cache, clearing
   findbar.py   Ctrl+F, driving WebKit's per-view FindController
   personas.py  named answering styles composed onto ai.py's prompts (GTK-free)
-  playbooks.py recorded op sequences: capture, validation, JSON store (GTK-free)
+  playbooks.py recorded op sequences: capture, validation, JSON store,
+               {param:NAME} substitution (GTK-free)
+  update.py    self-update: reads .git/HEAD, decides when a restart is safe (GTK-free)
+  dialogs.py   script-dialog policy + per-tab log (GTK-free)
+  uploads.py   path checks + the pending-upload handshake for `upload` (GTK-free)
+  netlog.py    per-tab request log behind `network` and `wait-for --idle` (GTK-free)
   progress.py  the load bar's curve, which is not the load's (GTK-free)
   tabnames.py  tab labelling (GTK-free so it is testable)
   urls.py      omnibox intent: navigate or search (GTK-free)
@@ -56,7 +61,7 @@ tests/         unittest, no display needed
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
 ./cbctl settings                            # every setting; add KEY VALUE to change one
-CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 917 tests, ~2s, no display
+CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 1055 tests, ~4s, no display
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
@@ -274,6 +279,42 @@ stronger gate; on those four, py_compile is the only one there is.
   change of default. A setter that could write `ANTHROPIC_API_KEY` would be a
   route from an API call to the user's credential, which is why it raises
   instead.
+- **The running window updates itself; nothing outside the checkout has to.**
+  `update.py` reads `.git/HEAD` every `POLL_S` seconds (two file reads, no
+  subprocess) and `Browser._poll_update` restarts onto a new commit once
+  `update.idle()` says nothing would be interrupted. The exec in `__main__`
+  keeps `CB_IN_SCOPE=1` on purpose: the process is already inside the systemd
+  scope `cb` created, exec keeps the PID, and re-entering the wrapper would ask
+  systemd to move a process that is already in a scope, which it refuses — the
+  browser would simply never come back. A commit is the trigger, not a file
+  save, so an editor session does not restart the browser on every keystroke.
+- **Dialogs auto-answer only on a tab an agent is driving.** `needs_tab` stamps
+  `tab.agent_at`; `_on_script_dialog` treats a tab driven within
+  `DIALOG_DRIVEN_S` as the agent's and applies `CB_DIALOGS`, and every other
+  tab gets WebKit's own dialog whatever the setting says. The split is the
+  whole feature: a daily browser whose `confirm()`s are all accepted silently
+  is a browser that will one day delete something for you.
+- **`upload` is a handshake, never a chooser.** Paths are validated in
+  `uploads.check_paths` before the page is touched, parked on the tab with a
+  ten-second expiry, and consumed by the `run-file-chooser` handler when the
+  input is clicked. No pending entry means the ordinary GTK chooser, so a human
+  click is unchanged. An expired or failed upload is `take()`n so it cannot be
+  handed to the next click on some other input.
+- **A `download` claimed by the agent is matched to the agent's own tab.**
+  `_dl_claim` takes an exact URL match first and otherwise only a pending entry
+  whose tab's view is the download's view. Without that second check a redirect
+  fallback would route the user's own download, started in the same window, to
+  the agent's path.
+- **The network log resets on COMMITTED, and the main document is re-recorded
+  after.** `resource-load-started` for the main frame fires *before*
+  `COMMITTED`, so a plain reset would drop the very entry that names the page.
+  Compare the resource to `get_main_resource()` with `==`, never `is`:
+  PyGObject can hand out two wrappers for one GObject.
+- **`press` dispatches the events and then applies the default action.** A
+  synthetic `KeyboardEvent` has no default action in any browser, so Enter
+  submitting a form, Tab moving focus and Escape blurring are done by hand in
+  `extract.press`, after the handlers ran and only if none called
+  `preventDefault()`.
 - Named exports of intent in comments: explain *why*, especially where a choice
   looks arbitrary but encodes a real constraint.
 

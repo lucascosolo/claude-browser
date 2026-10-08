@@ -8,7 +8,8 @@ Postgres and Playwright) has been removed rather than parked; the reasoning for
 those refusals lives in `CLAUDE.md` under *Architectures already rejected*, so
 it does not get re-proposed here every six months.
 
-Ideas that have since been built — reader mode, the page-text cache, `recall`
+Ideas that have since been built — reader mode, playbook parameters, scroll
+restore on discard, the agent's keyboard/file/network operations, self-update, the page-text cache, `recall`
 full-text search, the visible agent cursor, the outbound PII scrubber, playbooks,
 Claude personas, discard-path tab summaries, private-mode hardening and VPN
 Mode — are documented in `README.md` and `CLAUDE.md` and are no longer
@@ -34,9 +35,6 @@ What is left are the wins that cost no CPU.
   the pointer is resting on pays full DNS latency on click. It has to inherit the
   privacy gates: not in a private tab, and not while VPN Mode is on, where a local
   resolution would defeat the tunnel.
-- **`Tab.scroll` is a dead field** — set to `0` and never read or written again,
-  so a tab discarded under memory pressure reloads to the top and loses your
-  reading position. Capturing and restoring it makes discards nearly invisible.
 - **Back/forward swipe gestures** (`enable-back-forward-navigation-gestures`)
   default `False` and are free to enable.
 - **Startup is ~7.8s of imports** (`python3 -X importtime`), most of it
@@ -91,9 +89,3 @@ page.
 - **Lazy images and iframes.** A `loading="lazy"` pass and a low-quality
   placeholder for offscreen images, on hardware where a page's image decode is a
   real cost.
-
-- **Parameters for playbooks.** A recorded run hard-codes the URL and the search
-  term it used. A playbook worth keeping takes them as arguments, so
-  `playbook-run report --date 2026-08` is one playbook rather than thirty. The
-  recorder already knows which parameter each value came from; what is missing
-  is a way to name one and substitute it at replay.

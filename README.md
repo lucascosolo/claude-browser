@@ -402,10 +402,11 @@ claude mcp add -s user browser -- /path/to/claude-browser/cb-mcp
 ```
 
 That registers `browser_open`, `browser_text`, `browser_markdown`, `browser_links`,
-`browser_find`, `browser_click`, `browser_fill`, `browser_eval`, `browser_console`,
-`browser_screenshot`, `browser_reader`, `browser_recall`, `browser_playbook-run`,
-and the navigation tools — 26 in all, generated from the same table as the HTTP
-routes, so the two cannot disagree.
+`browser_find`, `browser_click`, `browser_fill`, `browser_press`, `browser_wait-for`,
+`browser_network`, `browser_download`, `browser_eval`, `browser_console`,
+`browser_screenshot`, `browser_pdf`, `browser_reader`, `browser_recall`,
+`browser_playbook-run` and the rest — 48 in all, generated from the same table as
+the HTTP routes, so the two cannot disagree. `cbctl --help` lists every one.
 
 **You do not need to start the browser first.** The MCP server launches it on
 the first tool call and waits for it to come up (`CB_AUTOSTART=0` opts out).
@@ -428,6 +429,66 @@ the first tool call and waits for it to come up (`CB_AUTOSTART=0` opts out).
 
 `cbctl` exits non-zero when the browser reports a failure, so `cbctl click .go &&
 cbctl text` does the right thing.
+
+### Doing real work: waiting, keys, files, the network
+
+Reading a page is the easy half. The operations below are what let an agent
+finish a task on a page that loads in stages, needs a keyboard, or hands back a
+file. Every one is an MCP tool as well as a `cbctl` subcommand.
+
+```bash
+./cbctl wait-for --selector '#results'          # until it exists and is visible
+./cbctl wait-for --text 'Order confirmed' --timeout 60
+./cbctl wait-for --idle                         # not loading, network quiet 500 ms
+./cbctl wait-for --selector '.spinner' --gone   # until it is gone
+./cbctl scroll bottom                           # or top, a selector, or --by 800
+./cbctl text --selector 'main'                  # read one region, not the page
+./cbctl tables                                  # every <table> as headers + rows
+./cbctl press Enter                             # also Tab, Escape, Ctrl+K, ArrowDown
+./cbctl type 'hello'                            # into the focused field, or --selector
+./cbctl select '#country' 'Canada'              # by value or label; --checked for boxes
+./cbctl hover '.menu'                           # open a hover menu, nothing pressed
+./cbctl submit                                  # the form, then wait for the load
+./cbctl upload 'input[type=file]' /home/me/report.csv
+./cbctl download https://example.com/data.csv /home/me/data.csv   # with the tab's cookies
+./cbctl network --pattern '/api/'               # the tab's requests: status, size, time
+./cbctl dialogs                                 # alerts/confirms the page raised
+./cbctl shot /tmp/page.png --full               # the whole document; --selector crops
+./cbctl pdf /tmp/page.pdf                       # the rendered page as a PDF
+```
+
+A few of these carry a rule worth knowing:
+
+- **`press` applies the key's default action**, the way a real keystroke
+  would: Enter in a field submits its form, Tab moves focus, Escape blurs. The
+  events are dispatched first, so a page that handles the key itself still
+  wins.
+- **Dialogs never block the browser while an agent is driving.** On a tab an
+  agent has touched in the last 30 seconds, `alert`, `confirm`, `prompt` and
+  leave-page prompts are answered automatically and logged, readable with
+  `dialogs`. On every other tab you still get the normal dialog, whatever
+  `CB_DIALOGS` says — a page you are reading by hand cannot be auto-confirmed
+  out from under you. `CB_DIALOGS=ask` turns auto-answering off entirely.
+- **`upload` never opens a file chooser.** The paths are checked before the
+  page is touched, parked on the tab for ten seconds, and handed to WebKit's
+  chooser request when the input is clicked. A human clicking the same input
+  still gets the ordinary chooser.
+- **`download` fetches with the tab's session** and writes exactly where it
+  was told, refusing to overwrite without `--overwrite`. A private tab refuses
+  it unless `CB_PRIVATE_DOWNLOADS` allows.
+- **`network` is per tab, in memory only, and resets on each navigation.** It
+  is what `wait-for --idle` reads to decide the page has settled.
+- **A screenshot or PDF of a private tab is never written to disk** — omit the
+  path on `screenshot` to receive the PNG instead.
+
+### Keeping the running browser current
+
+The browser runs straight from its checkout, and the installed launcher is a
+symlink into it. When a commit lands there, the running window restarts itself
+onto the new code — once nothing is loading, no agent or playbook is active, no
+download is running, and neither the control API nor the keyboard has been used
+for half a minute. Tabs come back through the saved session. `CB_AUTOUPDATE=0`
+turns it off; `cbctl restart` restarts at once regardless.
 
 ### Playbooks: record a sequence, replay it later
 
@@ -459,6 +520,14 @@ works tomorrow.
 field is dropped at capture time rather than written to disk and hidden later,
 and the reply says how many were skipped. On replay the browser's own autofill
 supplies them, which is the only path here allowed to hold a secret.
+
+A recorded step hard-codes the URL and the text it used. To make one playbook
+serve many inputs, edit the file and replace a value with `{param:NAME}`; then
+`cbctl playbook-run report '{"NAME": "value"}'` substitutes it, and
+`playbook-list` says which names each playbook needs. A missing value refuses
+the whole run before any step moves the browser. (`{profile:...}` placeholders
+are different: those resolve against the keyring at fill time, never from the
+command line.)
 
 Playbooks live in `~/.local/share/claude-browser/playbooks.json` — plain JSON, so
 you can read, edit, diff and copy them. Replay validates every step against the
@@ -707,7 +776,7 @@ session eats it. It is a fallback, not a foundation.
 CB_AUTOSTART=0 python3 -m unittest discover -s tests
 ```
 
-576 tests, about 9 seconds, no display needed. `CB_AUTOSTART=0` matters:
+1055 tests, about 4 seconds, no display needed. `CB_AUTOSTART=0` matters:
 `test_offline.py` runs `cbctl` and `cb-mcp` as real subprocesses, and those
 launch the browser on demand unless told not to.
 
