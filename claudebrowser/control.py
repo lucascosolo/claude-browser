@@ -172,6 +172,11 @@ class Control:
         except KeyError as e:
             return self._send(handler, 400,
                               {"ok": False, "error": "missing parameter %s" % e})
+        except ValueError as e:
+            # A builder refusing its arguments (an unparseable key combo, a
+            # `select` with nothing to set) is the caller's mistake, not a
+            # crash: 400 with the reason, never a traceback.
+            return self._send(handler, 400, {"ok": False, "error": str(e)})
         except Exception:
             return self._send(handler, 500,
                               {"ok": False, "error": traceback.format_exc(limit=4)})
