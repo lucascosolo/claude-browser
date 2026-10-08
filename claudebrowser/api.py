@@ -408,14 +408,16 @@ OPS = [
        params=[Param("selector", required=True,
                      help="The input[type=file], as a CSS selector or @ref."),
                Param("path", required=True,
-                     help="Absolute path, or a JSON array string of them.")],
+                     help="Absolute path, or a JSON array string of them, inside "
+                          "CB_AGENT_DIRS (default ~/Downloads, ~/.cache/claude-browser).")],
        call=lambda c, a: ("api_upload", (_tab(a), a["selector"], a["path"]))),
 
     Op("download", "/download", "POST", "Download a URL with this tab's cookies "
        "to an absolute path on disk and wait for it to finish. Refused for a "
        "private tab unless private downloads are allowed.",
        params=[Param("url", required=True, help="What to download."),
-               Param("path", required=True, help="Absolute destination file."),
+               Param("path", required=True, help="Absolute destination file, "
+                     "inside CB_AGENT_DIRS."),
                Param("overwrite", "boolean", "Replace an existing file.",
                      cli="opt", default=False)],
        call=lambda c, a: ("api_download", (_tab(a), a["url"], a["path"],
@@ -489,8 +491,12 @@ OPS = [
        timeout=60),
 
     Op("pdf", "/pdf", "POST", "Print the page to a PDF file at an absolute path.",
-       params=[Param("path", required=True, help="Absolute path ending in .pdf.")],
-       call=lambda c, a: ("api_pdf", (_tab(a), a["path"])),
+       params=[Param("path", required=True, help="Absolute path ending in .pdf, "
+                     "inside CB_AGENT_DIRS."),
+               Param("overwrite", "boolean", "Replace an existing file.",
+                     cli="opt", default=False)],
+       call=lambda c, a: ("api_pdf", (_tab(a), a["path"],
+                                      _truthy(a.get("overwrite"), False))),
        timeout=90),
 
     # Playbooks: a saved, ordered list of the operations above. Nothing new is

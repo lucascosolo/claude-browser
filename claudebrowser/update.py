@@ -28,7 +28,10 @@ GTK-free, so the whole decision -- what counts as a change, what counts as
 idle -- is tested without a display.
 """
 
+import glob
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -132,6 +135,10 @@ def idle(state, now=None):
         last_request_at       monotonic stamp of the last control-API request,
                               or None if there has never been one
         last_input_at         monotonic stamp of the last key/pointer event
+        requests_active       control-API requests not yet answered
+        playbook_running      a playbook replay is in progress
+        private_tabs          a private tab exists (it would not come back)
+        restore_off           CB_RESTORE_SESSION is off (no tab would)
 
     Returns (ok, reason): `reason` names the first thing in the way, in the
     words the flash message uses, so a user can see why the browser is holding.
@@ -145,6 +152,15 @@ def idle(state, now=None):
         return False, "a playbook is recording"
     if state.get("downloads_active"):
         return False, "a download is in progress"
+    if state.get("requests_active"):
+        return False, "a control-API request is in flight"
+    if state.get("playbook_running"):
+        return False, "a playbook is running"
+    if state.get("private_tabs"):
+        # A private tab is not saved in the session, so a restart closes it.
+        return False, "a private tab is open"
+    if state.get("restore_off"):
+        return False, "session restore is off"
     last_request = state.get("last_request_at")
     if last_request is not None and now - last_request < QUIET_REQUEST_S:
         return False, "the control API was used %ds ago" % int(now - last_request)
@@ -181,3 +197,34 @@ def restart_environ(environ=None):
     env["CB_IN_SCOPE"] = "1"
     env["CB_RESTARTED"] = "1"
     return env
+
+
+#: What the preflight imports. The modules every launch path needs before the
+#: window exists; a failure here is a browser that would not come back.
+PREFLIGHT_IMPORTS = ("import claudebrowser.api, claudebrowser.extract, "
+                     "claudebrowser.settings, claudebrowser.playbooks")
+PREFLIGHT_TIMEOUT_S = 60
+
+
+def preflight(repo, python=sys.executable):
+    """(ok, message): does the checkout compile and import?
+
+    Run in a subprocess before an exec, because exec is one-way: a syntax
+    error committed mid-edit would otherwise replace a working browser with
+    one that never starts. `message` is the tail of stderr on failure.
+    """
+    sources = sorted(os.path.relpath(p, repo) for p in
+                     glob.glob(os.path.join(str(repo), "claudebrowser", "*.py")))
+    for cmd in ([python, "-m", "py_compile", *sources],
+                [python, "-c", PREFLIGHT_IMPORTS]):
+        try:
+            done = subprocess.run(cmd, cwd=str(repo), capture_output=True,
+                                  text=True, timeout=PREFLIGHT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return False, "preflight timed out after %ds" % PREFLIGHT_TIMEOUT_S
+        except OSError as e:
+            return False, "preflight could not run %s: %s" % (python, e)
+        if done.returncode != 0:
+            err = (done.stderr or "").strip() or "exit status %d" % done.returncode
+            return False, err[-500:]
+    return True, ""

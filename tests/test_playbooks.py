@@ -677,5 +677,25 @@ class TestParameters(unittest.TestCase):
             playbooks.validate(out)
 
 
+
+class TestFilesChunkRules(unittest.TestCase):
+    def test_type_without_a_selector_is_always_secret(self):
+        for params in ({"text": "hello"}, {"selector": "", "text": "hello"}, {}):
+            self.assertTrue(playbooks.is_secret_step("type", params), params)
+
+    def test_type_with_a_selector_follows_the_selector_alone(self):
+        self.assertTrue(playbooks.is_secret_step(
+            "type", {"selector": "#password", "text": "x"}))
+        self.assertFalse(playbooks.is_secret_step(
+            "type", {"selector": "#search", "text": "hunter2-secret"}))
+
+    def test_side_effecting_ops_are_not_replayable(self):
+        for name in ("restart", "upload", "download", "pdf"):
+            self.assertIn(name, playbooks.NOT_REPLAYABLE)
+            self.assertIsNone(playbooks.replayable(name))
+            with self.assertRaises(playbooks.PlaybookError):
+                playbooks.validate([{"op": name, "params": {}}])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

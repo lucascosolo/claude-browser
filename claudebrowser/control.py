@@ -69,6 +69,11 @@ class Control:
         # self-update poll (update.idle) so a restart never lands between two
         # steps of a sequence someone is driving.
         self.last_request_at = None
+        # Requests between reaching an op and answering. The timestamp alone
+        # cannot see a long one -- a 300 s download or a playbook run started
+        # more than QUIET_REQUEST_S ago looks quiet while it is still working.
+        self.inflight = 0
+        self._inflight_lock = threading.Lock()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -166,6 +171,8 @@ class Control:
                 "routes": sorted(o.route for o in api.OPS)})
 
         self.last_request_at = time.monotonic()
+        with self._inflight_lock:
+            self.inflight += 1
         try:
             method, call_args = op.call(self, args)
             payload = on_main_loop(self.browser, method, call_args, timeout=op.timeout)
@@ -180,6 +187,9 @@ class Control:
         except Exception:
             return self._send(handler, 500,
                               {"ok": False, "error": traceback.format_exc(limit=4)})
+        finally:
+            with self._inflight_lock:
+                self.inflight -= 1
 
         self._record(op, args, payload)
 

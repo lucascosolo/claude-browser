@@ -65,7 +65,7 @@ r=$("$CB" "${T[@]}" text --selector '#out');    check "page saw the file" "$r" '
 r=$("$CB" "${T[@]}" network);                   check "network log has the document" "$r" 'smoke.html'
 r=$("$CB" "${T[@]}" shot "$OUT/full.png" --full);           check "screenshot --full" "$r" '"ok": true'
 r=$("$CB" "${T[@]}" shot "$OUT/table.png" --selector '#t'); check "screenshot --selector" "$r" '"ok": true'
-r=$("$CB" "${T[@]}" pdf "$OUT/page.pdf");       check "pdf" "$r" '"ok": true'
+r=$("$CB" "${T[@]}" pdf "$OUT/page.pdf" --overwrite); check "pdf" "$r" '"ok": true'
 [ -s "$OUT/page.pdf" ] && ok "pdf file is non-empty" || bad "pdf file is non-empty" "$(ls -la "$OUT")"
 
 r=$("$CB" "${T[@]}" download "$PAGE" "$OUT/downloaded.html" --overwrite); check "download" "$r" '"ok": true'

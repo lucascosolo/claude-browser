@@ -24,7 +24,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (update,  # noqa: E402
                agent, ai, auth, dialogs, envfile, extract, fills, findbar,  # noqa: E402
-               netlog, pages, uploads,
+               files, netlog, pages, uploads,
                pagetext, panel_html, passwords, perf, personas, playbooks,
                profile, progress, reader, resources, scrub, search, settings,
                siterules, storage, store, style, tabnames, urls, vpn,
@@ -318,6 +318,47 @@ def _playing_audio(view):
         return False
 
 
+def _restore_session():
+    """CB_RESTORE_SESSION, read now. Off means a restart loses every tab, so
+    self-update holds for it as well as consulting it at launch."""
+    return (envfile.setting("CB_RESTORE_SESSION", "1") or "1").strip().lower() \
+        not in ("0", "off", "false", "no")
+
+
+def _file_printer():
+    """The name of GTK's print-to-file printer, or None when there is none.
+
+    Without it `print_()` falls through to the default printer, which turns an
+    agent's `pdf` into paper. GtkPrinter lives in the GtkUnixPrint namespace,
+    whose typelib Ubuntu does not ship; where it exists the printers are
+    enumerated, and where it does not, the presence of GTK's file backend
+    module stands in for asking it.
+    """
+    try:
+        gi.require_version("GtkUnixPrint", "3.0")
+        from gi.repository import GtkUnixPrint
+    except (ValueError, ImportError):
+        GtkUnixPrint = None
+    if GtkUnixPrint is not None:
+        found = []
+
+        def pick(printer, *_data):
+            backend = str(printer.get_backend() or "").lower()
+            if (printer.is_virtual() and printer.accepts_pdf()
+                    and ("file" in backend or "file" in printer.get_name().lower())):
+                found.append(printer.get_name())
+                return True
+            return False
+
+        GtkUnixPrint.enumerate_printers(pick, True)
+        return found[0] if found else None
+    import glob
+    if glob.glob("/usr/lib/*/gtk-3.0/*/printbackends/libprintbackend-file.so") \
+            or glob.glob("/usr/lib*/gtk-3.0/*/printbackends/libprintbackend-file.so"):
+        return "Print to File"
+    return None
+
+
 def _route_through_vpn(target):
     """Put one WebContext or WebsiteDataManager behind the VPN proxy.
 
@@ -345,6 +386,10 @@ class Tab:
         self.id = Tab._next_id
         Tab._next_id += 1
         self.private = private
+        # The one agent `download` waiting for this tab's next WebKit download.
+        # Claimed by view, not URL: a redirect changes the URL, and matching
+        # it let another tab's download, or a person's, answer the agent.
+        self.pending_download = None
         self.dialogs = dialogs.Log()
         self.netlog = netlog.Log()
         # id() -> WebResource. Holding the wrapper keeps id() unique for the
@@ -602,7 +647,9 @@ class Browser(Gtk.Window):
         # Files an `upload` has promised to the next file chooser on a tab, and
         # `download` calls waiting for WebKit's download-started, by URL.
         self.pending_uploads = uploads.Pending()
-        self.pending_downloads = {}
+
+        # Playbook runs in progress; update.idle will not restart under one.
+        self.playbooks_running = 0
 
         # -- self-update ------------------------------------------------------
         # The checkout is the installed application (install.sh symlinks into
@@ -613,6 +660,7 @@ class Browser(Gtk.Window):
         self.last_input_at = time.monotonic()
         self.updater = update.Watcher()
         self._update_note = ""
+        self._update_broken = None     # the revision whose preflight failed
         GLib.timeout_add_seconds(update.POLL_S, self._poll_update)
 
         # Context tuning must happen before the first WebView exists, since the
@@ -659,8 +707,7 @@ class Browser(Gtk.Window):
         # launch passes None, which is the only case restoring last session's
         # tabs should apply. Read once, like CB_HOME: this only ever matters at
         # the moment the window is built.
-        restore = (envfile.setting("CB_RESTORE_SESSION", "1") or "1").strip().lower() \
-            not in ("0", "off", "false", "no")
+        restore = _restore_session()
         restored = self.store.session_tabs() if (
             urls is None and restore and self.store is not None) else []
         for url in (urls or restored or [HOME]):
@@ -678,6 +725,10 @@ class Browser(Gtk.Window):
             "agent_running": self.panel_busy,
             "recording": bool(getattr(self.recorder, "active", False)),
             "downloads_active": bool(self.downloads),
+            "requests_active": getattr(self.control, "inflight", 0),
+            "playbook_running": self.playbooks_running > 0,
+            "private_tabs": any(t.private for t in self.tabs),
+            "restore_off": not _restore_session(),
             "last_request_at": getattr(self.control, "last_request_at", None),
             "last_input_at": self.last_input_at,
         }
@@ -701,6 +752,17 @@ class Browser(Gtk.Window):
                 self._update_note = note
                 self._flash(note)
             return GLib.SOURCE_CONTINUE
+        if revision == self._update_broken:
+            return GLib.SOURCE_CONTINUE
+        ok, message = update.preflight(self.updater.repo)
+        if not ok:
+            # Once per revision: the next commit gets its own check.
+            self._update_broken = revision
+            print("update: %s does not compile:\n%s" % (revision, message),
+                  flush=True)
+            self._flash("New version %s does not compile — not restarting"
+                        % revision)
+            return GLib.SOURCE_CONTINUE
         self._flash("Updated to %s — restarting" % revision)
         self._restart()
         return GLib.SOURCE_REMOVE
@@ -718,6 +780,10 @@ class Browser(Gtk.Window):
         if update.launcher() is None:
             return done({"ok": False, "error": "not running from a git "
                                                "checkout; nothing to restart onto"})
+        ok, message = update.preflight(self.updater.repo)
+        if not ok:
+            return done({"ok": False, "error": "the checkout does not "
+                         "compile; not restarting onto it: %s" % message})
         done({"ok": True, "restarting": True,
               "revision": (update.head_revision(self.updater.repo) or "")[:10]})
         GLib.timeout_add(300, lambda: (self._restart(), GLib.SOURCE_REMOVE)[1])
@@ -3668,28 +3734,17 @@ class Browser(Gtk.Window):
         self._flash("Downloaded %s" % name)
 
     def _dl_claim(self, download):
-        """The pending agent `download` this WebKit download belongs to, removed
-        from the pending table, or None for an ordinary one. Matched on the URI
-        WebKit reports; a redirect changes it, so with no exact match the most
-        recent entry registered *by the tab this download came from* is taken.
-        Anything else is a person's own download and gets the offer row."""
-        if not self.pending_downloads:
-            return None
-        try:
-            uri = download.get_request().get_uri()
-        except Exception:
-            uri = None
-        if uri in self.pending_downloads:
-            return self.pending_downloads.pop(uri)
+        """The agent `download` waiting on the tab this download came from,
+        taken off that tab, or None for a person's own download."""
         try:
             view = download.get_web_view()
         except Exception:
             view = None
-        for key in reversed(list(self.pending_downloads)):
-            tab = self.find(self.pending_downloads[key]["tab"])
-            if view is not None and tab is not None and tab.view is view:
-                return self.pending_downloads.pop(key)
-        return None
+        tab = next((t for t in self.tabs if _same_object(t.view, view)), None)
+        if tab is None or tab.pending_download is None:
+            return None
+        entry, tab.pending_download = tab.pending_download, None
+        return entry
 
     @needs_tab
     def api_download(self, tab, url, path, overwrite, done):
@@ -3697,13 +3752,19 @@ class Browser(Gtk.Window):
 
         Goes through WebKit's own download machinery (view.download_uri) rather
         than fetching in Python, so the session, cookies and proxy are the
-        tab's. The record is registered before the download starts, keyed by
-        URL, so _on_download routes it here instead of to the offer row.
+        tab's. One per tab at a time: the next download WebKit starts from this
+        tab's view is the one claimed, whatever URL it ends up at.
         """
         if tab.private and not storage.private_downloads_enabled():
             return done({"ok": False, "error": PRIVATE_DOWNLOAD_ERROR})
-        if not os.path.isabs(path or ""):
-            return done({"ok": False, "error": "path must be absolute"})
+        if tab.pending_download is not None:
+            return done({"ok": False,
+                         "error": "a download is already pending on this tab"})
+        try:
+            path = files.contain_write(
+                path, files.roots(envfile.setting("CB_AGENT_DIRS")))
+        except ValueError as e:
+            return done({"ok": False, "error": str(e)})
         if not os.path.isdir(os.path.dirname(path)):
             return done({"ok": False, "error": "no such directory: %s"
                          % os.path.dirname(path)})
@@ -3711,13 +3772,14 @@ class Browser(Gtk.Window):
         if existed and not overwrite:
             return done({"ok": False, "error": "file exists: %s "
                          "(pass overwrite to replace it)" % path})
-        state = {"answered": False, "download": None}
+        state = {"answered": False}
 
         def answer(payload):
             if state["answered"]:
                 return
             state["answered"] = True
-            self.pending_downloads.pop(url, None)
+            if tab.pending_download is entry:
+                tab.pending_download = None
             done(payload)
 
         def timed_out():
@@ -3735,7 +3797,7 @@ class Browser(Gtk.Window):
 
         entry = {"path": path, "overwrite": bool(overwrite), "existed": existed,
                  "answer": answer, "tab": tab.id}
-        self.pending_downloads[url] = entry
+        tab.pending_download = entry
         GLib.timeout_add_seconds(DOWNLOAD_TIMEOUT_S, timed_out)
         try:
             tab.view.download_uri(url)
@@ -3799,7 +3861,9 @@ class Browser(Gtk.Window):
         """Click a file input and answer its chooser with `path`, then poll
         until the input holds the files."""
         try:
-            paths = uploads.check_paths(path)
+            roots = files.roots(envfile.setting("CB_AGENT_DIRS"))
+            paths = [files.contain_read(p, roots)
+                     for p in uploads.check_paths(path)]
         except ValueError as e:
             return done({"ok": False, "error": str(e)})
         self.pending_uploads.put(tab.id, paths)
@@ -4710,21 +4774,30 @@ class Browser(Gtk.Window):
         self.api_eval(tab.id, extract.rect(selector), on_rect)
 
     @needs_tab
-    def api_pdf(self, tab, path, done):
+    def api_pdf(self, tab, path, overwrite, done):
         """Print the page to a PDF through WebKit's own print path, which
         lays the document out for paper rather than grabbing pixels."""
         if tab.private:
             return done({"ok": False, "error":
                          "this tab is private, so it is not printed to a file "
                          "on disk. Use screenshot without a path instead."})
-        path = path or ""
-        if not os.path.isabs(path):
-            return done({"ok": False, "error": "path must be absolute"})
+        try:
+            path = files.contain_write(
+                path or "", files.roots(envfile.setting("CB_AGENT_DIRS")))
+        except ValueError as e:
+            return done({"ok": False, "error": str(e)})
         if not path.lower().endswith(".pdf"):
             return done({"ok": False, "error": "path must end in .pdf"})
         if not os.path.isdir(os.path.dirname(path)):
             return done({"ok": False, "error": "no such directory: %s"
                          % os.path.dirname(path)})
+        if os.path.exists(path) and not overwrite:
+            return done({"ok": False, "error": "file exists: %s "
+                         "(pass overwrite to replace it)" % path})
+        printer = _file_printer()
+        if printer is None:
+            return done({"ok": False,
+                         "error": "no print-to-file printer available"})
         state = {"answered": False}
 
         def answer(payload):
@@ -4743,9 +4816,7 @@ class Browser(Gtk.Window):
 
         op = WebKit2.PrintOperation.new(tab.view)
         settings = Gtk.PrintSettings()
-        # GTK's file backend; named so print_() cannot fall through to a real
-        # default printer. The name is GTK's untranslated one on this machine.
-        settings.set_printer("Print to File")
+        settings.set_printer(printer)
         settings.set(Gtk.PRINT_SETTINGS_OUTPUT_FILE_FORMAT, "pdf")
         settings.set(Gtk.PRINT_SETTINGS_OUTPUT_URI, GLib.filename_to_uri(path))
         op.set_print_settings(settings)
@@ -4754,7 +4825,10 @@ class Browser(Gtk.Window):
         # The operation must outlive this call; the timer's closure holds it.
         GLib.timeout_add_seconds(PDF_TIMEOUT_S, lambda: (
             op, answer({"ok": False, "error": "pdf timed out"}))[1])
-        op.print_()
+        try:
+            op.print_()
+        except Exception as e:
+            answer({"ok": False, "error": "print failed: %s" % e})
 
     # -- machine and storage ------------------------------------------------
 
@@ -5571,6 +5645,7 @@ class Browser(Gtk.Window):
             if finished[0]:
                 return
             finished[0] = True
+            self.playbooks_running -= 1
             done(payload)
 
         def run(index):
@@ -5603,8 +5678,16 @@ class Browser(Gtk.Window):
                 # main loop gets a chance to paint between steps.
                 GLib.idle_add(lambda: (run(index + 1), GLib.SOURCE_REMOVE)[1])
 
-            getattr(self, method)(*call_args, after)
+            try:
+                getattr(self, method)(*call_args, after)
+            except Exception as e:
+                # Without this a raising step would never reach `finish`, and
+                # the playbook would hold self-update off for the session.
+                finish({"ok": False, "playbook": name, "steps": results,
+                        "error": "step %d (%s) raised: %s"
+                                 % (index + 1, op.name, e)})
 
+        self.playbooks_running += 1
         run(0)
 
     # -- bookmarks, history and downloads, over the API ----------------------

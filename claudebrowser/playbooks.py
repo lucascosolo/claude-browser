@@ -73,6 +73,9 @@ NOT_REPLAYABLE = frozenset({
     # while someone saves a password would write it to the playbook file
     # verbatim.
     "save-password",
+    # Restarting mid-replay ends the replay; and the file ops take paths, so a
+    # playbook file on disk must not be a way to name what to read or write.
+    "restart", "upload", "download", "pdf",
 })
 
 #: What a credential field looks like from the outside. Matched against a CSS
@@ -116,13 +119,19 @@ def replayable(name):
 def is_secret_step(op_name, params):
     """Would recording this step write a credential to disk?
 
-    Three ops carry free text that could be one: `fill` types a value into a
-    field the selector names, `eval` can carry anything at all, and
-    `fill-many` types several values at once. Everything else is a URL, a
+    Four ops carry free text that could be one: `fill` and `type` put a value
+    into a field the selector names (`type` with no selector, into whatever
+    has focus -- always treated as secret), `eval` can carry anything at all,
+    and `fill-many` types several values at once. Everything else is a URL, a
     selector, or a number.
     """
     if op_name == "fill":
         return bool(SECRET_HINT.search(str(params.get("selector") or "")))
+    if op_name == "type":
+        # With no selector it types into whatever has focus, which may well be
+        # a password field nothing here can see.
+        selector = str(params.get("selector") or "")
+        return not selector or bool(SECRET_HINT.search(selector))
     if op_name == "eval":
         return bool(SECRET_HINT.search(str(params.get("js") or "")))
     if op_name == "fill-many":

@@ -507,7 +507,10 @@ class TestApiRegistry(unittest.TestCase):
         self.assertEqual(
             d("/network", {"pattern": "x", "limit": "5", "clear": "1", "tab": "2"}),
             ("api_network", (2, "x", 5, True)))
-        self.assertEqual(d("/pdf", {"path": "/x.pdf"}), ("api_pdf", (None, "/x.pdf")))
+        self.assertEqual(d("/pdf", {"path": "/x.pdf"}),
+                         ("api_pdf", (None, "/x.pdf", False)))
+        self.assertEqual(d("/pdf", {"path": "/x.pdf", "overwrite": "true"}),
+                         ("api_pdf", (None, "/x.pdf", True)))
         self.assertEqual(d("/wait/for", {"selector": "a"}),
                          ("api_wait_for", (None, "a", None, None, False, None, False, 500)))
         self.assertEqual(d("/wait/for", {"idle": "1"}),

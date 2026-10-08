@@ -154,5 +154,59 @@ class Misc(unittest.TestCase):
         self.assertTrue((root / "claudebrowser" / "update.py").is_file())
 
 
+
+class IdleChunk7(unittest.TestCase):
+    def test_new_blockers_name_themselves(self):
+        for state, word in [({"requests_active": 2}, "request"),
+                            ({"playbook_running": True}, "playbook")]:
+            ok, reason = update.idle(state, now=1000.0)
+            self.assertFalse(ok, state)
+            self.assertIn(word, reason)
+
+    def test_private_tabs_and_restore_off_have_exact_reasons(self):
+        self.assertEqual(update.idle({"private_tabs": True}, now=1000.0),
+                         (False, "a private tab is open"))
+        self.assertEqual(update.idle({"restore_off": True}, now=1000.0),
+                         (False, "session restore is off"))
+
+    def test_falsy_new_blockers_do_not_block(self):
+        state = {"requests_active": 0, "playbook_running": False,
+                 "private_tabs": False, "restore_off": False}
+        self.assertEqual(update.idle(state, now=1000.0), (True, ""))
+
+
+class Preflight(unittest.TestCase):
+    def repo(self, **overrides):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        pkg = Path(tmp.name) / "claudebrowser"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        for name in ("api", "extract", "settings", "playbooks"):
+            (pkg / (name + ".py")).write_text(overrides.get(name, "X = 1\n"))
+        return tmp.name
+
+    def test_healthy_tree_passes(self):
+        self.assertEqual(update.preflight(self.repo()), (True, ""))
+
+    def test_syntax_error_fails_and_is_reported(self):
+        ok, msg = update.preflight(self.repo(extract="def (:\n"))
+        self.assertFalse(ok)
+        self.assertIn("SyntaxError", msg)
+
+    def test_import_time_error_fails_and_is_reported(self):
+        ok, msg = update.preflight(
+            self.repo(playbooks='raise ImportError("boom-xyz")\n'))
+        self.assertFalse(ok)
+        self.assertIn("boom-xyz", msg)
+        self.assertLessEqual(len(msg), 500)
+
+    def test_unlaunchable_python_fails_without_raising(self):
+        repo = self.repo()
+        ok, msg = update.preflight(repo, python=os.path.join(repo, "nope", "python3"))
+        self.assertFalse(ok)
+        self.assertTrue(msg)
+
+
 if __name__ == "__main__":
     unittest.main()

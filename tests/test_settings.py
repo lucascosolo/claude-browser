@@ -21,13 +21,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from claudebrowser import envfile, pages, personas, settings, style  # noqa: E402
+from claudebrowser import envfile, files, pages, personas, settings, style  # noqa: E402
 
 #: Every knob the browser reads. Listed here rather than derived from the table
 #: so that a setting deleted from settings.py fails a test instead of quietly
 #: becoming uneditable again.
 EVERY_KEY = (
-    "CB_AUTH", "CB_AUTOSTART", "CB_AUTOUPDATE", "CB_BLOCK", "CB_COOKIES", "CB_DIALOGS", "CB_GPU", "CB_HOME",
+    "CB_AGENT_DIRS", "CB_AUTH", "CB_AUTOSTART", "CB_AUTOUPDATE", "CB_BLOCK", "CB_COOKIES", "CB_DIALOGS", "CB_GPU", "CB_HOME",
     "CB_ITP", "CB_LIGHT", "CB_MAX_TABS", "CB_MEM_LIMIT", "CB_PACE",
     "CB_PERSONA", "CB_PORT", "CB_PRIVATE_AI", "CB_PRIVATE_DOWNLOADS",
     "CB_QUEUE_LIST", "CB_RESTORE_SESSION",
@@ -65,6 +65,14 @@ class Isolated(unittest.TestCase):
 
 
 class TestTable(Isolated):
+    def test_agent_dirs_setting(self):
+        knob = settings.get("CB_AGENT_DIRS")
+        self.assertEqual(knob.default, files.DEFAULT)
+        self.assertEqual(knob.section, "Control API")
+        with self.assertRaises(ValueError):
+            knob.clean("rel/dir")
+        self.assertEqual(knob.clean("~/x:/abs/y"), "~/x:/abs/y")
+
     def test_every_setting_the_browser_reads_is_here(self):
         self.assertEqual(sorted(settings.BY_KEY), sorted(EVERY_KEY))
 
@@ -92,6 +100,8 @@ class TestTable(Isolated):
         badge is exactly the field most likely to be copied unexamined."""
         live = {"CB_THEME", "CB_LIGHT", "CB_SCRUB", "CB_PERSONA", "CB_AUTH",
                 "CB_PACE", "CB_URL", "CB_AUTOSTART",
+                # read by files.roots on every upload, download and pdf call
+                "CB_AGENT_DIRS",
                 # Both read at the moment they are consulted -- ai.private_ai_-
                 # enabled when a Claude feature is handed a tab, and
                 # storage.private_downloads_enabled when a download starts.

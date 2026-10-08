@@ -38,7 +38,7 @@ it. Nothing here is a fresh description of behaviour written from the name.
 
 import os
 
-from . import envfile, personas, vpn
+from . import envfile, files, personas, vpn
 
 #: Section headings, in the order the page shows them, with the one line that
 #: says what the section is for.
@@ -174,6 +174,13 @@ def _playlist_id(value):
     if not all(c.isalnum() or c in "-_" for c in text):
         return "playlist ids are letters, digits, - and _ only"
     return None
+
+
+def _absolute_dirs(value):
+    for entry in value.split(":"):
+        entry = entry.strip()
+        if entry and not os.path.isabs(os.path.expanduser(entry)):
+            raise ValueError("%r is not an absolute directory" % entry)
 
 
 def _start_page(value):
@@ -627,6 +634,16 @@ SETTINGS = (
         "Read by each client process as it starts; nothing in this window uses "
         "it.",
         allow_empty=True, check=_http_url),
+    Setting(
+        "CB_AGENT_DIRS", "Control API", "Agent file directories",
+        "Where agent upload, download and pdf calls may read and write: "
+        "colon-separated absolute directories, ~ allowed. Anything outside "
+        "them, symlinks included, is refused.",
+        "text", files.DEFAULT,
+        "Next file call",
+        "Read on every upload, download and pdf call, so a change applies to "
+        "the next one.",
+        check=_absolute_dirs),
     Setting(
         "CB_AUTOSTART", "Control API", "Start the browser on demand",
         "Lets the MCP server launch the browser when a tool call arrives and "

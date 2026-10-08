@@ -155,7 +155,21 @@ def main(argv=None):
         path = update.launcher()
         if path:
             print("restarting onto %s" % path, flush=True)
-            os.execve(path, [path], update.restart_environ())
+            try:
+                os.execve(path, [path], update.restart_environ())
+            except OSError as e:
+                # cb lost its exec bit, or the checkout moved: start it as a new
+                # process instead, so the restart still ends in a browser.
+                import subprocess
+
+                print("restart: exec failed (%s); starting %s detached"
+                      % (e, path), flush=True)
+                try:
+                    subprocess.Popen([path], start_new_session=True)
+                except OSError as e2:
+                    print("restart: could not start %s (%s)" % (path, e2),
+                          flush=True)
+                    return 1
     return 0
 
 
