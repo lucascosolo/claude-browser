@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Smoke page</title>
+<style>
+  body { font-family: sans-serif; margin: 2rem; }
+  #late { display: none; }
+  #spacer { height: 3000px; }
+  .menu-items { display: none; }
+  .menu:hover .menu-items { display: block; }
+</style>
+</head>
+<body>
+<h1>Smoke page</h1>
+<main id="main">
+  <p id="intro">This page exists for tools/smoke.sh. It appears late, has a form, a table and a menu.</p>
+  <table id="t">
+    <caption>Fruit</caption>
+    <thead><tr><th>Name</th><th>Colour</th></tr></thead>
+    <tbody>
+      <tr><td>Apple</td><td>Red</td></tr>
+      <tr><td>Banana</td><td>Yellow</td></tr>
+    </tbody>
+  </table>
+  <form id="f" onsubmit="event.preventDefault(); document.getElementById('out').textContent = 'submitted:' + this.q.value + ':' + this.c.value + ':' + (this.k.checked ? 'on' : 'off');">
+    <input id="q" name="q" placeholder="query">
+    <select id="c" name="c"><option value="r">Red</option><option value="g">Green</option></select>
+    <input id="k" name="k" type="checkbox">
+    <input id="file" name="file" type="file">
+    <button type="submit">Go</button>
+  </form>
+  <p id="out">not submitted</p>
+  <div class="menu"><span id="menu-label">Menu</span><div class="menu-items" id="menu-items">Hidden item</div></div>
+  <button id="ask" onclick="document.getElementById('out').textContent = 'confirm:' + confirm('Proceed?')">Confirm</button>
+  <div id="late">Late content</div>
+  <div id="spacer"></div>
+  <p id="bottom">Bottom of the page</p>
+</main>
+<script>
+  setTimeout(function () { document.getElementById('late').style.display = 'block'; }, 1500);
+  document.getElementById('file').addEventListener('change', function () {
+    document.getElementById('out').textContent = 'files:' + this.files.length;
+  });
+</script>
+</body>
+</html>
