@@ -146,6 +146,10 @@ def _tab(args):
     return int(raw) if raw not in (None, "") else None
 
 
+def _int(value, default):
+    return int(value) if value not in (None, "") else default
+
+
 def _truthy(value, default=True):
     if value is None:
         return default
@@ -217,7 +221,9 @@ OPS = [
     Op("wait-for", "/wait/for", "POST", "Block until a condition holds on the "
        "page: an element is visible (or, with gone, absent), the page text "
        "matches a regex, or the URL matches a regex. Use after a click that "
-       "triggers a slow update. Fails with a timeout error if nothing matches.",
+       "triggers a slow update. With idle, also wait until the network has been "
+       "quiet for quiet_ms; idle alone waits for a single-page app to settle. "
+       "Fails with a timeout error if nothing matches.",
        params=[Param("selector", help="CSS selector or @ref that must be visible.",
                      cli="opt"),
                Param("text", help="Regex the page text must match.", cli="opt"),
@@ -225,11 +231,18 @@ OPS = [
                Param("gone", "boolean", "Wait for the selector to disappear instead.",
                      cli="opt", default=False),
                Param("timeout", "integer", "Seconds to wait (default 20, max 120).",
-                     cli="opt")],
+                     cli="opt"),
+               Param("idle", "boolean", "Require the tab to be loaded and no "
+                     "request to have started or finished for quiet_ms.",
+                     cli="opt", default=False),
+               Param("quiet_ms", "integer", "Quiet period for idle, in ms "
+                     "(default 500).", cli="opt", default=500)],
        call=lambda c, a: ("api_wait_for", (_tab(a), a.get("selector") or None,
                                            a.get("text") or None, a.get("url") or None,
                                            _truthy(a.get("gone"), False),
-                                           a.get("timeout"))),
+                                           a.get("timeout"),
+                                           _truthy(a.get("idle"), False),
+                                           _int(a.get("quiet_ms"), 500))),
        timeout=130),
 
     Op("close", "/close", "POST", "Close a tab.",
@@ -418,6 +431,18 @@ OPS = [
        params=[Param("pattern", help="Regex filter over message text.", cli="opt")],
        call=lambda c, a: ("api_console", (_tab(a), a.get("pattern")))),
 
+    Op("network", "/network", "GET", "List the requests the page has made since "
+       "it last navigated: URL, status, MIME type, bytes, duration, error. Use it "
+       "to find the API call behind what a page shows, or why a page is broken.",
+       params=[Param("pattern", help="Regex filter over the URL.", cli="opt"),
+               Param("limit", "integer", "Newest entries to return (default 100).",
+                     cli="opt"),
+               Param("clear", "boolean", "Empty the log after reading it.",
+                     cli="opt", default=False)],
+       call=lambda c, a: ("api_network", (_tab(a), a.get("pattern") or None,
+                                          _int(a.get("limit"), None),
+                                          _truthy(a.get("clear"), False)))),
+
     Op("blocked", "/blocked", "GET", "Check whether the page is showing a "
        "CAPTCHA or anti-bot challenge instead of its real content. Call this "
        "when a click or fill had no visible effect. This never attempts to "
@@ -451,11 +476,22 @@ OPS = [
        tab=False),
 
     Op("screenshot", "/screenshot", "GET", "Save a PNG of the visible viewport to a "
-       "path on disk.",
+       "path on disk; with full, the whole page; with selector, just that element.",
        params=[Param("path", help="Write here; omit to stream the PNG to stdout.",
-                     cli="optarg")],
-       call=lambda c, a: ("api_screenshot", (_tab(a), a.get("path"))),
+                     cli="optarg"),
+               Param("full", "boolean", "Capture the whole document, not the viewport.",
+                     cli="opt", default=False),
+               Param("selector", help="Capture only this element: CSS selector or @ref.",
+                     cli="opt")],
+       call=lambda c, a: ("api_screenshot", (_tab(a), a.get("path"),
+                                             _truthy(a.get("full"), False),
+                                             a.get("selector") or None)),
        timeout=60),
+
+    Op("pdf", "/pdf", "POST", "Print the page to a PDF file at an absolute path.",
+       params=[Param("path", required=True, help="Absolute path ending in .pdf.")],
+       call=lambda c, a: ("api_pdf", (_tab(a), a["path"])),
+       timeout=90),
 
     # Playbooks: a saved, ordered list of the operations above. Nothing new is
     # described here -- a playbook's steps are entries from this same table,

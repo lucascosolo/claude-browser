@@ -597,6 +597,17 @@ def wait_predicate(selector=None, text=None, url=None, gone=False) -> str:
     return "(function(){" + "".join(parts) + "})()"
 
 
+def rect(selector: str) -> str:
+    """The match's box in document coordinates, for cropping a full-document
+    snapshot: the viewport rect shifted by the scroll offsets."""
+    return ("(function(){var e=%s;"
+            "if(!e)return JSON.stringify({ok:false,error:'no match'});"
+            "var r=e.getBoundingClientRect();"
+            "return JSON.stringify({ok:true,x:Math.round(r.left+window.scrollX),"
+            "y:Math.round(r.top+window.scrollY),w:Math.round(r.width),"
+            "h:Math.round(r.height)});})()" % _resolve_target(selector))
+
+
 def scroll_js(to=None, by=None) -> str:
     """Scroll the window to "top", "bottom", or an element (CSS or "@ref"), or
     by a signed pixel count. Answers {ok, x, y, height, viewport, at_bottom}.

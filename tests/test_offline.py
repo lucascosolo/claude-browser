@@ -443,6 +443,7 @@ class TestApiRegistry(unittest.TestCase):
             "/hover": {"selector": "a"}, "/submit": {},
             "/dialogs": {}, "/upload": {"selector": "input", "path": "/x"},
             "/download": {"url": "https://x", "path": "/x"},
+            "/network": {}, "/pdf": {"path": "/x.pdf"},
         }
         # /health is served without touching the browser, so it has no builder.
         callable_routes = {op.route for op in self.api.OPS if op.call}
@@ -499,6 +500,48 @@ class TestApiRegistry(unittest.TestCase):
             return {p.name for p in by[name].params if p.required}
         self.assertTrue({"selector", "path"} <= required("upload"))
         self.assertTrue({"url", "path"} <= required("download"))
+
+    def test_chunk4_ops_dispatch(self):
+        d = self.dispatch
+        self.assertEqual(d("/network", {}), ("api_network", (None, None, None, False)))
+        self.assertEqual(
+            d("/network", {"pattern": "x", "limit": "5", "clear": "1", "tab": "2"}),
+            ("api_network", (2, "x", 5, True)))
+        self.assertEqual(d("/pdf", {"path": "/x.pdf"}), ("api_pdf", (None, "/x.pdf")))
+        self.assertEqual(d("/wait/for", {"selector": "a"}),
+                         ("api_wait_for", (None, "a", None, None, False, None, False, 500)))
+        self.assertEqual(d("/wait/for", {"idle": "1"}),
+                         ("api_wait_for", (None, None, None, None, False, None, True, 500)))
+        self.assertEqual(d("/wait/for", {"idle": "true", "quiet_ms": "800"})[1][-2:],
+                         (True, 800))
+        self.assertEqual(d("/screenshot", {}),
+                         ("api_screenshot", (None, None, False, None)))
+        self.assertEqual(
+            d("/screenshot", {"path": "/x.png", "full": "1", "selector": "#a"}),
+            ("api_screenshot", (None, "/x.png", True, "#a")))
+
+    def test_chunk4_op_shape(self):
+        by = self.api.BY_NAME
+
+        def params(name):
+            return {p.name: p for p in by[name].params}
+        net = by["network"]
+        self.assertEqual(net.method, "GET")
+        self.assertTrue(net.mcp)
+        self.assertTrue({"pattern", "limit", "clear"} <= set(params("network")))
+        self.assertEqual(params("network")["limit"].kind, "integer")
+        self.assertEqual(params("network")["clear"].kind, "boolean")
+        pdf = by["pdf"]
+        self.assertEqual((pdf.method, pdf.route, pdf.timeout), ("POST", "/pdf", 90))
+        self.assertTrue(pdf.mcp)
+        self.assertTrue(params("pdf")["path"].required)
+        self.assertEqual(params("wait-for")["idle"].kind, "boolean")
+        self.assertEqual(params("wait-for")["quiet_ms"].kind, "integer")
+        self.assertEqual(params("screenshot")["full"].kind, "boolean")
+        self.assertIn("selector", params("screenshot"))
+        tools = {t["name"] for t in self.api.mcp_tools()}
+        self.assertIn("browser_network", tools)
+        self.assertIn("browser_pdf", tools)
 
     def test_chunk2_ops_dispatch(self):
         for route, args, needle in [

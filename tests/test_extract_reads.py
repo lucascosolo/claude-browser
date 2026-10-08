@@ -149,5 +149,25 @@ class TestTables(_Compiles):
             extract.tables(limit="1); alert(1")
 
 
+class TestRect(_Compiles):
+    def test_is_one_expression(self):
+        self.assert_expression(extract.rect("#a"))
+        self.assert_expression(extract.rect("@e3"))
+
+    def test_reports_document_coordinates(self):
+        js = extract.rect("#a")
+        for needle in ("getBoundingClientRect", "scrollX", "scrollY", "no match"):
+            self.assertIn(needle, js)
+        self.assertIn(extract._js_str("#a"), js)
+
+    def test_ref_uses_the_resolver(self):
+        self.assertIn("__cbResolve", extract.rect("@e3"))
+
+    def test_selector_escaped(self):
+        js = extract.rect(NASTY)
+        assert_escaped(self, js)
+        self.assertIn(extract._js_str(NASTY), js)
+
+
 if __name__ == "__main__":
     unittest.main()

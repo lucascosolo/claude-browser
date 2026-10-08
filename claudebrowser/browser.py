@@ -24,7 +24,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (update,  # noqa: E402
                agent, ai, auth, dialogs, envfile, extract, fills, findbar,  # noqa: E402
-               pages, uploads,
+               netlog, pages, uploads,
                pagetext, panel_html, passwords, perf, personas, playbooks,
                profile, progress, reader, resources, scrub, search, settings,
                siterules, storage, store, style, tabnames, urls, vpn,
@@ -38,6 +38,8 @@ PRIVATE_DOWNLOAD_ERROR = ("this tab is private; downloads from it are off "
                           "(CB_PRIVATE_DOWNLOADS)")
 # `upload` re-reads the input this often, this many times, for the files.
 UPLOAD_CHECK_MS = 150
+# `pdf` answers a timeout after this long; the op's own timeout is 90 s.
+PDF_TIMEOUT_S = 60
 UPLOAD_CHECKS = 10
 # Where a private tab starts, and not CB_HOME: the default start page is a
 # dashboard of history and bookmarks, which is the one thing a private
@@ -272,6 +274,22 @@ def needs_tab(method):
 
 
 
+def _crop(surface, box):
+    """The element's box cut out of a full-document snapshot, clamped to it."""
+    import cairo
+    x = max(0, int(box["x"]))
+    y = max(0, int(box["y"]))
+    w = min(int(box["w"]), surface.get_width() - x)
+    h = min(int(box["h"]), surface.get_height() - y)
+    if w < 1 or h < 1:
+        raise ValueError("element is outside the page")
+    out = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    ctx = cairo.Context(out)
+    ctx.set_source_surface(surface, -x, -y)
+    ctx.paint()
+    return out
+
+
 def _playing_audio(view):
     """Is this view making a sound right now?
 
@@ -319,6 +337,11 @@ class Tab:
         Tab._next_id += 1
         self.private = private
         self.dialogs = dialogs.Log()
+        self.netlog = netlog.Log()
+        # id() -> WebResource. Holding the wrapper keeps id() unique for the
+        # resource's life; once it is collected, the next one can reuse the id.
+        self.resources = {}
+        self.main_entry = None
         # A private view gets its own ephemeral WebsiteDataManager: separate
         # cookie jar, no disk cache, nothing written when it closes. It cannot
         # also be a *related* view -- related views inherit their relative's
@@ -2121,6 +2144,7 @@ class Browser(Gtk.Window):
         view.connect("create", self._on_popup)
         view.connect("script-dialog", self._on_script_dialog, tab)
         view.connect("run-file-chooser", self._on_file_chooser, tab)
+        view.connect("resource-load-started", self._on_resource, tab)
 
         label = self._tab_label(tab)
         view.show()
@@ -2245,6 +2269,10 @@ class Browser(Gtk.Window):
             # be in place before the page paints, or the clutter appears and
             # then visibly vanishes, which is worse than leaving it there.
             self._apply_siterules(tab)
+            # The main document's resource-load-started fired before this, so
+            # its entry is carried across the reset rather than lost to it.
+            tab.netlog.reset_for_navigation(keep=tab.main_entry)
+            tab.main_entry = None
         elif event == WebKit2.LoadEvent.FINISHED:
             tab.loading = False
             tab.bar.finish()   # the only path to a full bar; see progress.py
@@ -2259,6 +2287,33 @@ class Browser(Gtk.Window):
             self._settle(tab, {"ok": tab.failed is None, **tab.info(),
                                **({"error": tab.failed} if tab.failed else {})})
         self._refresh(tab)
+
+    def _on_resource(self, view, resource, request, tab):
+        key = id(resource)
+        log = tab.netlog
+        entry = log.start(key, request.get_uri(),
+                          main=resource is view.get_main_resource())
+        if entry["main"]:
+            tab.main_entry = entry
+        tab.resources[key] = resource
+
+        def on_response(r, _pspec):
+            response = r.get_response()
+            if response is not None:
+                log.response(key, response.get_status_code(),
+                             response.get_mime_type())
+
+        def on_end(_r, error=None):
+            if error is None:
+                log.finish(key)
+            else:
+                log.fail(key, error.message)
+            tab.resources.pop(key, None)
+
+        resource.connect("notify::response", on_response)
+        resource.connect("received-data", lambda _r, n: log.data(key, n))
+        resource.connect("finished", on_end)
+        resource.connect("failed", on_end)
 
     def _apply_siterules(self, tab):
         """Install the declutter sheet for whatever site this tab is on.
@@ -3651,6 +3706,16 @@ class Browser(Gtk.Window):
             answer({"ok": False, "error": str(e)})
 
     @needs_tab
+    def api_network(self, tab, pattern, limit, clear, done):
+        try:
+            entries = tab.netlog.entries(pattern, limit)
+        except ValueError as e:
+            return done({"ok": False, "error": str(e)})
+        if clear:
+            tab.netlog.clear()
+        done({"ok": True, "count": len(entries), "entries": entries})
+
+    @needs_tab
     def api_dialogs(self, tab, clear, done):
         entries = tab.dialogs.entries()
         if clear:
@@ -4261,22 +4326,31 @@ class Browser(Gtk.Window):
         self._await_load(tab, True, done)
 
     @needs_tab
-    def api_wait_for(self, tab, selector, text, url, gone, timeout, done):
+    def api_wait_for(self, tab, selector, text, url, gone, timeout, idle,
+                     quiet_ms, done):
         """Poll one JS predicate every 250 ms until a condition holds.
 
         Goes through api_eval, so a discarded tab is restored first. An eval
         error -- the page is mid-navigation and has no context to answer in --
         is "not yet", not failure: waiting through a load is the point.
+        `idle` is checked here in Python against the tab's network log, and
+        is ANDed with the JS conditions; alone it needs no eval at all.
         """
         try:
-            js = extract.wait_predicate(selector, text, url, bool(gone))
+            js = (extract.wait_predicate(selector, text, url, bool(gone))
+                  if (selector or text or url or not idle) else None)
             seconds = max(1, min(120, int(timeout if timeout not in (None, "") else 20)))
+            quiet_ms = max(0, int(quiet_ms if quiet_ms not in (None, "") else 500))
         except (ValueError, TypeError) as e:
             return done({"ok": False, "error": str(e)})
         what = ", ".join(
             [("selector %s to disappear" if gone else "selector %s") % selector]
             * bool(selector)
-            + ["text %s" % text] * bool(text) + ["url %s" % url] * bool(url))
+            + ["text %s" % text] * bool(text) + ["url %s" % url] * bool(url)
+            + ["the network to be idle for %d ms" % quiet_ms] * bool(idle))
+
+        def is_idle():
+            return not tab.loading and tab.netlog.quiet_for(quiet_ms)
         start = time.monotonic()
         state = {"finished": False}
 
@@ -4296,16 +4370,26 @@ class Browser(Gtk.Window):
                 return finish(payload)
             result = payload.get("result") if payload.get("ok") else None
             matched = result.get("matched") if isinstance(result, dict) else None
-            if matched:
+            if matched and (not idle or is_idle()):
                 return finish({"ok": True, "matched": matched,
-                               "elapsed_ms": elapsed_ms()})
+                               "elapsed_ms": elapsed_ms(),
+                               **({"idle": True} if idle else {})})
             if time.monotonic() - start >= seconds:
                 return timed_out()
             GLib.timeout_add(250, poll)
 
         def poll():
-            if not state["finished"]:
+            if state["finished"]:
+                return GLib.SOURCE_REMOVE
+            if js is not None:
                 self.api_eval(tab.id, js, on_result)
+            elif is_idle():
+                finish({"ok": True, "matched": "idle", "idle": True,
+                        "elapsed_ms": elapsed_ms()})
+            elif time.monotonic() - start >= seconds:
+                timed_out()
+            else:
+                GLib.timeout_add(250, poll)
             return GLib.SOURCE_REMOVE
 
         def timed_out():
@@ -4530,7 +4614,7 @@ class Browser(Gtk.Window):
         self.api_reader(None, None, None, announce)
 
     @needs_tab
-    def api_screenshot(self, tab, path, done):
+    def api_screenshot(self, tab, path, full, selector, done):
         # A path is a file that outlives the tab, which is the one thing a
         # private session promises not to leave behind -- and the path itself
         # was landing in the playbook alongside it. Streaming the PNG back to
@@ -4542,11 +4626,19 @@ class Browser(Gtk.Window):
                          "written to disk. Omit the path to receive the PNG "
                          "instead."})
 
-        def on_snapshot(view, result, _data=None):
+        def on_snapshot(view, result, box=None):
             try:
                 surface = view.get_snapshot_finish(result)
             except GLib.Error as e:
                 return done({"ok": False, "error": e.message})
+            if box:
+                try:
+                    surface = _crop(surface, box)
+                except ValueError as e:
+                    return done({"ok": False, "error": str(e)})
+                except ImportError:
+                    return done({"ok": False, "error": "cropping needs pycairo "
+                                 "-- install python3-gi-cairo"})
             try:
                 if path:
                     surface.write_to_png(path)
@@ -4561,10 +4653,71 @@ class Browser(Gtk.Window):
                 return done({"ok": False, "error": "cannot encode PNG (%r) -- "
                                                    "install python3-gi-cairo" % (e,)})
 
-        tab.view.get_snapshot(
-            WebKit2.SnapshotRegion.VISIBLE, WebKit2.SnapshotOptions.NONE,
-            None, on_snapshot, None,
-        )
+        def snap(box=None):
+            region = (WebKit2.SnapshotRegion.FULL_DOCUMENT if full or box
+                      else WebKit2.SnapshotRegion.VISIBLE)
+            tab.view.get_snapshot(region, WebKit2.SnapshotOptions.NONE,
+                                  None, on_snapshot, box)
+
+        if not selector:
+            return snap()
+
+        def on_rect(payload):
+            box = payload.get("result") if payload.get("ok") else None
+            if not isinstance(box, dict) or not box.get("ok"):
+                return done(box if isinstance(box, dict) else payload)
+            if box["w"] < 1 or box["h"] < 1:
+                return done({"ok": False, "error": "element has no size"})
+            snap(box)
+
+        self.api_eval(tab.id, extract.rect(selector), on_rect)
+
+    @needs_tab
+    def api_pdf(self, tab, path, done):
+        """Print the page to a PDF through WebKit's own print path, which
+        lays the document out for paper rather than grabbing pixels."""
+        if tab.private:
+            return done({"ok": False, "error":
+                         "this tab is private, so it is not printed to a file "
+                         "on disk. Use screenshot without a path instead."})
+        path = path or ""
+        if not os.path.isabs(path):
+            return done({"ok": False, "error": "path must be absolute"})
+        if not path.lower().endswith(".pdf"):
+            return done({"ok": False, "error": "path must end in .pdf"})
+        if not os.path.isdir(os.path.dirname(path)):
+            return done({"ok": False, "error": "no such directory: %s"
+                         % os.path.dirname(path)})
+        state = {"answered": False}
+
+        def answer(payload):
+            if not state["answered"]:
+                state["answered"] = True
+                done(payload)
+            return GLib.SOURCE_REMOVE
+
+        def on_finished(_op):
+            try:
+                size = os.path.getsize(path)
+            except OSError as e:
+                return answer({"ok": False, "error": "print finished but no "
+                               "file was written (%s)" % e.strerror})
+            answer({"ok": True, "path": path, "bytes": size})
+
+        op = WebKit2.PrintOperation.new(tab.view)
+        settings = Gtk.PrintSettings()
+        # GTK's file backend; named so print_() cannot fall through to a real
+        # default printer. The name is GTK's untranslated one on this machine.
+        settings.set_printer("Print to File")
+        settings.set(Gtk.PRINT_SETTINGS_OUTPUT_FILE_FORMAT, "pdf")
+        settings.set(Gtk.PRINT_SETTINGS_OUTPUT_URI, GLib.filename_to_uri(path))
+        op.set_print_settings(settings)
+        op.connect("finished", on_finished)
+        op.connect("failed", lambda _op, e: answer({"ok": False, "error": e.message}))
+        # The operation must outlive this call; the timer's closure holds it.
+        GLib.timeout_add_seconds(PDF_TIMEOUT_S, lambda: (
+            op, answer({"ok": False, "error": "pdf timed out"}))[1])
+        op.print_()
 
     # -- machine and storage ------------------------------------------------
 
