@@ -4115,6 +4115,31 @@ class Browser(Gtk.Window):
             return done({"ok": False, "error": "give exactly one of to, by"})
         self.api_eval(tab.id, extract.scroll_js(to or None, by), done)
 
+    @needs_tab
+    def api_submit(self, tab, selector, done):
+        """Submit a form and, if that starts a navigation within a second,
+        wait for it -- so the caller reads the page the form led to, not the
+        one it left. A submit that stays on the page answers at once."""
+        def after_eval(r):
+            inner = r.get("result")
+            if not r.get("ok") or (isinstance(inner, dict) and not inner.get("ok")):
+                return done(inner if isinstance(inner, dict) else r)
+            deadline = time.monotonic() + 1.0
+
+            def poll():
+                if tab.loading:
+                    return self._await_load(
+                        tab, True, lambda p: done(
+                            {"ok": bool(p.get("ok")), "navigated": True, **tab.info()}))
+                if time.monotonic() >= deadline:
+                    return done({"ok": True, "navigated": False, **inner})
+                GLib.timeout_add(50, lambda: poll() and False)
+                return None
+
+            poll()
+
+        self.api_eval(tab.id, extract.submit(selector), after_eval)
+
     def api_present(self, done):
         """Raise the window. Used by a second launch after it hands over its
         URLs -- opening a link that lands in a window behind three others has

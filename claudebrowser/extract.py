@@ -656,6 +656,210 @@ def tables(selector=None, limit=200) -> str:
     )
 
 
+_MODIFIERS = {"ctrl": "ctrl", "control": "ctrl", "shift": "shift", "alt": "alt",
+              "option": "alt", "meta": "meta", "cmd": "meta", "command": "meta",
+              "super": "meta"}
+_NAMED_KEYS = {n.lower(): n for n in (
+    "Enter", "Escape", "Tab", "Backspace", "Delete", "Home", "End", "PageUp",
+    "PageDown", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Insert")}
+_NAMED_KEYS.update({"esc": "Escape", "return": "Enter", "del": "Delete"})
+
+
+def parse_key(combo: str) -> dict:
+    """A key combo ("Enter", "Shift+Tab", "Ctrl+K", "a") as the fields of a
+    KeyboardEvent: {key, code, ctrl, shift, alt, meta}. The modifier flags are
+    real booleans. Raises ValueError for anything that is not one key plus
+    optional modifiers -- a typo must not become a keystroke nobody meant."""
+    if combo == " " or combo.lower() == "space":
+        return {"key": " ", "code": "Space",
+                "ctrl": False, "shift": False, "alt": False, "meta": False}
+    parts = ["+"] if combo == "+" else combo.split("+")
+    if not combo or any(p == "" for p in parts):
+        raise ValueError("empty key in %r" % combo)
+    flags = {"ctrl": False, "shift": False, "alt": False, "meta": False}
+    for mod in parts[:-1]:
+        name = _MODIFIERS.get(mod.lower())
+        if name is None:
+            raise ValueError("unknown modifier %r in %r" % (mod, combo))
+        flags[name] = True
+    last = parts[-1]
+    low = last.lower()
+    if low == "space":
+        key, code = " ", "Space"
+    elif low in _NAMED_KEYS:
+        key = code = _NAMED_KEYS[low]
+    elif len(low) > 1 and low[0] == "f" and low[1:].isdigit() and 1 <= int(low[1:]) <= 12:
+        key = code = "F" + low[1:]
+    elif len(last) == 1 and last.isascii() and last.isprintable():
+        key = last.lower()
+        code = ("Key" + last.upper() if last.isalpha()
+                else "Digit" + last if last.isdigit() else "")
+    else:
+        raise ValueError("unknown key %r in %r" % (last, combo))
+    return {"key": key, "code": code, **flags}
+
+
+def _driven(selector, body: str) -> str:
+    """Wrap `body` as one expression: halo, the target in `e` (the selector's
+    match, else the focused element), and the delta baseline. `body` must
+    return a JSON string. A single expression, like scroll_js, so it can sit
+    anywhere an eval result is expected."""
+    target = (_resolve_target(selector) if selector
+              else "(document.activeElement||document.body)")
+    return (
+        "(" + HALO.strip().rstrip(";") + ",(function(){"
+        "var __cbUrlBefore=location.href;var e=" + target + ";"
+        "if(!e)return JSON.stringify({ok:false,error:'no match'});"
+        + ("e.scrollIntoView({block:'center'});" if selector else "")
+        + "window.__cbHaloAt(e);" + body + "})())"
+    )
+
+
+_PRESS_JS = r"""
+var K=%(key)s,C=%(code)s,PR=%(printable)s,SH=%(shift)s;
+function mk(t){return new KeyboardEvent(t,{key:K,code:C,ctrlKey:%(ctrl)s,shiftKey:SH,
+altKey:%(alt)s,metaKey:%(meta)s,bubbles:true,cancelable:true});}
+function shown(x){return !!(x.offsetWidth||x.offsetHeight||x.getClientRects().length);}
+if(%(sel)s&&e.focus)e.focus();
+window.__cbCursorAt(e,true);
+var defaulted=null,go=e.dispatchEvent(mk('keydown'));
+if(go&&PR)go=e.dispatchEvent(mk('keypress'));
+if(go){
+  var t=e.tagName,f=e.form||(e.closest&&e.closest('form'));
+  if(K==='Enter'&&(t==='BUTTON'||(t==='A'&&e.hasAttribute('href'))||
+      (t==='INPUT'&&/^(submit|button|reset|checkbox|radio)$/.test(e.type)))){
+    e.click();defaulted='click';
+  }else if(K==='Enter'&&f&&(t==='INPUT'||(t==='TEXTAREA'&&(%(ctrl)s||%(meta)s)))){
+    if(f.requestSubmit)f.requestSubmit();else f.submit();defaulted='submit';
+  }else if(K==='Tab'){
+    var all=Array.prototype.filter.call(document.querySelectorAll(
+      'a[href],button,input,select,textarea,[tabindex]:not([tabindex="-1"])'),
+      function(x){return !x.disabled&&x.tabIndex>=0&&shown(x)&&x.type!=='hidden';});
+    var i=all.indexOf(e),n=all.length,nx=null;
+    if(n)nx=all[i<0?(SH?n-1:0):(i+(SH?-1:1)+n)%%n];
+    if(nx){nx.focus();window.__cbCursorAt(nx,false);defaulted=SH?'focus-previous':'focus-next';}
+  }else if(K==='Escape'&&e.blur){
+    e.blur();defaulted='blur';
+  }
+}
+e.dispatchEvent(mk('keyup'));
+return JSON.stringify(Object.assign({ok:true,key:K,defaulted:defaulted},{%(delta)s}));
+"""
+
+
+def press(key: str, selector=None) -> str:
+    """Press a key combo on the selector's match, else the focused element:
+    keydown, keypress (printable keys only), keyup, then -- unless a handler
+    called preventDefault() on the keydown -- the default action a browser
+    would have taken. Synthetic events are untrusted, so the browser takes no
+    default action of its own; the handful that matter are applied here."""
+    k = parse_key(key)
+    flag = lambda v: "true" if v else "false"  # noqa: E731
+    body = _PRESS_JS % {
+        "key": _js_str(k["key"]), "code": _js_str(k["code"]),
+        "printable": flag(len(k["key"]) == 1 and not k["ctrl"] and not k["meta"]),
+        "shift": flag(k["shift"]), "ctrl": flag(k["ctrl"]), "alt": flag(k["alt"]),
+        "meta": flag(k["meta"]), "sel": flag(bool(selector)), "delta": delta(),
+    }
+    return _driven(selector, body)
+
+
+def type_text(text: str, selector=None) -> str:
+    """Insert text into the selector's match, else the focused element.
+    `insertText` fires the real beforeinput/input events frameworks listen to
+    and works in contenteditable as well as inputs. Per-character key events
+    are deliberately not simulated: that is one round trip of events per
+    character for no listener `insertText` does not already reach."""
+    body = (
+        "var T=%s;e.focus&&e.focus();window.__cbCursorAt(e,true);"
+        "var done=false;"
+        "try{if(document.queryCommandSupported&&document.queryCommandSupported('insertText'))"
+        "done=document.execCommand('insertText',false,T);}catch(x){}"
+        "if(!done){if(!('value' in e))return JSON.stringify({ok:false,error:'not editable'});"
+        "e.value=e.value+T;"
+        "e.dispatchEvent(new Event('input',{bubbles:true}));"
+        "e.dispatchEvent(new Event('change',{bubbles:true}));}"
+        "return JSON.stringify(Object.assign({ok:true,length:T.length},{%s}));"
+        % (_js_str(text), delta())
+    )
+    return _driven(selector, body)
+
+
+def select(selector: str, value=None, checked=None) -> str:
+    """Choose an option of a <select> (by value, else by visible label,
+    case-insensitively; a JSON array string for a <select multiple>) or set a
+    checkbox/radio. Fires input and change. A <select> with no match answers
+    the labels it does have (capped at 50) so the next call can succeed."""
+    if value is None and checked is None:
+        raise ValueError("select needs value or checked")
+    body = (
+        "var V=%s,CH=%s;window.__cbCursorAt(e,true);"
+        "function fire(){e.dispatchEvent(new Event('input',{bubbles:true}));"
+        "e.dispatchEvent(new Event('change',{bubbles:true}));}"
+        "if(e.tagName==='SELECT'){"
+        "if(V===null)return JSON.stringify({ok:false,error:'a select needs a value'});"
+        "var options=Array.prototype.slice.call(e.options);"
+        "function lbl(o){return (o.text||'').trim();}"
+        "function find(v){var s=String(v).trim().toLowerCase();"
+        "return options.filter(function(o){return o.value===String(v);})[0]||"
+        "options.filter(function(o){return lbl(o).toLowerCase()===s;})[0];}"
+        "var want=[V];"
+        "if(e.multiple){try{var p=JSON.parse(V);if(Array.isArray(p))want=p;}catch(x){}}"
+        "var hit=want.map(find);"
+        "if(hit.some(function(o){return !o;}))return JSON.stringify({ok:false,"
+        "error:'no such option',options:options.slice(0,50).map(lbl)});"
+        "if(e.multiple)options.forEach(function(o){o.selected=hit.indexOf(o)>=0;});"
+        "else hit[0].selected=true;"
+        "fire();"
+        "var now=options.filter(function(o){return o.selected;}).map(function(o){return o.value;});"
+        "return JSON.stringify(Object.assign({ok:true,value:e.multiple?now:e.value},{%s}));}"
+        "if(e.type==='checkbox'||e.type==='radio'){"
+        "if(CH===null)return JSON.stringify({ok:false,error:'a checkbox needs checked'});"
+        "e.checked=CH;fire();"
+        "return JSON.stringify(Object.assign({ok:true,checked:e.checked},{%s}));}"
+        "return JSON.stringify({ok:false,error:'not a select, checkbox or radio'});"
+        % ("null" if value is None else _js_str(value),
+           "null" if checked is None else ("true" if checked else "false"),
+           delta(), delta())
+    )
+    return _driven(selector, body)
+
+
+def hover(selector: str) -> str:
+    """Move the pointer onto the match without pressing: pointerover,
+    pointerenter, mouseover, mouseenter, mousemove at the element's centre.
+    The enter events do not bubble, so they are dispatched at the element
+    itself; that is also what a real pointer move does."""
+    body = (
+        "e.scrollIntoView({block:'center'});"
+        "var r=e.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;"
+        "window.__cbCursorAt(e,false);"
+        "var P=window.PointerEvent||MouseEvent;"
+        "[['pointerover',P,true],['pointerenter',P,false],['mouseover',MouseEvent,true],"
+        "['mouseenter',MouseEvent,false],['mousemove',MouseEvent,true]].forEach(function(a){"
+        "e.dispatchEvent(new a[1](a[0],{bubbles:a[2],cancelable:true,clientX:x,clientY:y,view:window}));});"
+        "return JSON.stringify(Object.assign({ok:true,tag:e.tagName.toLowerCase(),"
+        "x:Math.round(x),y:Math.round(y)},{%s}));" % delta()
+    )
+    return _driven(selector, body)
+
+
+def submit(selector=None) -> str:
+    """Submit a form via requestSubmit(), so validation and submit handlers
+    run as they would for a user. `selector` may be the form or a field in it;
+    default the first form on the page."""
+    if selector:
+        find = ("var f=e.tagName==='FORM'?e:(e.form||(e.closest&&e.closest('form')));")
+    else:
+        find = "var f=document.forms[0];"
+    body = (
+        find + "if(!f)return JSON.stringify({ok:false,error:'no form'});"
+        "if(f.requestSubmit)f.requestSubmit();else f.submit();"
+        "return JSON.stringify(Object.assign({ok:true},{%s}));" % delta()
+    )
+    return _driven(selector, body)
+
+
 def _js_str(s: str) -> str:
     """Render `s` as a JS string literal that is safe in any injection context.
 

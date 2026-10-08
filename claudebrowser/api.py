@@ -97,6 +97,12 @@ class Op:
                 "inputSchema": self.schema()}
 
 
+def _extract():
+    from . import extract
+
+    return extract
+
+
 def _js(name):
     """An op whose whole implementation is a snippet from extract.py."""
     def build(_control, args):
@@ -329,6 +335,49 @@ OPS = [
        params=[Param("fields", required=True,
                      help="JSON object: {selector_or_ref: value}.")],
        call=lambda c, a: ("api_fill_many", (_tab(a), a["fields"]))),
+
+    Op("press", "/press", "POST", "Press a key or combo (Enter, Escape, Tab, "
+       "Shift+Tab, Ctrl+K, ArrowDown, a) on `selector`, else the focused element. "
+       "Also applies the key's default action: Enter submits the form or "
+       "activates a button/link, Tab moves focus, Escape blurs.",
+       params=[Param("key", required=True, help="Key combo, e.g. Enter or Ctrl+K."),
+               Param("selector", help="CSS selector or @ref to focus first.",
+                     cli="opt")],
+       call=lambda c, a: ("api_eval", (_tab(a), _extract().press(
+           a["key"], a.get("selector") or None)))),
+
+    Op("type", "/type", "POST", "Type text into `selector`, else the focused "
+       "element, as real input (works in contenteditable too). Appends at the "
+       "caret; use `fill` to replace a field's value.",
+       params=[Param("text", required=True),
+               Param("selector", help="CSS selector or @ref to focus first.",
+                     cli="opt")],
+       call=lambda c, a: ("api_eval", (_tab(a), _extract().type_text(
+           a["text"], a.get("selector") or None)))),
+
+    Op("select", "/select", "POST", "Choose an option in a <select> by value or "
+       "visible label (a JSON array for <select multiple>), or tick/untick a "
+       "checkbox or radio with `checked`. Fires input and change.",
+       params=[Param("selector", required=True),
+               Param("value", help="Option value or label.", cli="optarg"),
+               Param("checked", "boolean", "Checkbox/radio state to set.",
+                     cli="opt")],
+       call=lambda c, a: ("api_eval", (_tab(a), _extract().select(
+           a["selector"], a.get("value"),
+           None if a.get("checked") in (None, "") else _truthy(a["checked"]))))),
+
+    Op("hover", "/hover", "POST", "Move the pointer onto an element without "
+       "clicking, to open hover menus and tooltips.",
+       params=[Param("selector", required=True)],
+       call=_js_call("hover", "selector")),
+
+    Op("submit", "/submit", "POST", "Submit a form the way a user would "
+       "(validation and submit handlers run). `selector` is the form or a field "
+       "in it; default the first form. Waits for the page load it starts.",
+       params=[Param("selector", cli="optarg",
+                     help="Form or field inside one; default the first form.")],
+       call=lambda c, a: ("api_submit", (_tab(a), a.get("selector") or None)),
+       timeout=LOAD_TIMEOUT),
 
     Op("eval", "/eval", "POST", "Evaluate JavaScript in the page and return its value.",
        params=[Param("js", required=True, help="JavaScript to evaluate.")],
