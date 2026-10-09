@@ -282,6 +282,41 @@ SNAPSHOT_SHIM = r"""
 """
 
 
+# Installed at document start beside SNAPSHOT_SHIM. Counts the page's own
+# changes so an agent can know, without a screenshot, whether the page it
+# read is the page it is about to act on: freshness.py turns the epoch and
+# this counter into a state token, and control._handle refuses an acting op
+# whose caller has not looked since the token moved. childList and
+# characterData only -- attribute churn (class toggles on hover, aria-*
+# updates) is constant on a live page and changes nothing the agent read.
+# The browser's own cursor halo is excluded by id, since every act paints it.
+STATE_SHIM = r"""
+(function () {
+  window.__cbMut = 0;
+  window.__cbMutAt = 0;
+  var own = /^__cb/;
+  function ours(n) {
+    while (n) { if (n.id && own.test(n.id)) return true; n = n.parentNode; }
+    return false;
+  }
+  function start() {
+    if (!document.documentElement) return;
+    new MutationObserver(function (list) {
+      for (var i = 0; i < list.length; i++) {
+        if (ours(list[i].target)) continue;
+        window.__cbMut++;
+        window.__cbMutAt = performance.now();
+      }
+    }).observe(document.documentElement, {
+      childList: true, characterData: true, subtree: true });
+  }
+  if (document.documentElement) start();
+  else document.addEventListener('DOMContentLoaded', start);
+})();
+"""
+
+
+
 def snapshot() -> str:
     """Interactive elements as a compact, ref-indexed line list, not prose.
 
@@ -573,15 +608,24 @@ def html(selector=None) -> str:
             % _resolve_target(selector))
 
 
-def wait_predicate(selector=None, text=None, url=None, gone=False) -> str:
-    """One expression answering {"matched": "selector"|"text"|"url"|null}: the
-    first condition that holds right now. Polled by Browser.api_wait_for.
-    `selector` means present and visible, or -- with gone -- not visible.
-    `text` and `url` are case-insensitive regexes; a bad regex never matches."""
-    if not (selector or text or url):
-        raise ValueError("wait-for needs at least one of selector, text, url")
+def wait_predicate(selector=None, text=None, url=None, gone=False,
+                   changed_since=None) -> str:
+    """One expression answering {"matched": "selector"|"text"|"url"|"change"|
+    null}: the first condition that holds right now. Polled by
+    Browser.api_wait_for. `selector` means present and visible, or -- with
+    gone -- not visible. `text` and `url` are case-insensitive regexes; a bad
+    regex never matches. `changed_since` is a state token from an earlier
+    result: matched once the page's token differs from it (any mutation or a
+    navigation), which is "wait for anything to happen"."""
+    if not (selector or text or url or changed_since):
+        raise ValueError("wait-for needs at least one of selector, text, url, "
+                         "changed_since")
     parts = ["var m=null,gone=%s;" % ("true" if gone else "false")]
     branches = []
+    if changed_since:
+        branches.append(
+            "if(window.__cbEpoch&&(window.__cbEpoch+':'+(window.__cbMut||0))!==%s)"
+            "m='change';" % _js_str(changed_since))
     if selector:
         branches.append(
             "if(function(){var e=%s;var v=!!(e&&e.getClientRects&&e.getClientRects().length>0);"
@@ -595,6 +639,37 @@ def wait_predicate(selector=None, text=None, url=None, gone=False) -> str:
     parts.append("try{" + "else ".join(branches) + "}catch(x){}")
     parts.append("return JSON.stringify({matched:m});")
     return "(function(){" + "".join(parts) + "})()"
+
+
+#: The page's state in one cheap read, appended to every op's result as
+#: `state` and the whole answer of the `state` op. No text, no DOM walk: the
+#: counter is maintained by STATE_SHIM, so this costs what a JSON.stringify
+#: of a dozen fields costs. `quiet_ms` is how long since the page last
+#: changed; `focus` is where typing would land; `dialogs` is left to the
+#: native side.
+STATE = r"""
+(function () {
+  var f = document.activeElement;
+  var fd = f && f !== document.body ? {
+    tag: f.tagName.toLowerCase(), id: f.id || null, name: f.name || null,
+    editable: !!(('value' in f) || f.isContentEditable) } : null;
+  var at = window.__cbMutAt || 0;
+  return JSON.stringify({
+    url: location.href, title: document.title || '',
+    ready: document.readyState,
+    epoch: window.__cbEpoch || null, mutations: window.__cbMut || 0,
+    quiet_ms: at ? Math.round(performance.now() - at) : null,
+    scroll: { y: Math.round(window.scrollY),
+              max: Math.max(0, (document.documentElement.scrollHeight || 0) - window.innerHeight) },
+    focus: fd,
+    text_length: document.body ? document.body.innerText.length : 0
+  });
+})()
+"""
+
+
+def state() -> str:
+    return STATE
 
 
 def rect(selector: str) -> str:

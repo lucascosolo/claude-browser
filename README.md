@@ -491,6 +491,28 @@ A few of these carry a rule worth knowing:
 - **A screenshot or PDF of a private tab is never written to disk** — omit the
   path on `screenshot` to receive the PNG instead.
 
+### Acting on the page as it is, not as it was
+
+Every result now carries `state`: the URL, title, readiness, scroll position,
+the focused element, how long since the page last changed, and a **state
+token** (`epoch:mutations`, from a mutation counter every page carries). Two
+operations read nothing but that:
+
+- **`state`** — the token and the vitals, in one cheap call. Poll it to know
+  whether anything happened, instead of screenshotting.
+- **`changes`** — the lines of text that appeared and disappeared since the
+  last read of that tab, plus the state. The way to follow a page that
+  updates in place.
+
+`wait-for --changed-since TOKEN` returns the moment the page moves at all.
+
+And it is enforced, not advised: **an operation that changes the page is
+refused when the page has moved since the caller last looked.** A navigation
+is always stale; mutations count once the last look is older than twenty
+seconds. The refusal (HTTP 409, `"stale": true`) carries the current state
+and the text diff, so it is also the catch-up, and the retry goes through.
+`--force` acts regardless.
+
 ### Keeping the running browser current
 
 The browser runs straight from its checkout, and the installed launcher is a
@@ -789,7 +811,7 @@ session eats it. It is a fallback, not a foundation.
 CB_AUTOSTART=0 python3 -m unittest discover -s tests
 ```
 
-1086 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
+1110 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
 `test_offline.py` runs `cbctl` and `cb-mcp` as real subprocesses, and those
 launch the browser on demand unless told not to.
 

@@ -37,6 +37,21 @@ class _Compiles(unittest.TestCase):
 
 
 class TestWaitPredicate(_Compiles):
+    def test_changed_since_matches_a_moved_token(self):
+        js = extract.wait_predicate(changed_since="abc:4")
+        self.assert_expression(js)
+        self.assertIn("m='change'", js)
+        self.assertIn(extract._js_str("abc:4"), js)
+
+    def test_changed_since_alone_is_enough(self):
+        extract.wait_predicate(changed_since="abc:4")
+        with self.assertRaises(ValueError):
+            extract.wait_predicate()
+
+    def test_state_is_an_expression(self):
+        self.assert_expression(extract.state())
+        self.assert_expression(extract.STATE_SHIM.strip().rstrip(";"))
+
     def test_each_condition_is_a_single_expression(self):
         for kw in ({"selector": "#a"}, {"text": "done"}, {"url": "/cart"},
                    {"selector": "#a", "gone": True},

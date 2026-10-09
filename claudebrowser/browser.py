@@ -24,7 +24,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 from . import (update,  # noqa: E402
                agent, ai, auth, dialogs, envfile, extract, fills, findbar,  # noqa: E402
-               files, netlog, pages, uploads,
+               files, freshness, netlog, pages, uploads,
                pagetext, panel_html, passwords, perf, personas, playbooks,
                profile, progress, reader, resources, scrub, search, settings,
                siterules, storage, store, style, tabnames, urls, vpn,
@@ -392,6 +392,9 @@ class Tab:
         self.pending_download = None
         self.dialogs = dialogs.Log()
         self.netlog = netlog.Log()
+        # What the agent last saw of this page (freshness.Seen): stamped by
+        # every op that reads or acts, checked before every op that acts.
+        self.seen = None
         # id() -> WebResource. Holding the wrapper keeps id() unique for the
         # resource's life; once it is collected, the next one can reuse the id.
         self.resources = {}
@@ -566,7 +569,8 @@ class Browser(Gtk.Window):
         # reads. The tradeoff is that console output from inside an iframe is
         # not captured.
         self.content = WebKit2.UserContentManager()
-        for script in (CONSOLE_SHIM, passwords.PASSWORD_JS, extract.SNAPSHOT_SHIM):
+        for script in (CONSOLE_SHIM, passwords.PASSWORD_JS, extract.SNAPSHOT_SHIM,
+                       extract.STATE_SHIM):
             self.content.add_script(
                 WebKit2.UserScript.new(
                     script,
@@ -4428,7 +4432,7 @@ class Browser(Gtk.Window):
 
     @needs_tab
     def api_wait_for(self, tab, selector, text, url, gone, timeout, idle,
-                     quiet_ms, done):
+                     quiet_ms, changed_since, done):
         """Poll one JS predicate every 250 ms until a condition holds.
 
         Goes through api_eval, so a discarded tab is restored first. An eval
@@ -4438,8 +4442,10 @@ class Browser(Gtk.Window):
         is ANDed with the JS conditions; alone it needs no eval at all.
         """
         try:
-            js = (extract.wait_predicate(selector, text, url, bool(gone))
-                  if (selector or text or url or not idle) else None)
+            js = (extract.wait_predicate(selector, text, url, bool(gone),
+                                         changed_since)
+                  if (selector or text or url or changed_since or not idle)
+                  else None)
             seconds = max(1, min(120, int(timeout if timeout not in (None, "") else 20)))
             quiet_ms = max(0, int(quiet_ms if quiet_ms not in (None, "") else 500))
         except (ValueError, TypeError) as e:
@@ -4448,7 +4454,9 @@ class Browser(Gtk.Window):
             [("selector %s to disappear" if gone else "selector %s") % selector]
             * bool(selector)
             + ["text %s" % text] * bool(text) + ["url %s" % url] * bool(url)
+            + ["a change since %s" % changed_since] * bool(changed_since)
             + ["the network to be idle for %d ms" % quiet_ms] * bool(idle))
+        done = self._with_state(tab, done)
 
         def is_idle():
             return not tab.loading and tab.netlog.quiet_for(quiet_ms)
@@ -4483,7 +4491,7 @@ class Browser(Gtk.Window):
             if state["finished"]:
                 return GLib.SOURCE_REMOVE
             if js is not None:
-                self.api_eval(tab.id, js, on_result)
+                self._eval_raw(tab, js, on_result)
             elif is_idle():
                 finish({"ok": True, "matched": "idle", "idle": True,
                         "elapsed_ms": elapsed_ms()})
@@ -4565,12 +4573,115 @@ class Browser(Gtk.Window):
     def _await_load(self, tab, wait, done):
         if not wait:
             return done({"ok": True, **tab.info()})
+        # A settled load answers with the page's state token, so a caller that
+        # opened the page and acts next has "seen" it (freshness.py).
+        done = self._with_state(tab, done)
         if not tab.loading:
             # Already settled -- report now rather than block until the *next*
             # navigation, which is what waiting unconditionally would do.
             return done({"ok": tab.failed is None, **tab.info(),
                          **({"error": tab.failed} if tab.failed else {})})
         tab.waiters.append((tab.generation, done))
+
+    # -- page state and freshness --------------------------------------------
+
+    def _with_state(self, tab, done, text_of=None):
+        """Wrap `done` so the payload leaves with `state` (extract.STATE) and
+        the tab is stamped as seen at that token. `text_of(payload)` may pull
+        the page text out of the payload for later diffing."""
+        def finish(payload):
+            if not isinstance(payload, dict) or tab.discarded:
+                return done(payload)
+            text = text_of(payload) if text_of else None
+            state = {"done": False}
+
+            def once(st):
+                if state["done"]:
+                    return
+                state["done"] = True
+                if isinstance(st, dict):
+                    st["token"] = freshness.token(st)
+                    payload["state"] = st
+                    if st["token"]:
+                        kept = (text if text is not None
+                                else (tab.seen.text if tab.seen and
+                                      tab.seen.token == st["token"] else None))
+                        tab.seen = freshness.Seen(st["token"], text=kept)
+                done(payload)
+
+            def on_result(view, result, _data=None):
+                try:
+                    value = view.evaluate_javascript_finish(result)
+                    once(json.loads(value.to_string()) if value is not None else None)
+                except Exception:
+                    once(None)
+            try:
+                tab.view.evaluate_javascript(extract.STATE, -1, None, None, None,
+                                             on_result, None)
+            except Exception:
+                once(None)
+        return finish
+
+    @needs_tab
+    def api_state(self, tab, done):
+        """The page's state in one read -- see extract.STATE."""
+        def reshape(p):
+            st = p.get("state") if p.get("ok") else None
+            if not isinstance(st, dict):
+                return done(p if not p.get("ok") else
+                            {"ok": False, "error": "the page has no state yet"})
+            done({"ok": True, **st})
+        self._eval_raw(tab, "null", self._with_state(tab, reshape))
+
+    @needs_tab
+    def api_changes(self, tab, done):
+        """The page text that appeared and disappeared since the last read of
+        this tab, and the current state. The first call on a tab has nothing
+        to diff against and says so (`baseline`)."""
+        old = tab.seen.text if tab.seen else None
+
+        def reshape(p):
+            new = p.get("result") if p.get("ok") else None
+            if not isinstance(new, str):
+                return done(p if not p.get("ok") else
+                            {"ok": False, "error": "could not read the page"})
+            out = {"ok": True, "baseline": old is None,
+                   **freshness.diff(old, new)}
+            if "state" in p:
+                out["state"] = p["state"]
+            done(out)
+        self._eval_raw(tab, extract.TEXT, self._with_state(
+            tab, reshape, text_of=lambda p: p.get("result")
+            if isinstance(p.get("result"), str) else None))
+
+    @needs_tab
+    def api_freshness(self, tab, done):
+        """Not an op: control._handle asks this before every acting op.
+        {"stale": False}, or {"stale": True, "reason", "state", "changes"} --
+        the refusal carries what the caller needs to catch up, and stamps the
+        tab as seen, so the retry is not refused for the same reason."""
+        seen = tab.seen
+
+        def on_state(p):
+            st = p.get("state") if isinstance(p, dict) else None
+            if not isinstance(st, dict):
+                return done({"stale": False})
+            is_stale, why = freshness.stale(seen, st)
+            if not is_stale:
+                return done({"stale": False})
+            old = seen.text if seen else None
+
+            def on_text(q):
+                new = q.get("result") if q.get("ok") else None
+                out = {"stale": True, "reason": why,
+                       "state": q.get("state", st)}
+                if isinstance(new, str):
+                    out["changes"] = freshness.diff(old, new)
+                done(out)
+            self._eval_raw(tab, extract.TEXT, self._with_state(
+                tab, on_text, text_of=lambda q: q.get("result")
+                if isinstance(q.get("result"), str) else None))
+        self._eval_raw(tab, "null", self._with_state(tab, on_state))
 
     @needs_tab
     def api_eval(self, tab, script, done):
@@ -4582,6 +4693,18 @@ class Browser(Gtk.Window):
         memory to get tight, and came back would silently read `about:blank` and
         report the page as empty.
         """
+        # Every answer leaves with the page's state token (freshness.py); a
+        # bare `text` read also keeps its text on the tab so `changes` and a
+        # stale refusal can say what moved.
+        done = self._with_state(
+            tab, done, text_of=(lambda p: p.get("result")
+                                if isinstance(p.get("result"), str) else None)
+            if script == extract.TEXT else None)
+        self._eval_raw(tab, script, done)
+
+    def _eval_raw(self, tab, script, done):
+        """api_eval without the state read: for internal polls and for the
+        state read itself."""
         if tab.discarded:
             self.restore_tab(tab)
             return self._await_load(

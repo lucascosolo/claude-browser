@@ -36,6 +36,14 @@ r=$("$CB" "${T[@]}" wait-for --selector '#late' --timeout 10); check "wait-for s
 r=$("$CB" "${T[@]}" wait-for --idle);                      check "wait-for idle" "$r" '"ok": true'
 r=$("$CB" "${T[@]}" wait-for --selector '#nope' --timeout 2 || true); check "wait-for timeout is honest" "$r" 'timed out'
 
+r=$("$CB" "${T[@]}" state);                     check "state has a token" "$r" '"token": "[a-z0-9]+:[0-9]+"'
+r=$("$CB" "${T[@]}" text);                      check "text carries state" "$r" '"token"'
+r=$("$CB" "${T[@]}" eval "document.getElementById('intro').insertAdjacentHTML('afterend','<p>Freshly added line</p>')" >/dev/null)
+r=$("$CB" "${T[@]}" changes);                   check "changes shows the added line" "$r" 'Freshly added line'
+r=$("$CB" "${T[@]}" changes);                   check "changes is empty once read" "$r" '"added": \[\]'
+TOK=$("$CB" "${T[@]}" state | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+"$CB" "${T[@]}" eval "setTimeout(function(){document.body.appendChild(document.createElement('p'))},400)" >/dev/null
+r=$("$CB" "${T[@]}" wait-for --changed-since "$TOK" --timeout 5); check "wait-for --changed-since" "$r" '"matched": "change"'
 r=$("$CB" "${T[@]}" text --selector '#intro');  check "text --selector" "$r" 'tools/smoke.sh'
 r=$("$CB" "${T[@]}" find 'Banana');             check "find" "$r" '"count": 1'
 r=$("$CB" "${T[@]}" tables);                    check "tables" "$r" 'Banana'
@@ -78,6 +86,14 @@ r=$("$CB" "${T[@]}" download "$PAGE" "$OUT/downloaded.html" --overwrite); check 
 grep -q 'Smoke page' "$OUT/downloaded.html" && ok "download content" || bad "download content" "$(head -c 200 "$OUT/downloaded.html")"
 
 r=$("$CB" "${T[@]}" submit '#f');               check "submit (no navigation)" "$r" '"navigated": false'
+
+# The freshness gate: a page that moved after a look older than FRESH_S refuses an act.
+"$CB" "${T[@]}" text >/dev/null
+"$CB" "${T[@]}" eval "setTimeout(function(){document.body.appendChild(document.createElement('p'))},200)" >/dev/null
+printf '  (sleeping 21s for the freshness window)\n'; sleep 21
+r=$("$CB" "${T[@]}" click '#ask' 2>&1 || true); check "stale act is refused with the reason" "$r" 'changed [0-9]+ times'
+r=$("$CB" "${T[@]}" click '#ask');              check "act after the refusal goes through" "$r" '"ok": true'
+r=$("$CB" "${T[@]}" click '#ask' --force);      check "force bypasses the gate" "$r" '"ok": true'
 
 r=$("$CB" "${T[@]}" close);                     check "close" "$r" '"ok": true'
 

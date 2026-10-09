@@ -421,6 +421,7 @@ class TestApiRegistry(unittest.TestCase):
             "/close": {}, "/wait": {}, "/text": {}, "/markdown": {}, "/links": {},
             "/html": {}, "/reader": {}, "/simplify": {},
             "/find": {"q": "a"}, "/snapshot": {}, "/click": {"selector": "a"},
+            "/state": {}, "/changes": {},
             "/fill": {"selector": "a", "value": "b"},
             "/fill/many": {"fields": '{"a": "b"}'}, "/eval": {"js": "1"},
             "/console": {}, "/screenshot": {}, "/recall": {"q": "a"},
@@ -513,10 +514,10 @@ class TestApiRegistry(unittest.TestCase):
         self.assertEqual(d("/pdf", {"path": "/x.pdf", "overwrite": "true"}),
                          ("api_pdf", (None, "/x.pdf", True)))
         self.assertEqual(d("/wait/for", {"selector": "a"}),
-                         ("api_wait_for", (None, "a", None, None, False, None, False, 500)))
+                         ("api_wait_for", (None, "a", None, None, False, None, False, 500, None)))
         self.assertEqual(d("/wait/for", {"idle": "1"}),
-                         ("api_wait_for", (None, None, None, None, False, None, True, 500)))
-        self.assertEqual(d("/wait/for", {"idle": "true", "quiet_ms": "800"})[1][-2:],
+                         ("api_wait_for", (None, None, None, None, False, None, True, 500, None)))
+        self.assertEqual(d("/wait/for", {"idle": "true", "quiet_ms": "800"})[1][-3:-1],
                          (True, 800))
         self.assertEqual(d("/screenshot", {}),
                          ("api_screenshot", (None, None, False, None)))
@@ -559,6 +560,24 @@ class TestApiRegistry(unittest.TestCase):
             self.assertEqual(method, "api_eval", route)
             self.assertIn(needle, js, route)
         self.assertEqual(self.dispatch("/submit", {})[0], "api_submit")
+
+    def test_acting_ops_carry_force_and_reads_do_not(self):
+        acting = {o.name for o in self.api.OPS if o.acts}
+        self.assertEqual(acting, {"click", "fill", "fill-many", "press", "type",
+                                  "clear-field", "select", "hover", "submit",
+                                  "upload"})
+        for op in self.api.OPS:
+            names = [p.name for p in op.params]
+            self.assertEqual("force" in names, op.acts, op.name)
+
+    def test_state_and_changes_dispatch(self):
+        self.assertEqual(self.dispatch("/state", {})[0], "api_state")
+        self.assertEqual(self.dispatch("/changes", {"tab": "3"}), ("api_changes", (3,)))
+
+    def test_wait_for_takes_changed_since(self):
+        method, args = self.dispatch("/wait/for", {"changed_since": "e:4"})
+        self.assertEqual(method, "api_wait_for")
+        self.assertEqual(args[-1], "e:4")
 
     def test_clear_carries_its_kind_through_and_documents_pagetext(self):
         """The page-text cache is the most personal thing on disk, so it is

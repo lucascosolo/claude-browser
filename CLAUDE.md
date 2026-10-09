@@ -28,6 +28,8 @@ claudebrowser/
   update.py    self-update: reads .git/HEAD, decides when a restart is safe,
                preflights the new tree (GTK-free)
   files.py     CB_AGENT_DIRS containment for upload/download/pdf paths (GTK-free)
+  freshness.py the page-state token, the stale decision behind the acting-op
+               gate, and the text diff behind `changes` (GTK-free)
   dialogs.py   script-dialog policy + per-tab log (GTK-free)
   uploads.py   path checks + the pending-upload handshake for `upload` (GTK-free)
   netlog.py    per-tab request log behind `network` and `wait-for --idle` (GTK-free)
@@ -63,7 +65,7 @@ tests/         unittest, no display needed
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
 ./cbctl settings                            # every setting; add KEY VALUE to change one
-CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 1086 tests, ~6s, no display
+CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 1110 tests, ~6s, no display
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
@@ -322,6 +324,19 @@ stronger gate; on those four, py_compile is the only one there is.
   `~/.ssh`. A new op that takes a path uses the same two functions or it is the
   hole again. `screenshot` is deliberately outside this: it writes pixels of a
   page the caller already drives.
+- **An acting op is refused when the page moved since the caller last looked,
+  and the refusal is the catch-up.** `extract.STATE_SHIM` keeps a mutation
+  counter in every document (childList and characterData only, the browser's
+  own `__cb*` nodes excluded); `Browser._with_state` appends `state` (with a
+  token, `epoch:mutations`) to every eval, load and wait result and stamps
+  `tab.seen`; `control._handle` asks `api_freshness` before any op with
+  `acts=True` and answers 409 with the reason, the state and a text diff when
+  `freshness.stale` says so. Two deliberate asymmetries: a navigation is
+  always stale, but mutations alone are stale only after `FRESH_S` -- a gate
+  that fires on every ticking clock is a gate someone turns off. Internal
+  polls go through `_eval_raw`, which attaches nothing, so `wait-for` does not
+  pay the state read four times a second. The gate sits in the control funnel
+  only: playbook replay and the in-browser agent dispatch below it.
 - **Self-update never restarts into a break.** `update.preflight` byte-compiles
   the new tree and imports the GTK-free modules in a subprocess before the
   quit, once per revision; a failing commit is flashed once and left alone. It

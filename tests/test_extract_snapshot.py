@@ -17,6 +17,23 @@ class TestSnapshotShim(unittest.TestCase):
         self.assertIn("__cbResolve", extract.SNAPSHOT_SHIM)
 
 
+class TestStateShim(unittest.TestCase):
+    def test_counts_structure_and_text_but_not_attributes(self):
+        self.assertIn("MutationObserver", extract.STATE_SHIM)
+        self.assertIn("childList: true", extract.STATE_SHIM)
+        self.assertIn("characterData: true", extract.STATE_SHIM)
+        self.assertNotIn("attributes: true", extract.STATE_SHIM)
+
+    def test_ignores_the_browsers_own_nodes(self):
+        self.assertIn("/^__cb/", extract.STATE_SHIM)
+
+    def test_state_reads_the_counter_and_epoch(self):
+        js = extract.state()
+        for word in ("__cbEpoch", "__cbMut", "quiet_ms", "scroll", "focus",
+                     "text_length", "JSON.stringify"):
+            self.assertIn(word, js)
+
+
 class TestSnapshot(unittest.TestCase):
     def test_returns_a_function_expression(self):
         js = extract.snapshot()

@@ -174,6 +174,23 @@ class Control:
         with self._inflight_lock:
             self.inflight += 1
         try:
+            if op.acts and not api._truthy(args.get("force"), False):
+                # The freshness gate (freshness.py): an op that changes the
+                # page is refused when the page has moved since the caller
+                # last looked. One funnel, so cbctl and the MCP server cannot
+                # disagree; playbook replay and the in-browser agent dispatch
+                # below this point and are not gated.
+                gate = on_main_loop(self.browser, "api_freshness",
+                                    (api._tab(args),), timeout=20)
+                if isinstance(gate, dict) and gate.get("stale"):
+                    return self._send(handler, 409, {
+                        "ok": False, "stale": True,
+                        "error": "not acting: %s" % gate.get("reason", ""),
+                        "hint": "this answer carries the current state and "
+                                "what changed; act on it, or pass force "
+                                "to act regardless",
+                        **{k: v for k, v in gate.items()
+                           if k in ("reason", "state", "changes")}})
             method, call_args = op.call(self, args)
             payload = on_main_loop(self.browser, method, call_args, timeout=op.timeout)
         except KeyError as e:

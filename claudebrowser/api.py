@@ -63,11 +63,11 @@ class Param:
 
 
 class Op:
-    __slots__ = ("name", "route", "method", "summary", "params", "call", "tab",
+    __slots__ = ("name", "route", "method", "summary", "params", "call", "tab", "acts",
                  "timeout", "mcp")
 
     def __init__(self, name, route, method, summary, call, params=(), tab=True,
-                 timeout=45, mcp=True):
+                 timeout=45, mcp=True, acts=False):
         self.name = name
         self.route = route
         self.method = method
@@ -77,6 +77,15 @@ class Op:
         self.tab = tab            # takes an optional tab id
         self.timeout = timeout
         self.mcp = mcp            # exposed as an MCP tool
+        # An op that changes the page. control._handle refuses it when the
+        # page has moved since the caller last looked (freshness.stale), so
+        # every acting op carries `force` to say "I know, do it anyway".
+        self.acts = acts
+        if acts:
+            self.params.append(Param(
+                "force", "boolean", "Act even if the page changed since you "
+                "last read it (the refusal explains what changed).",
+                cli="opt", default=False))
 
     # -- projections onto each surface --------------------------------------
 
@@ -220,7 +229,8 @@ OPS = [
 
     Op("wait-for", "/wait/for", "POST", "Block until a condition holds on the "
        "page: an element is visible (or, with gone, absent), the page text "
-       "matches a regex, or the URL matches a regex. Use after a click that "
+       "matches a regex, the URL matches a regex, or (changed_since) the page "
+       "has changed at all since a state token you hold. Use after a click that "
        "triggers a slow update. With idle, also wait until the network has been "
        "quiet for quiet_ms; idle alone waits for a single-page app to settle. "
        "Fails with a timeout error if nothing matches.",
@@ -236,13 +246,17 @@ OPS = [
                      "request to have started or finished for quiet_ms.",
                      cli="opt", default=False),
                Param("quiet_ms", "integer", "Quiet period for idle, in ms "
-                     "(default 500).", cli="opt", default=500)],
+                     "(default 500).", cli="opt", default=500),
+               Param("changed_since", help="A state token from an earlier "
+                     "result: return once the page has changed at all since "
+                     "it (any mutation or navigation).", cli="opt")],
        call=lambda c, a: ("api_wait_for", (_tab(a), a.get("selector") or None,
                                            a.get("text") or None, a.get("url") or None,
                                            _truthy(a.get("gone"), False),
                                            a.get("timeout"),
                                            _truthy(a.get("idle"), False),
-                                           _int(a.get("quiet_ms"), 500))),
+                                           _int(a.get("quiet_ms"), 500),
+                                           a.get("changed_since") or None)),
        timeout=130),
 
     Op("close", "/close", "POST", "Close a tab.",
@@ -313,6 +327,20 @@ OPS = [
                Param("selector", help="Limit to this element: CSS selector or @ref.", cli="opt")],
        call=_js_scoped("find", "q")),
 
+    Op("state", "/state", "GET", "The page's state in one cheap read: URL, "
+       "title, readiness, a state token (epoch:mutations -- every result "
+       "carries the current one as `state.token`), ms since the page last "
+       "changed, scroll position, the focused element. No text, no screenshot: "
+       "poll this to know whether anything happened.",
+       call=lambda c, a: ("api_state", (_tab(a),))),
+
+    Op("changes", "/changes", "GET", "What changed on the page since you last "
+       "read it: the lines of text that appeared and disappeared, plus the "
+       "current state. The cheap way to follow a page that updates in place; "
+       "use text/snapshot only when the diff says more than it can show "
+       "(truncated).",
+       call=lambda c, a: ("api_changes", (_tab(a),))),
+
     Op("snapshot", "/snapshot", "GET", "List the page's interactive elements "
        "(inputs, buttons, links) as a compact, ref-indexed manifest -- use this "
        "instead of `text` before filling a form. Each ref (like @e7) can be "
@@ -322,7 +350,7 @@ OPS = [
     Op("click", "/click", "POST", "Click the first element matching a CSS "
        "selector, or a @ref from `snapshot` (e.g. \"@e7\").",
        params=[Param("selector", required=True)],
-       call=_js_call("click", "selector")),
+       call=_js_call("click", "selector"), acts=True),
 
     Op("scroll", "/scroll", "POST", "Scroll the page: `to` is top, bottom, a CSS "
        "selector or a @ref (centred in view), or `by` is a signed pixel count. "
@@ -339,7 +367,7 @@ OPS = [
        "so frameworks notice. `selector` is a CSS selector or a @ref from "
        "`snapshot`.",
        params=[Param("selector", required=True), Param("value", required=True)],
-       call=_js_call("fill", "selector", "value")),
+       call=_js_call("fill", "selector", "value"), acts=True),
 
     Op("fill-many", "/fill/many", "POST", "Fill several fields in one call. "
        "`fields` is a JSON object mapping each selector (or @ref from "
@@ -347,7 +375,7 @@ OPS = [
        "from the stored profile without ever seeing the value yourself.",
        params=[Param("fields", required=True,
                      help="JSON object: {selector_or_ref: value}.")],
-       call=lambda c, a: ("api_fill_many", (_tab(a), a["fields"]))),
+       call=lambda c, a: ("api_fill_many", (_tab(a), a["fields"])), acts=True),
 
     Op("press", "/press", "POST", "Press a key or combo (Enter, Escape, Tab, "
        "Shift+Tab, Ctrl+K, ArrowDown, a) on `selector`, else the focused element. "
@@ -357,7 +385,7 @@ OPS = [
                Param("selector", help="CSS selector or @ref to focus first.",
                      cli="opt")],
        call=lambda c, a: ("api_eval", (_tab(a), _extract().press(
-           a["key"], a.get("selector") or None)))),
+           a["key"], a.get("selector") or None))), acts=True),
 
     Op("type", "/type", "POST", "Type text into `selector`, else the focused "
        "element, as real input (works in contenteditable too). Appends at the "
@@ -369,7 +397,7 @@ OPS = [
                Param("clear", "boolean", "Select all first, so the text "
                      "replaces the field's contents.", cli="opt", default=False)],
        call=lambda c, a: ("api_eval", (_tab(a), _extract().type_text(
-           a["text"], a.get("selector") or None, bool(a.get("clear")))))),
+           a["text"], a.get("selector") or None, bool(a.get("clear"))))), acts=True),
 
     Op("clear-field", "/clear/field", "POST", "Empty a field -- an input, textarea or "
        "contenteditable editor -- through the same real-input path as `type`, "
@@ -378,7 +406,7 @@ OPS = [
        params=[Param("selector", help="CSS selector or @ref; else the focused "
                      "element.", cli="optarg")],
        call=lambda c, a: ("api_eval", (_tab(a), _extract().clear_field(
-           a.get("selector") or None)))),
+           a.get("selector") or None))), acts=True),
 
     Op("select", "/select", "POST", "Choose an option in a <select> by value or "
        "visible label (a JSON array for <select multiple>), or tick/untick a "
@@ -389,12 +417,12 @@ OPS = [
                      cli="opt")],
        call=lambda c, a: ("api_eval", (_tab(a), _extract().select(
            a["selector"], a.get("value"),
-           None if a.get("checked") in (None, "") else _truthy(a["checked"]))))),
+           None if a.get("checked") in (None, "") else _truthy(a["checked"])))), acts=True),
 
     Op("hover", "/hover", "POST", "Move the pointer onto an element without "
        "clicking, to open hover menus and tooltips.",
        params=[Param("selector", required=True)],
-       call=_js_call("hover", "selector")),
+       call=_js_call("hover", "selector"), acts=True),
 
     Op("submit", "/submit", "POST", "Submit a form the way a user would "
        "(validation and submit handlers run). `selector` is the form or a field "
@@ -402,7 +430,7 @@ OPS = [
        params=[Param("selector", cli="optarg",
                      help="Form or field inside one; default the first form.")],
        call=lambda c, a: ("api_submit", (_tab(a), a.get("selector") or None)),
-       timeout=LOAD_TIMEOUT),
+       timeout=LOAD_TIMEOUT, acts=True),
 
     # Dialogs and files: the three things a page does that an agent driving it
     # through JavaScript cannot see -- a modal, a native chooser, a save prompt.
@@ -422,7 +450,7 @@ OPS = [
                Param("path", required=True,
                      help="Absolute path, or a JSON array string of them, inside "
                           "CB_AGENT_DIRS (default ~/Downloads, ~/.cache/claude-browser).")],
-       call=lambda c, a: ("api_upload", (_tab(a), a["selector"], a["path"]))),
+       call=lambda c, a: ("api_upload", (_tab(a), a["selector"], a["path"])), acts=True),
 
     Op("download", "/download", "POST", "Download a URL with this tab's cookies "
        "to an absolute path on disk and wait for it to finish. Refused for a "
