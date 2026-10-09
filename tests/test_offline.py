@@ -434,7 +434,7 @@ class TestApiRegistry(unittest.TestCase):
             "/bookmarks": {}, "/bookmark/add": {},
             "/bookmark/remove": {"url": "https://example.com"},
             "/history": {"q": "a"}, "/history/clear": {}, "/downloads": {},
-            "/import-chrome": {},
+            "/import-chrome": {}, "/passwords/import-csv": {"path": "x.csv"},
             "/passwords/save": {"origin": "https://example.com", "username": "a",
                                 "password": "b"},
             "/wait/for": {"selector": "a"}, "/scroll": {"to": "bottom"},

@@ -15,6 +15,7 @@ this module's entire reason for existing carefully: see chrome_import.py's
 own docstring on read_passwords for the constraint that governs it.
 """
 
+import csv
 import json
 import os
 import shutil
@@ -198,3 +199,36 @@ def read_passwords(profile_dir=CHROME_PROFILE_DEFAULT, secret=None):
             except (ValueError, UnicodeDecodeError):
                 continue
             yield origin, username or "", password
+
+
+#: The columns Chrome's password export writes (name,url,username,password,
+#: note). Matched by header name, case-insensitively, so a Firefox or
+#: Bitwarden export with the same three names works too.
+CSV_COLUMNS = ("url", "username", "password")
+
+
+def read_passwords_csv(path):
+    """Yields (origin, username, password) for every usable row of a
+    password-manager CSV export. A generator for the same reason
+    read_passwords is: a decrypted value never accumulates in a list.
+
+    Rows with no url or no password are skipped, as is a url that is not a
+    web origin (passwords.origin_of says what counts). A file with no
+    `url`/`password` header raises ValueError, naming what it found.
+    """
+    from claudebrowser.passwords import origin_of
+
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        header = [(h or "").strip().lower() for h in (reader.fieldnames or [])]
+        missing = [c for c in CSV_COLUMNS if c not in header]
+        if missing:
+            raise ValueError("not a password export: missing column(s) %s "
+                             "(found %s)" % (", ".join(missing), ", ".join(header) or "none"))
+        for row in reader:
+            lower = {(k or "").strip().lower(): (v or "") for k, v in row.items()}
+            origin = origin_of(lower.get("url", "").strip())
+            password = lower.get("password", "")
+            if not origin or not password:
+                continue
+            yield origin, lower.get("username", "").strip(), password

@@ -203,3 +203,49 @@ class ReadPasswordsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadPasswordsCsvTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write(self, text, name="p.csv"):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def test_chrome_export_columns(self):
+        path = self.write("name,url,username,password,note\n"
+                          "Example,https://example.com/login,alice,hunter2,\n"
+                          "Other,https://other.example:8443/x,bob,pw2,hi\n")
+        rows = list(chrome_import.read_passwords_csv(path))
+        self.assertEqual(rows, [("https://example.com", "alice", "hunter2"),
+                                ("https://other.example:8443", "bob", "pw2")])
+
+    def test_header_case_and_bom_are_tolerated(self):
+        path = self.write("\ufeffURL,Username,PASSWORD\nhttps://a.example,u,p\n")
+        self.assertEqual(list(chrome_import.read_passwords_csv(path)),
+                         [("https://a.example", "u", "p")])
+
+    def test_rows_without_a_web_origin_or_password_are_skipped(self):
+        path = self.write("url,username,password\n"
+                          "android://abc/com.app,u,p\n"
+                          "https://b.example,u,\n"
+                          ",u,p\n"
+                          "https://c.example,,p\n")
+        self.assertEqual(list(chrome_import.read_passwords_csv(path)),
+                         [("https://c.example", "", "p")])
+
+    def test_wrong_file_is_refused_by_name(self):
+        path = self.write("name,email\nx,y\n")
+        with self.assertRaises(ValueError) as cm:
+            list(chrome_import.read_passwords_csv(path))
+        self.assertIn("url", str(cm.exception))
+        self.assertIn("password", str(cm.exception))
+
+    def test_is_a_generator(self):
+        import types
+        path = self.write("url,username,password\n")
+        self.assertIsInstance(chrome_import.read_passwords_csv(path), types.GeneratorType)

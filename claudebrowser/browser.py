@@ -5934,29 +5934,49 @@ class Browser(Gtk.Window):
                 result["history"] = {"error": str(exc)}
 
         if "passwords" in kinds:
-            imported = skipped = failed = 0
-            try:
-                for origin, username, password in chrome_import.read_passwords(profile_dir):
-                    if self.vault is None:
-                        failed += 1
-                        continue
-                    existing = self.vault.credentials(origin)
-                    if any(e["username"] == username for e in existing):
-                        skipped += 1
-                        continue
-                    if self.vault.save(origin, username, password):
-                        imported += 1
-                    else:
-                        failed += 1
-                result["passwords"] = {"imported": imported, "skipped": skipped,
-                                        "failed": failed}
-            except (OSError, ValueError) as exc:
-                result["passwords"] = {"error": str(exc)}
+            result["passwords"] = self._import_credentials(
+                lambda: chrome_import.read_passwords(profile_dir))
 
         if self.store is not None:
             self.store.flush()
         self._reload_internal()
         done(result)
+
+    def _import_credentials(self, rows):
+        """Feed (origin, username, password) triples from `rows()` into the
+        vault, filling gaps only. Counts come back; no value does. Shared by
+        the Chrome import and the CSV import so the never-overwrite rule and
+        the never-return rule live in one place."""
+        imported = skipped = failed = 0
+        try:
+            for origin, username, password in rows():
+                if self.vault is None:
+                    failed += 1
+                    continue
+                existing = self.vault.credentials(origin)
+                if any(e["username"] == username for e in existing):
+                    skipped += 1
+                    continue
+                if self.vault.save(origin, username, password):
+                    imported += 1
+                else:
+                    failed += 1
+        except (OSError, ValueError) as exc:
+            return {"error": str(exc)}
+        return {"imported": imported, "skipped": skipped, "failed": failed}
+
+    def api_import_passwords_csv(self, path, done):
+        """Import a password-manager CSV export (Chrome's Settings > Passwords
+        > Export) into the vault. The file is read, never moved or deleted --
+        the answer reminds the caller it is still there in clear text."""
+        path = os.path.expanduser(path or "")
+        if not os.path.isfile(path):
+            return done({"ok": False, "error": "no such file: %s" % path})
+        counts = self._import_credentials(
+            lambda: chrome_import.read_passwords_csv(path))
+        done({"ok": "error" not in counts, "passwords": counts, "path": path,
+              "note": "the CSV still holds every password in clear text; "
+                      "delete it yourself once the counts look right"})
 
     def api_save_password(self, origin, username, password, done):
         """Save one credential straight into the keyring-backed vault. The

@@ -700,6 +700,14 @@ OPS = [
                      cli="opt", default=False)],
        call=lambda c, a: ("api_import_chrome", (_import_chrome_kinds(a),)),
        tab=False, mcp=False, timeout=90),
+    Op("import-passwords-csv", "/passwords/import-csv", "POST",
+       "Import a password-manager CSV export (Chrome: Settings > Passwords > "
+       "Export; columns url, username, password) into the vault. Fills gaps "
+       "only, never overwrites, reports counts only. The file is left in "
+       "place for you to delete.",
+       params=[Param("path", required=True, help="Path to the exported CSV.")],
+       call=lambda c, a: ("api_import_passwords_csv", (a["path"],)),
+       tab=False, mcp=False, timeout=90),
     Op("save-password", "/passwords/save", "POST",
        "Save one credential straight into the password vault. Not an agent "
        "tool -- the one path for a human to hand this browser a password "

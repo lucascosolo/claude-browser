@@ -369,6 +369,16 @@ the origin is `scheme://host[:port]` — never a path, because a password belong
 to a site rather than a page, and never a bare hostname, because `http://` and
 `https://` are different security origins.
 
+**Getting them in from Chrome.** `cbctl import-chrome --passwords` reads a
+local Chrome profile directly, decrypting with Chrome's own keyring secret.
+Without a profile — after a reinstall, or from another machine — export from
+Chrome (Settings › Passwords › Export) and run
+`cbctl import-passwords-csv ~/Downloads/"Chrome Passwords.csv"`. Both fill
+gaps only, never overwrite, and report counts rather than values. Neither
+is an MCP tool: an agent cannot trigger an import. The CSV is left where it
+is, because this project deletes nothing; delete it yourself once the counts
+look right, since it holds every password in clear text.
+
 **Why not Google Password Manager.** It is not a service other browsers can talk
 to. The autofill half lives inside Chrome and Android; the sync half rides Chrome
 Sync, whose API is gated behind client credentials Google issues to Chrome builds
@@ -811,7 +821,7 @@ session eats it. It is a fallback, not a foundation.
 CB_AUTOSTART=0 python3 -m unittest discover -s tests
 ```
 
-1110 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
+1115 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
 `test_offline.py` runs `cbctl` and `cb-mcp` as real subprocesses, and those
 launch the browser on demand unless told not to.
 
