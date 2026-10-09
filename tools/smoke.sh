@@ -43,7 +43,7 @@ r=$("$CB" "${T[@]}" changes);                   check "changes shows the added l
 r=$("$CB" "${T[@]}" changes);                   check "changes is empty once read" "$r" '"added": \[\]'
 TOK=$("$CB" "${T[@]}" state | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 "$CB" "${T[@]}" eval "setTimeout(function(){document.body.appendChild(document.createElement('p'))},400)" >/dev/null
-r=$("$CB" "${T[@]}" wait-for --changed-since "$TOK" --timeout 5); check "wait-for --changed-since" "$r" '"matched": "change"'
+r=$("$CB" "${T[@]}" wait-for --changed_since "$TOK" --timeout 5); check "wait-for --changed-since" "$r" '"matched": "change"'
 r=$("$CB" "${T[@]}" text --selector '#intro');  check "text --selector" "$r" 'tools/smoke.sh'
 r=$("$CB" "${T[@]}" find 'Banana');             check "find" "$r" '"count": 1'
 r=$("$CB" "${T[@]}" tables);                    check "tables" "$r" 'Banana'

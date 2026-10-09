@@ -504,7 +504,7 @@ operations read nothing but that:
   last read of that tab, plus the state. The way to follow a page that
   updates in place.
 
-`wait-for --changed-since TOKEN` returns the moment the page moves at all.
+`wait-for --changed_since TOKEN` returns the moment the page moves at all.
 
 And it is enforced, not advised: **an operation that changes the page is
 refused when the page has moved since the caller last looked.** A navigation
