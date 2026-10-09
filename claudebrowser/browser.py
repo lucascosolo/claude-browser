@@ -662,6 +662,11 @@ class Browser(Gtk.Window):
         self.restart_requested = False
         self.control = None          # set by __main__ once the server is up
         self.last_input_at = time.monotonic()
+        # Who this window is for. An agent's autostart (client.autostart sets
+        # CB_AUTOSTARTED) that the person has never typed or clicked in is the
+        # agent's to shut down again; anything else is the person's browser.
+        self.autostarted = os.environ.get("CB_AUTOSTARTED") == "1"
+        self.human_input = False
         self.updater = update.Watcher()
         self._update_note = ""
         self._update_broken = None     # the revision whose preflight failed
@@ -775,6 +780,35 @@ class Browser(Gtk.Window):
         """Quit the main loop with a restart flagged; __main__ does the exec,
         after the control server has released its port."""
         self.restart_requested = True
+        self._save_session()
+        GLib.idle_add(lambda: (self._on_destroy(), GLib.SOURCE_REMOVE)[1])
+
+    def api_quit(self, force, done):
+        """Shut the browser down, for a session that started it and is done.
+
+        Refused, with the reason, when the window is the person's: they
+        launched it themselves (no CB_AUTOSTARTED), or they have typed or
+        clicked in it since it came up. `force` overrides. Either way the
+        session is saved first, so the next launch reopens every tab -- quit
+        loses nothing but the process. The answer goes out before the quit
+        so the caller gets a reply rather than a dropped connection."""
+        if not force:
+            if not self.autostarted:
+                return done({"ok": False, "quit": False,
+                             "error": "this window was started by the user, "
+                                      "not by a session; leave it running"})
+            if self.human_input:
+                return done({"ok": False, "quit": False,
+                             "error": "the user has been using this window "
+                                      "since it started; leave it running"})
+            if any(t.private for t in self.tabs):
+                return done({"ok": False, "quit": False,
+                             "error": "a private tab is open; it would not "
+                                      "come back"})
+        done({"ok": True, "quit": True, "tabs_saved": len(self.tabs)})
+        GLib.timeout_add(300, lambda: (self._quit(), GLib.SOURCE_REMOVE)[1])
+
+    def _quit(self):
         self._save_session()
         GLib.idle_add(lambda: (self._on_destroy(), GLib.SOURCE_REMOVE)[1])
 
@@ -1301,9 +1335,16 @@ class Browser(Gtk.Window):
         }
         self._accels = {(Gdk.keyval_from_name(k), m): fn for (k, m), fn in accel.items()}
         self.connect("key-press-event", self._on_key)
+        self.connect("button-press-event", self._on_button)
+
+    def _on_button(self, _widget, _event):
+        self.last_input_at = time.monotonic()
+        self.human_input = True
+        return False
 
     def _on_key(self, _widget, event):
         self.last_input_at = time.monotonic()
+        self.human_input = True
         mods = event.state & Gtk.accelerator_get_default_mod_mask()
         action = self._accels.get((Gdk.keyval_to_lower(event.keyval), mods))
         if action:

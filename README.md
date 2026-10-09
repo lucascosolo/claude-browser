@@ -523,6 +523,16 @@ seconds. The refusal (HTTP 409, `"stale": true`) carries the current state
 and the text diff, so it is also the catch-up, and the retry goes through.
 `--force` acts regardless.
 
+### A session's own browser: start, use, quit
+
+The first MCP tool call starts the browser if none is running; nothing has
+to be launched by hand. **`quit`** is the other end of that: it shuts the
+browser down when a session's work is done — but only a browser that was
+autostarted by a session *and* that nobody has typed or clicked in since.
+A window you opened yourself, or have used, answers `"quit": false` with the
+reason and keeps running; `--force` overrides. The session is saved first
+either way, so the next launch reopens every tab.
+
 ### Keeping the running browser current
 
 The browser runs straight from its checkout, and the installed launcher is a
@@ -821,7 +831,7 @@ session eats it. It is a fallback, not a foundation.
 CB_AUTOSTART=0 python3 -m unittest discover -s tests
 ```
 
-1115 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
+1116 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
 `test_offline.py` runs `cbctl` and `cb-mcp` as real subprocesses, and those
 launch the browser on demand unless told not to.
 

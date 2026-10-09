@@ -416,7 +416,8 @@ class TestApiRegistry(unittest.TestCase):
 
     def test_every_op_builds_a_call(self):
         cases = {
-            "/tabs": {}, "/present": {}, "/restart": {}, "/open": {"url": "x.com"},
+            "/tabs": {}, "/present": {}, "/restart": {}, "/quit": {},
+            "/open": {"url": "x.com"},
             "/navigate": {"url": "x.com"}, "/back": {}, "/forward": {}, "/reload": {},
             "/close": {}, "/wait": {}, "/text": {}, "/markdown": {}, "/links": {},
             "/html": {}, "/reader": {}, "/simplify": {},
@@ -568,7 +569,15 @@ class TestApiRegistry(unittest.TestCase):
                                   "upload"})
         for op in self.api.OPS:
             names = [p.name for p in op.params]
+            if op.name == "quit":   # its own `force`: override the ownership check
+                continue
             self.assertEqual("force" in names, op.acts, op.name)
+
+    def test_quit_dispatches_force(self):
+        self.assertEqual(self.dispatch("/quit", {}), ("api_quit", (False,)))
+        self.assertEqual(self.dispatch("/quit", {"force": "1"}), ("api_quit", (True,)))
+        self.assertTrue(self.api.BY_ROUTE["/quit"].mcp)
+        self.assertFalse(self.api.BY_ROUTE["/quit"].acts)
 
     def test_state_and_changes_dispatch(self):
         self.assertEqual(self.dispatch("/state", {})[0], "api_state")

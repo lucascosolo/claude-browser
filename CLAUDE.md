@@ -65,7 +65,7 @@ tests/         unittest, no display needed
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
 ./cbctl settings                            # every setting; add KEY VALUE to change one
-CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 1115 tests, ~6s, no display
+CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 1116 tests, ~6s, no display
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,
@@ -337,6 +337,13 @@ stronger gate; on those four, py_compile is the only one there is.
   polls go through `_eval_raw`, which attaches nothing, so `wait-for` does not
   pay the state read four times a second. The gate sits in the control funnel
   only: playbook replay and the in-browser agent dispatch below it.
+- **`quit` takes down an agent's browser, never the person's.**
+  `client.autostart` launches with `CB_AUTOSTARTED=1`; the window records
+  that, and `_on_key`/`_on_button` set `human_input` on the first real
+  keystroke or click. `api_quit` refuses unless autostarted and untouched
+  (or `force`), saves the session first, and answers before the quit so the
+  caller gets a reply instead of a dropped connection -- the same shape as
+  `api_restart`.
 - **Self-update never restarts into a break.** `update.preflight` byte-compiles
   the new tree and imports the GTK-free modules in a subprocess before the
   quit, once per revision; a failing commit is flashed once and left alone. It

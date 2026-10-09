@@ -190,6 +190,16 @@ OPS = [
        "currently in its checkout, reopening this session's tabs.",
        call=lambda c, a: ("api_restart", ()), tab=False, mcp=False),
 
+    Op("quit", "/quit", "POST", "Shut the browser down when your work is done. "
+       "Only a browser your session started (the first tool call starts one "
+       "if none is running) and that the user has not touched since will "
+       "quit; otherwise it is refused with the reason and you leave it "
+       "running. Tabs are saved either way and reopen next launch.",
+       params=[Param("force", "boolean", "Quit even if the user started or "
+                     "has used this window.", cli="opt", default=False)],
+       call=lambda c, a: ("api_quit", (_truthy(a.get("force"), False),)),
+       tab=False),
+
     Op("open", "/open", "POST", "Open a URL in a new tab and wait for it to "
        "finish loading.",
        params=[Param("url", required=True, help="URL or search term."),

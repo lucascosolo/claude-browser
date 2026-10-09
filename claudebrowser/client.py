@@ -141,9 +141,14 @@ def autostart(command=None, wait_seconds=25):
         return False
 
     command = command or [str(_launcher())]
+    # Marked, so the window knows nobody asked for it on the desktop: `quit`
+    # will take down a browser an agent started and nobody has touched, and
+    # refuse one the person opened or has been using.
+    env = dict(os.environ, CB_AUTOSTARTED="1")
     try:
         subprocess.Popen(
             command,
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

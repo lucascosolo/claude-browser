@@ -75,7 +75,7 @@ NOT_REPLAYABLE = frozenset({
     "save-password",
     # Restarting mid-replay ends the replay; and the file ops take paths, so a
     # playbook file on disk must not be a way to name what to read or write.
-    "restart", "upload", "download", "pdf", "import-passwords-csv",
+    "restart", "quit", "upload", "download", "pdf", "import-passwords-csv",
 })
 
 #: What a credential field looks like from the outside. Matched against a CSS
