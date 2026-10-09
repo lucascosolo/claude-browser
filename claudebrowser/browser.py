@@ -5969,6 +5969,8 @@ class Browser(Gtk.Window):
         """Import a password-manager CSV export (Chrome's Settings > Passwords
         > Export) into the vault. The file is read, never moved or deleted --
         the answer reminds the caller it is still there in clear text."""
+        from claudebrowser import chrome_import
+
         path = os.path.expanduser(path or "")
         if not os.path.isfile(path):
             return done({"ok": False, "error": "no such file: %s" % path})
