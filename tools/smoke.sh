@@ -97,6 +97,11 @@ r=$("$CB" "${T[@]}" click '#ask' --force);      check "force bypasses the gate" 
 
 r=$("$CB" "${T[@]}" close);                     check "close" "$r" '"ok": true'
 
+# quit answers with its decision either way; on a window a person launched or
+# has used it must refuse. Do not assert the refusal: a browser cb-mcp started
+# and nobody touched is allowed to go, and then there is nothing left to check.
+r=$("$CB" quit 2>&1 || true);                   check "quit answers with a decision" "$r" '"quit": (true|false)'
+
 echo
 echo "passed $pass, failed $fail  (artifacts in $OUT)"
 [ "$fail" -eq 0 ]
