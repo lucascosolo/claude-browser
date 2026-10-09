@@ -5974,11 +5974,22 @@ class Browser(Gtk.Window):
         path = os.path.expanduser(path or "")
         if not os.path.isfile(path):
             return done({"ok": False, "error": "no such file: %s" % path})
-        counts = self._import_credentials(
-            lambda: chrome_import.read_passwords_csv(path))
-        done({"ok": "error" not in counts, "passwords": counts, "path": path,
-              "note": "the CSV still holds every password in clear text; "
-                      "delete it yourself once the counts look right"})
+
+        # On a worker, not the main loop: a thousand-row export is two
+        # synchronous Secret Service calls per row, and on the main loop that
+        # is a frozen window for as long as the keyring takes -- forever, if
+        # it is locked and waiting on a prompt the user cannot see. The vault
+        # touches no GTK object, so the thread is safe; `done` is handed back
+        # to the main loop the way every other worker here does it.
+        def worker():
+            counts = self._import_credentials(
+                lambda: chrome_import.read_passwords_csv(path))
+            GLib.idle_add(done, {
+                "ok": "error" not in counts, "passwords": counts, "path": path,
+                "note": "the CSV still holds every password in clear text; "
+                        "delete it yourself once the counts look right"})
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def api_save_password(self, origin, username, password, done):
         """Save one credential straight into the keyring-backed vault. The

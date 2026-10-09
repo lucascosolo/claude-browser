@@ -707,7 +707,7 @@ OPS = [
        "place for you to delete.",
        params=[Param("path", required=True, help="Path to the exported CSV.")],
        call=lambda c, a: ("api_import_passwords_csv", (a["path"],)),
-       tab=False, mcp=False, timeout=90),
+       tab=False, mcp=False, timeout=600),
     Op("save-password", "/passwords/save", "POST",
        "Save one credential straight into the password vault. Not an agent "
        "tool -- the one path for a human to hand this browser a password "
