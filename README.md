@@ -369,6 +369,14 @@ the origin is `scheme://host[:port]` — never a path, because a password belong
 to a site rather than a page, and never a bare hostname, because `http://` and
 `https://` are different security origins.
 
+**Split logins and several accounts.** Google-style sign-ins ask for the
+email on one screen and the password on the next; the browser notices the
+password box appearing and fills it then. When a site has more than one saved
+login, it fills only if the page says which account is signing in (the email
+you just typed, or the one printed on the page) and otherwise leaves the box
+alone rather than guess. **Ctrl+Shift+L** (menu: Fill saved login) fills on
+demand, and opens a picker of the site's accounts when it cannot tell.
+
 **Getting them in from Chrome.** `cbctl import-chrome --passwords` reads a
 local Chrome profile directly, decrypting with Chrome's own keyring secret.
 Without a profile — after a reinstall, or from another machine — export from
@@ -831,7 +839,7 @@ session eats it. It is a fallback, not a foundation.
 CB_AUTOSTART=0 python3 -m unittest discover -s tests
 ```
 
-1116 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
+1125 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
 `test_offline.py` runs `cbctl` and `cb-mcp` as real subprocesses, and those
 launch the browser on demand unless told not to.
 

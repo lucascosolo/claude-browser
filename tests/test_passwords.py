@@ -185,3 +185,51 @@ class InjectedScript(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PickUsername(unittest.TestCase):
+    """Which saved account a split login is on, from what the page shows."""
+
+    USERS = ["lucas@gmail.com", "work@example.com", "plainname"]
+
+    def test_typed_value_wins(self):
+        hint = {"typed": "Work@Example.com", "emails": ["lucas@gmail.com"]}
+        self.assertEqual(passwords.pick_username(self.USERS, hint), "work@example.com")
+
+    def test_typed_local_part_matches_an_email_username(self):
+        self.assertEqual(passwords.pick_username(self.USERS, {"typed": "lucas"}),
+                         "lucas@gmail.com")
+
+    def test_typed_non_email_username(self):
+        self.assertEqual(passwords.pick_username(self.USERS, {"typed": "plainname"}),
+                         "plainname")
+
+    def test_exactly_one_email_on_the_page(self):
+        hint = {"typed": "", "emails": ["someone@else.com", "LUCAS@gmail.com"]}
+        self.assertEqual(passwords.pick_username(self.USERS, hint), "lucas@gmail.com")
+
+    def test_two_saved_emails_on_the_page_is_no_answer(self):
+        hint = {"emails": ["lucas@gmail.com", "work@example.com"]}
+        self.assertIsNone(passwords.pick_username(self.USERS, hint))
+
+    def test_nothing_to_go_on_is_no_answer(self):
+        self.assertIsNone(passwords.pick_username(self.USERS, {}))
+        self.assertIsNone(passwords.pick_username(self.USERS, None))
+        self.assertIsNone(passwords.pick_username(self.USERS, "garbage"))
+
+    def test_a_single_saved_login_needs_no_hint(self):
+        self.assertEqual(passwords.pick_username(["only@x.com"], {}), "only@x.com")
+
+    def test_no_saved_logins(self):
+        self.assertIsNone(passwords.pick_username([], {"typed": "a"}))
+
+
+class HintScript(unittest.TestCase):
+    def test_hint_reports_typed_and_visible_emails_only(self):
+        js = passwords.PASSWORD_JS
+        self.assertIn("window.__cbPwHint", js)
+        # The hint carries what the page already shows, never anything from
+        # the vault: the native side matches, the page is never told the list.
+        hint = js[js.index("window.__cbPwHint"):]
+        hint = hint[:hint.index("};")]
+        self.assertNotIn("password", hint.lower().replace("__cbpwhint", ""))

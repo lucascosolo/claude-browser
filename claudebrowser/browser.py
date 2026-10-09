@@ -90,6 +90,7 @@ MENU_SECTIONS = (
     )),
     ("This page", (
         ("edit-find-symbolic", "Find on page", "Ctrl+F", "find"),
+        ("dialog-password-symbolic", "Fill saved login", "Ctrl+Shift+L", "pwfill"),
         ("view-paged-symbolic", "Reader mode", "Ctrl+Alt+R", "reader"),
         ("view-fullscreen-symbolic", "Declutter this site", "Ctrl+Alt+D",
          "siterules"),
@@ -1319,6 +1320,11 @@ class Browser(Gtk.Window):
                 lambda: self.new_tab(PRIVATE_HOME, private=True),
             ("n", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
                 lambda: self.new_tab(PRIVATE_HOME, private=True),
+            # Fill the saved login now, picking the account when the site has
+            # several. Ctrl+Shift+L: Ctrl+L is the omnibox, and the Shift row's
+            # L was free.
+            ("l", Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                self.pw_fill_now,
             ("Home", Gdk.ModifierType.MOD1_MASK): self._go_home,
             # Ctrl+Alt+W joins reader mode and VPN Mode in the Ctrl+Alt row:
             # Ctrl+W is close-tab everywhere and must stay that way.
@@ -3139,6 +3145,7 @@ class Browser(Gtk.Window):
             "newtab": lambda: self.new_tab(HOME),
             "private": lambda: self.new_tab(PRIVATE_HOME, private=True),
             "find": self.findbar.open,
+            "pwfill": self.pw_fill_now,
             "reader": self.toggle_reader,
             "siterules": self.toggle_siterules,
             "vpn": self.toggle_vpn,
@@ -3227,25 +3234,107 @@ class Browser(Gtk.Window):
         origin = passwords.origin_of(tab.view.get_uri() or "")
         if origin is None:
             return
-        found = self.vault.credentials(origin)
-        if len(found) != 1:
-            # Nothing to do at zero. At two or more we would be picking an
-            # account on the user's behalf, and picking wrong signs them into
-            # the other one without ever saying so. Silence beats a coin flip.
+        usernames = self.vault.usernames(origin)
+        if not usernames:
             return
 
-        def landed(raw):
-            if (raw or "").strip() in ("1", "true"):
-                return                      # filled; nothing more to look for
+        def retry():
             if attempt + 1 >= self.PW_RETRIES:
                 return
             GLib.timeout_add(self.PW_RETRY_MS,
                              lambda: (self._pw_retry(tab, origin, attempt + 1),
                                       GLib.SOURCE_REMOVE)[1])
 
+        def landed(raw):
+            if (raw or "").strip() not in ("1", "true"):
+                retry()                     # filled means nothing more to look for
+
+        def with_hint(raw):
+            # At two or more saved accounts the page has to say which one is
+            # signing in (passwords.pick_username). No clear answer is silence,
+            # not a coin flip: Ctrl+Shift+L is how the person picks.
+            try:
+                hint = json.loads(raw) if raw else None
+            except ValueError:
+                hint = None
+            username = passwords.pick_username(usernames, hint)
+            if username is None:
+                return retry()
+            self._pw_fill(tab, origin, username, landed)
+
+        if len(usernames) == 1:
+            return self._pw_fill(tab, origin, usernames[0], landed)
+        self._pw_js(tab, "window.__cbPwHint ? window.__cbPwHint() : ''", with_hint)
+
+    def _pw_fill(self, tab, origin, username, on_value=None):
+        """Hand one saved login to the page. The secret is read here, for
+        this call only, and goes into the page as an argument."""
+        secret = self.vault.secret(origin, username)
+        if secret is None:
+            return on_value("0") if on_value else None
         self._pw_js(tab, "window.__cbPwFill ? window.__cbPwFill(%s, %s) : 0" % (
-            json.dumps(found[0]["username"]), json.dumps(found[0]["password"])),
-            landed)
+            json.dumps(username), json.dumps(secret)), on_value)
+
+    def pw_fill_now(self):
+        """Ctrl+Shift+L: fill the saved login for this site right now.
+
+        The automatic fill only acts when it is sure; this is the person
+        asking. One account fills at once. Several are matched against the
+        page the same way, and when the page cannot say, a picker opens under
+        the address bar -- choosing is the person's call, never a guess."""
+        tab = self.current()
+        if tab is None or self.vault is None:
+            return
+        origin = passwords.origin_of(tab.view.get_uri() or "")
+        usernames = self.vault.usernames(origin) if origin else []
+        if not usernames:
+            return self._flash("No saved login for this site")
+
+        def report(raw):
+            if (raw or "").strip() not in ("1", "true"):
+                self._flash("Filled the username; the password box is not on "
+                            "the page yet")
+
+        def with_hint(raw):
+            try:
+                hint = json.loads(raw) if raw else None
+            except ValueError:
+                hint = None
+            username = passwords.pick_username(usernames, hint)
+            if username is not None:
+                return self._pw_fill(tab, origin, username, report)
+            self._pw_picker(tab, origin, usernames, report)
+
+        if len(usernames) == 1:
+            return self._pw_fill(tab, origin, usernames[0], report)
+        self._pw_js(tab, "window.__cbPwHint ? window.__cbPwHint() : ''", with_hint)
+
+    def _pw_picker(self, tab, origin, usernames, report):
+        """A popover of this site's saved accounts, under the address bar."""
+        popover = Gtk.Popover()
+        popover.set_relative_to(self.omnibox)
+        popover.get_style_context().add_class("cb-menu")
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.get_style_context().add_class("cb-menucard")
+        head = Gtk.Label(label="Fill which login?", xalign=0)
+        head.get_style_context().add_class("cb-menuhead")
+        card.pack_start(head, False, False, 0)
+
+        def choose(_b, username):
+            popover.popdown()
+            if tab in self.tabs and passwords.origin_of(
+                    tab.view.get_uri() or "") == origin:
+                self._pw_fill(tab, origin, username, report)
+
+        for username in usernames:
+            row = Gtk.Button(label=username or "(no username)")
+            row.set_relief(Gtk.ReliefStyle.NONE)
+            row.get_style_context().add_class("cb-menuitem")
+            row.connect("clicked", choose, username)
+            card.pack_start(row, False, False, 0)
+        card.show_all()
+        popover.add(card)
+        popover.popup()
 
     def _pw_retry(self, tab, origin, attempt):
         """One more attempt, unless the page has moved on.

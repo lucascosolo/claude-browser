@@ -254,6 +254,44 @@ class Vault:
 # `postMessage` here is a doorbell, not a delivery: it carries no credential.
 # The native side answers it by reading `__cbPwTake()` out of the *focused*
 # view, so a background tab ringing the bell gets someone else's empty pocket.
+def pick_username(usernames, hint):
+    """Which saved account a login page is for, or None if it cannot say.
+
+    A site with one saved login needs no hint. With several, the page is asked
+    what it shows (`__cbPwHint`): the value typed into a username field on
+    this document, and the email addresses visible in its text. Google's
+    password step is the case this exists for -- the email typed one step
+    earlier is either still in `typed` (a same-document transition) or printed
+    on the page ("Hi, lucas@gmail.com"). Only an unambiguous answer counts:
+    signing someone into the wrong one of their accounts is worse than
+    leaving the box for them to fill.
+    """
+    usernames = [u for u in usernames if u is not None]
+    if not usernames:
+        return None
+    if len(usernames) == 1:
+        return usernames[0]
+    if not isinstance(hint, dict):
+        return None
+    by_lower = {u.lower(): u for u in usernames}
+
+    typed = str(hint.get("typed") or "").strip().lower()
+    if typed:
+        if typed in by_lower:
+            return by_lower[typed]
+        if "@" not in typed:
+            local = [u for u in usernames if u.lower().split("@", 1)[0] == typed]
+            if len(local) == 1:
+                return local[0]
+
+    shown = hint.get("emails") or []
+    seen = {by_lower[e.strip().lower()] for e in shown
+            if isinstance(e, str) and e.strip().lower() in by_lower}
+    if len(seen) == 1:
+        return seen.pop()
+    return None
+
+
 PASSWORD_JS = r"""
 (function () {
   if (window.__cbPw) { return; }
@@ -338,6 +376,26 @@ PASSWORD_JS = r"""
     }
     return best;
   }
+
+  // What the page itself shows about which account is signing in, for a site
+  // with several saved logins (passwords.pick_username decides). Nothing from
+  // the vault is passed in or out: the page is never told which accounts exist.
+  var lastTyped = '';
+  document.addEventListener('input', function (e) {
+    var el = e.target;
+    if (!el || el.tagName !== 'INPUT') { return; }
+    var t = (el.getAttribute('type') || 'text').toLowerCase();
+    if (t === 'text' || t === 'email' || t === 'tel') { lastTyped = el.value || ''; }
+  }, true);
+
+  window.__cbPwHint = function () {
+    var typed = lastTyped;
+    var u = standaloneUserField();
+    if (u && u.value) { typed = u.value; }
+    var text = document.body ? document.body.innerText : '';
+    var found = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [];
+    return JSON.stringify({ typed: typed, emails: found.slice(0, 20) });
+  };
 
   window.__cbPwFill = function (username, password) {
     var fields = passwords();
