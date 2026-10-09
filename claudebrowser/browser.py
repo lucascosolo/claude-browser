@@ -5949,15 +5949,25 @@ class Browser(Gtk.Window):
         the never-return rule live in one place."""
         imported = skipped = failed = 0
         try:
+            # One metadata search up front, not a lookup per row. The first
+            # version asked the keyring for the *secrets* at each origin (a
+            # thousand rows, two thousand D-Bus calls, every password pulled
+            # into memory to compare a username) and gnome-keyring is
+            # single-threaded, so the window's own autofill reads queued
+            # behind it and the browser froze for the whole import.
+            known = set()
+            if self.vault is not None:
+                known = {(a.get("origin", ""), a.get("username", ""))
+                         for a in self.vault.backend.search(passwords.LOGIN)}
             for origin, username, password in rows():
                 if self.vault is None:
                     failed += 1
                     continue
-                existing = self.vault.credentials(origin)
-                if any(e["username"] == username for e in existing):
+                if (origin, username) in known:
                     skipped += 1
                     continue
                 if self.vault.save(origin, username, password):
+                    known.add((origin, username))
                     imported += 1
                 else:
                     failed += 1
