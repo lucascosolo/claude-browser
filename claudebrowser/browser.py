@@ -4585,6 +4585,15 @@ class Browser(Gtk.Window):
 
     # -- page state and freshness --------------------------------------------
 
+    @staticmethod
+    def _text_of(payload):
+        """The page text out of a `text` read's payload (extract.TEXT answers
+        {title, url, text}), or None when the payload is something else."""
+        r = payload.get("result") if isinstance(payload, dict) else None
+        if isinstance(r, dict) and isinstance(r.get("text"), str):
+            return r["text"]
+        return None
+
     def _with_state(self, tab, done, text_of=None):
         """Wrap `done` so the payload leaves with `state` (extract.STATE) and
         the tab is stamped as seen at that token. `text_of(payload)` may pull
@@ -4641,8 +4650,8 @@ class Browser(Gtk.Window):
         old = tab.seen.text if tab.seen else None
 
         def reshape(p):
-            new = p.get("result") if p.get("ok") else None
-            if not isinstance(new, str):
+            new = self._text_of(p) if p.get("ok") else None
+            if new is None:
                 return done(p if not p.get("ok") else
                             {"ok": False, "error": "could not read the page"})
             out = {"ok": True, "baseline": old is None,
@@ -4651,8 +4660,7 @@ class Browser(Gtk.Window):
                 out["state"] = p["state"]
             done(out)
         self._eval_raw(tab, extract.TEXT, self._with_state(
-            tab, reshape, text_of=lambda p: p.get("result")
-            if isinstance(p.get("result"), str) else None))
+            tab, reshape, text_of=self._text_of))
 
     @needs_tab
     def api_freshness(self, tab, done):
@@ -4672,15 +4680,14 @@ class Browser(Gtk.Window):
             old = seen.text if seen else None
 
             def on_text(q):
-                new = q.get("result") if q.get("ok") else None
+                new = self._text_of(q) if q.get("ok") else None
                 out = {"stale": True, "reason": why,
                        "state": q.get("state", st)}
-                if isinstance(new, str):
+                if new is not None:
                     out["changes"] = freshness.diff(old, new)
                 done(out)
             self._eval_raw(tab, extract.TEXT, self._with_state(
-                tab, on_text, text_of=lambda q: q.get("result")
-                if isinstance(q.get("result"), str) else None))
+                tab, on_text, text_of=self._text_of))
         self._eval_raw(tab, "null", self._with_state(tab, on_state))
 
     @needs_tab
@@ -4697,9 +4704,7 @@ class Browser(Gtk.Window):
         # bare `text` read also keeps its text on the tab so `changes` and a
         # stale refusal can say what moved.
         done = self._with_state(
-            tab, done, text_of=(lambda p: p.get("result")
-                                if isinstance(p.get("result"), str) else None)
-            if script == extract.TEXT else None)
+            tab, done, text_of=self._text_of if script == extract.TEXT else None)
         self._eval_raw(tab, script, done)
 
     def _eval_raw(self, tab, script, done):
