@@ -439,6 +439,7 @@ class TestApiRegistry(unittest.TestCase):
             "/wait/for": {"selector": "a"}, "/scroll": {"to": "bottom"},
             "/tables": {},
             "/press": {"key": "Enter"}, "/type": {"text": "hi"},
+            "/clear/field": {"selector": "#q"},
             "/select": {"selector": "#s", "value": "a"},
             "/hover": {"selector": "a"}, "/submit": {},
             "/dialogs": {}, "/upload": {"selector": "input", "path": "/x"},
@@ -550,6 +551,8 @@ class TestApiRegistry(unittest.TestCase):
         for route, args, needle in [
                 ("/press", {"key": "Ctrl+K"}, "KeyK"),
                 ("/type", {"text": "</script>hi"}, extract._js_str("</script>hi")),
+                ("/type", {"text": "x", "clear": True}, "selectNodeContents"),
+                ("/clear/field", {"selector": "</script>"}, extract._js_str("</script>")),
                 ("/select", {"selector": "#s", "value": "a"}, extract._js_str("#s")),
                 ("/hover", {"selector": "a.x"}, extract._js_str("a.x"))]:
             method, (tab, js) = self.dispatch(route, args)

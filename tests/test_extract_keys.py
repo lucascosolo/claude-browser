@@ -115,6 +115,26 @@ class TestTypeText(_Compiles):
     def test_ref_selector(self):
         self.assertIn("__cbResolve", extract.type_text("x", selector="@e7"))
 
+    def test_clear_selects_everything_first(self):
+        js = extract.type_text("new", selector="#q", clear=True)
+        self.assert_expression(js)
+        # Inputs get select(); contenteditable gets a range over its contents.
+        for word in ("e.select()", "selectNodeContents", "removeAllRanges"):
+            self.assertIn(word, js)
+        # And the no-execCommand fallback replaces rather than appends.
+        self.assertIn("e.value=T", js)
+
+    def test_default_appends(self):
+        js = extract.type_text("more")
+        self.assertNotIn("selectNodeContents", js)
+        self.assertIn("e.value=e.value+T", js)
+
+    def test_clear_with_empty_text_deletes(self):
+        js = extract.clear_field("#q")
+        self.assert_expression(js)
+        self.assertIn("'delete'", js)
+        self.assertIn("selectNodeContents", js)
+
 
 class TestSelect(_Compiles):
     def test_needs_value_or_checked(self):

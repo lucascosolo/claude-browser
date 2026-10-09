@@ -63,7 +63,7 @@ tests/         unittest, no display needed
 ./cbctl machine                             # what the resource guard thinks
 ./cbctl --help                              # every subcommand, generated
 ./cbctl settings                            # every setting; add KEY VALUE to change one
-CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 1083 tests, ~6s, no display
+CB_AUTOSTART=0 python3 -m unittest discover -s tests   # 1086 tests, ~6s, no display
 ```
 
 Environment knobs the guard and storage read: `CB_MAX_TABS` (agent tab ceiling,

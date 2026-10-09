@@ -46,6 +46,12 @@ r=$("$CB" "${T[@]}" scroll --to '#bottom');          check "scroll to selector" 
 
 r=$("$CB" "${T[@]}" fill '#q' 'hello');         check "fill" "$r" '"ok": true'
 r=$("$CB" "${T[@]}" type ' world' --selector '#q'); check "type appends" "$r" '"ok": true'
+r=$("$CB" "${T[@]}" type 'replaced' --selector '#q' --clear); check "type --clear replaces" "$r" '"ok": true'
+r=$("$CB" "${T[@]}" eval "document.getElementById('q').value"); check "field holds only the new text" "$r" '"replaced"'
+r=$("$CB" "${T[@]}" clear-field '#q');          check "clear-field" "$r" '"ok": true'
+r=$("$CB" "${T[@]}" eval "JSON.stringify(document.getElementById('q').value)"); check "field is empty" "$r" '\\"\\"'
+r=$("$CB" "${T[@]}" fill '#q' 'hello');         check "fill again" "$r" '"ok": true'
+r=$("$CB" "${T[@]}" type ' world' --selector '#q'); check "type appends again" "$r" '"ok": true'
 r=$("$CB" "${T[@]}" select '#c' 'Green');       check "select by label" "$r" '"value": "g"'
 r=$("$CB" "${T[@]}" select '#k' --checked);     check "select checkbox" "$r" '"checked": true'
 r=$("$CB" "${T[@]}" press Enter --selector '#q'); check "press Enter submits" "$r" '"ok": true'

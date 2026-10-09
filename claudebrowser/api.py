@@ -361,12 +361,24 @@ OPS = [
 
     Op("type", "/type", "POST", "Type text into `selector`, else the focused "
        "element, as real input (works in contenteditable too). Appends at the "
-       "caret; use `fill` to replace a field's value.",
+       "caret unless `clear` is set, which replaces everything in the field "
+       "-- the way to reset a rich-text editor that ignores `fill`.",
        params=[Param("text", required=True),
                Param("selector", help="CSS selector or @ref to focus first.",
-                     cli="opt")],
+                     cli="opt"),
+               Param("clear", "boolean", "Select all first, so the text "
+                     "replaces the field's contents.", cli="opt", default=False)],
        call=lambda c, a: ("api_eval", (_tab(a), _extract().type_text(
-           a["text"], a.get("selector") or None)))),
+           a["text"], a.get("selector") or None, bool(a.get("clear")))))),
+
+    Op("clear-field", "/clear/field", "POST", "Empty a field -- an input, textarea or "
+       "contenteditable editor -- through the same real-input path as `type`, "
+       "so the page's listeners see it. Use before `type` or `fill` when a "
+       "field keeps old text.",
+       params=[Param("selector", help="CSS selector or @ref; else the focused "
+                     "element.", cli="optarg")],
+       call=lambda c, a: ("api_eval", (_tab(a), _extract().clear_field(
+           a.get("selector") or None)))),
 
     Op("select", "/select", "POST", "Choose an option in a <select> by value or "
        "visible label (a JSON array for <select multiple>), or tick/untick a "

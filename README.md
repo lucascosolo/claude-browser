@@ -789,7 +789,7 @@ session eats it. It is a fallback, not a foundation.
 CB_AUTOSTART=0 python3 -m unittest discover -s tests
 ```
 
-1083 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
+1086 tests, about 6 seconds, no display needed. `CB_AUTOSTART=0` matters:
 `test_offline.py` runs `cbctl` and `cb-mcp` as real subprocesses, and those
 launch the browser on demand unless told not to.
 

@@ -775,25 +775,48 @@ def press(key: str, selector=None) -> str:
     return _driven(selector, body)
 
 
-def type_text(text: str, selector=None) -> str:
+def type_text(text: str, selector=None, clear=False) -> str:
     """Insert text into the selector's match, else the focused element.
     `insertText` fires the real beforeinput/input events frameworks listen to
     and works in contenteditable as well as inputs. Per-character key events
     are deliberately not simulated: that is one round trip of events per
-    character for no listener `insertText` does not already reach."""
-    body = (
-        "var T=%s;e.focus&&e.focus();window.__cbCursorAt(e,true);"
-        "var done=false;"
+    character for no listener `insertText` does not already reach.
+
+    `clear` selects everything in the field first, so the insert *replaces*
+    rather than appends -- the one way to reset a rich-text editor, which
+    ignores a `.value` write and keeps whatever was typed before. An input
+    gets `select()`; anything else gets a DOM range over its contents."""
+    select_all = (
+        "if('value' in e&&e.select){try{e.select();}catch(x){}}"
+        "else{var s=window.getSelection();var r=document.createRange();"
+        "r.selectNodeContents(e);s.removeAllRanges();s.addRange(r);}"
+    ) if clear else ""
+    # `insertText` with an empty string is a no-op in WebKit, so clearing to
+    # nothing has to be a delete of the selection instead.
+    insert = (
+        "try{if(document.queryCommandSupported&&document.queryCommandSupported('insertText'))"
+        "done=T.length?document.execCommand('insertText',false,T)"
+        ":document.execCommand('delete');}catch(x){}"
+    ) if clear else (
         "try{if(document.queryCommandSupported&&document.queryCommandSupported('insertText'))"
         "done=document.execCommand('insertText',false,T);}catch(x){}"
+    )
+    assign = "e.value=T;" if clear else "e.value=e.value+T;"
+    body = (
+        "var T=" + _js_str(text) + ";e.focus&&e.focus();window.__cbCursorAt(e,true);"
+        "var done=false;" + select_all + insert +
         "if(!done){if(!('value' in e))return JSON.stringify({ok:false,error:'not editable'});"
-        "e.value=e.value+T;"
+        + assign +
         "e.dispatchEvent(new Event('input',{bubbles:true}));"
         "e.dispatchEvent(new Event('change',{bubbles:true}));}"
-        "return JSON.stringify(Object.assign({ok:true,length:T.length},{%s}));"
-        % (_js_str(text), delta())
+        "return JSON.stringify(Object.assign({ok:true,length:T.length},{" + delta() + "}));"
     )
     return _driven(selector, body)
+
+
+def clear_field(selector=None) -> str:
+    """Empty a field: `type_text` of nothing with everything selected."""
+    return type_text("", selector, clear=True)
 
 
 def select(selector: str, value=None, checked=None) -> str:
